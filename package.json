@@ -12,12 +12,24 @@
     "tauri:build": "tauri build",
     "tauri:android:dev": "tauri android dev",
     "tauri:android:build": "tauri android build",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "format:check": "biome format ."
   },
-  "keywords": ["tauri", "android", "endoscope", "usb", "uvc", "rust"],
+  "keywords": [
+    "tauri",
+    "android",
+    "endoscope",
+    "usb",
+    "uvc",
+    "rust"
+  ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@biomejs/biome": "^2.3.10",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/cli": "^2.0.0",

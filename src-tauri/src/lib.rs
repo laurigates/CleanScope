@@ -5,7 +5,7 @@
 mod usb;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter};
 
 /// USB device connection status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,13 +92,13 @@ pub fn run() {
             cycle_resolution,
             get_resolutions,
         ])
-        .setup(|app| {
+        .setup(|_app| {
             log::info!("Tauri app setup complete");
 
             // On Android, we'll initialize the USB handling here
             #[cfg(target_os = "android")]
             {
-                let app_handle = app.handle().clone();
+                let app_handle = _app.handle().clone();
                 std::thread::spawn(move || {
                     usb::init_usb_handler(app_handle);
                 });

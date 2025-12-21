@@ -1,0 +1,25 @@
+{
+  "format_version": "1.1.0",
+  "created_at": "2025-12-21T00:00:00Z",
+  "updated_at": "2025-12-21T00:00:00Z",
+  "created_by": {
+    "blueprint_plugin": "1.0.0"
+  },
+  "project": {
+    "name": "CleanScope",
+    "type": "team"
+  },
+  "structure": {
+    "has_prds": true,
+    "has_work_orders": true,
+    "has_ai_docs": false,
+    "has_templates": false,
+    "has_modular_rules": true,
+    "claude_md_mode": "both"
+  },
+  "generated_artifacts": {
+    "commands": [],
+    "skills": [],
+    "rules": []
+  }
+}
