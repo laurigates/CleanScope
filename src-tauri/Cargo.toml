@@ -1,0 +1,57 @@
+[package]
+name = "clean-scope"
+version = "0.1.0"
+description = "Privacy-respecting USB endoscope viewer for Android"
+authors = [""]
+license = "MIT"
+repository = ""
+edition = "2021"
+
+[lib]
+name = "clean_scope_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri framework
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# JNI bridge for Android
+jni = "0.21"
+
+# NDK bindings
+ndk = { version = "0.9", features = ["api-level-24"] }
+ndk-context = "0.1"
+
+# Android-specific logging
+android_logger = "0.14"
+
+# Image decoding for MJPEG streams
+jpeg-decoder = "0.3"
+
+# UVC driver with vendored libusb
+# Note: Using a fork that supports vendored builds for Android
+# uvc = { git = "https://github.com/AberrantWolf/uvc-rs", features = ["vendor"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

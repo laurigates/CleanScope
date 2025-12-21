@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+    USB Device Filter for UVC (USB Video Class) devices
+
+    UVC devices use class 0x0E (14 decimal) as defined in the USB specification.
+    This filter matches any USB device that identifies as a video device,
+    which includes most endoscopes and USB cameras.
+
+    The empty <usb-device /> tag acts as a catch-all for any USB device,
+    which is useful for development. For production, you may want to
+    restrict to specific vendor/product IDs or use the class filter below.
+    -->
+
+    <!-- Catch-all: matches any USB device (development mode) -->
+    <usb-device />
+
+    <!--
+    Alternative: Match only UVC (USB Video Class) devices
+    Uncomment the line below and comment out the catch-all above for production
+    -->
+    <!-- <usb-device class="14" /> -->
+
+    <!--
+    For specific endoscope models, you can add vendor/product ID filters:
+    <usb-device vendor-id="1234" product-id="5678" />
+
+    Common endoscope vendor IDs (in decimal):
+    - Depstech: 1443 (0x05A3)
+    - Teslong: 1443 (0x05A3)
+    - Generic UVC: varies
+    -->
+</resources>
