@@ -5,6 +5,9 @@ node_modules/
 dist/
 build/
 
+# Generated documentation
+docs/
+
 # Tauri build
 src-tauri/target/
 
@@ -29,6 +32,9 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+
+# MCP configuration (contains project-specific server setup)
+.mcp.json
 
 # Logs
 *.log

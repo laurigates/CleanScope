@@ -63,11 +63,22 @@ all = { level = "warn", priority = -1 }
 # Allow noisy lints during early development
 needless-pass-by-value = "allow"
 unnecessary-wraps = "allow"
-doc-markdown = "allow"
-missing-errors-doc = "allow"
-missing-panics-doc = "allow"
 must-use-candidate = "allow"
+
+# Documentation lints (standard level)
+doc-markdown = "warn"
+missing-errors-doc = "warn"
+missing-panics-doc = "warn"
 
 [lints.rust]
 # Allow dead code during early development
 dead-code = "allow"
+
+# Documentation requirements (standard level)
+missing_docs = "warn"
+
+[lints.rustdoc]
+# Detect broken documentation links
+broken_intra_doc_links = "warn"
+missing_crate_level_docs = "warn"
+private_intra_doc_links = "warn"

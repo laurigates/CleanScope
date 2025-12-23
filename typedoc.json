@@ -1,0 +1,13 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["./src"],
+  "entryPointStrategy": "expand",
+  "out": "docs/api",
+  "name": "CleanScope",
+  "includeVersion": true,
+  "readme": "README.md",
+  "exclude": ["**/node_modules/**", "**/*.test.ts", "**/*.spec.ts"],
+  "excludePrivate": true,
+  "excludeProtected": false,
+  "skipErrorChecking": true
+}

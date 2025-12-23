@@ -16,7 +16,9 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
-    "format:check": "biome format ."
+    "format:check": "biome format .",
+    "docs:build": "typedoc",
+    "docs:serve": "npx serve docs"
   },
   "keywords": [
     "tauri",
@@ -36,6 +38,7 @@
     "@tsconfig/svelte": "^5.0.0",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
+    "typedoc": "^0.27.6",
     "typescript": "^5.0.0",
     "vite": "^6.0.0"
   }
