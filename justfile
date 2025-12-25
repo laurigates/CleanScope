@@ -140,6 +140,40 @@ setup-rust-targets:
     rustup target add x86_64-linux-android
     echo "Rust Android targets installed."
 
+# Install Android emulator and system image
+setup-emulator:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Installing Android emulator..."
+
+    # Install emulator and system image (arm64 for Apple Silicon)
+    sdkmanager "emulator" "system-images;android-34;google_apis;arm64-v8a"
+
+    echo ""
+    echo "Emulator installed. Run 'just emulator-create' to create a virtual device."
+
+# Create an Android Virtual Device for testing
+emulator-create name="cleanscope":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AVD_NAME="{{name}}"
+
+    # Check if AVD already exists
+    if avdmanager list avd | grep -q "Name: $AVD_NAME"; then
+        echo "AVD '$AVD_NAME' already exists. Delete it first with:"
+        echo "  avdmanager delete avd -n $AVD_NAME"
+        exit 1
+    fi
+
+    echo "Creating AVD '$AVD_NAME'..."
+    echo "no" | avdmanager create avd \
+        -n "$AVD_NAME" \
+        -k "system-images;android-34;google_apis;arm64-v8a" \
+        -d "pixel_6"
+
+    echo ""
+    echo "AVD '$AVD_NAME' created. Run 'just emulator-run' to start it."
+
 # Install npm dependencies
 install:
     npm install
@@ -151,6 +185,42 @@ install:
 # Run desktop development server
 dev:
     npm run tauri:dev
+
+# Initialize or reinitialize Android project (run after changing package name/identifier)
+android-init:
+    rm -rf src-tauri/gen/android
+    npx tauri android init
+
+# Start Android emulator (run in separate terminal)
+emulator-run name="cleanscope":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SDK_ROOT="/opt/homebrew/share/android-commandlinetools"
+
+    # Check if emulator exists
+    if [[ ! -x "$SDK_ROOT/emulator/emulator" ]]; then
+        echo "Emulator not installed. Run 'just setup-emulator' first."
+        exit 1
+    fi
+
+    AVD_NAME="{{name}}"
+
+    # Check if AVD exists
+    if ! avdmanager list avd | grep -q "Name: $AVD_NAME"; then
+        echo "AVD '$AVD_NAME' not found. Run 'just emulator-create' first."
+        exit 1
+    fi
+
+    # Find AVD location (may be in non-standard location like ~/.config/.android/avd/)
+    AVD_PATH=$(avdmanager list avd 2>/dev/null | grep "Path:" | head -1 | sed 's/.*Path: //')
+    if [[ -n "$AVD_PATH" ]]; then
+        export ANDROID_AVD_HOME="$(dirname "$AVD_PATH")"
+    fi
+
+    echo "Starting emulator '$AVD_NAME'..."
+    echo "(Note: USB OTG is not supported in emulators - use physical device for endoscope testing)"
+    echo ""
+    "$SDK_ROOT/emulator/emulator" -avd "$AVD_NAME"
 
 # Run Android development (builds, installs, launches on connected device)
 android-dev: _require-android
