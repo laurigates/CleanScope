@@ -8,29 +8,102 @@ CleanScope is a privacy-respecting Android application for viewing video feeds f
 
 ## Development Commands
 
+Run `just --list` for all available recipes. Key commands:
+
 ```bash
 # Install dependencies
-npm install
+just install
 
 # Desktop development
-npm run tauri:dev
+just dev
 
-# Android development (requires SDK + NDK)
-npm run tauri:android:dev
+# Android development (physical device)
+just android-dev
+
+# Android development (emulator)
+# Terminal 1: Start emulator (keep running)
+just emulator-run
+# Terminal 2: Deploy app (after emulator boots)
+just android-dev
 
 # Build Android APK
-npm run tauri:android:build
+just android-build
 
-# Type checking (Svelte/TypeScript)
-npm run check
+# Run all checks (lint, format, typecheck, rust)
+just check-all
 
-# Rust checks (from src-tauri/)
-cargo check
-cargo clippy
-
-# View Android logs (filter by app tag)
-adb logcat -s CleanScope:* RustStdoutStderr:*
+# View Android logs
+just logs
 ```
+
+### Emulator Setup (one-time)
+
+```bash
+just setup-emulator    # Install emulator + system image
+just emulator-create   # Create AVD named "cleanscope"
+```
+
+**Note:** USB OTG is not supported in emulators. Use a physical device for endoscope testing.
+
+## ADB over WiFi (USB Endoscope Testing)
+
+Most Android phones have a single USB-C port, which is needed for the endoscope. Use ADB over WiFi to deploy and debug while the endoscope is connected.
+
+### Setup Procedure
+
+1. **Connect phone via USB** (temporarily, for initial setup)
+
+2. **Enable TCP/IP mode:**
+   ```bash
+   adb tcpip 5555
+   ```
+
+3. **Get phone's IP address:**
+   ```bash
+   adb shell ip addr show wlan0 | grep "inet "
+   ```
+   Look for the IP address (e.g., `192.168.1.42`)
+
+4. **Connect wirelessly:**
+   ```bash
+   adb connect <PHONE_IP>:5555
+   ```
+
+5. **Unplug USB cable** - ADB now runs over WiFi
+
+6. **Deploy the app:**
+   ```bash
+   just android-dev
+   ```
+
+7. **Plug endoscope into phone's USB-C port**
+
+8. **Monitor logs:**
+   ```bash
+   just logs
+   ```
+
+### Requirements
+
+- Phone and computer must be on the same network
+- Vite is configured with `host: "0.0.0.0"` in `vite.config.ts` for network accessibility
+
+### Reconnection
+
+- Connection persists until phone reboots
+- If connection drops, reconnect with: `adb connect <PHONE_IP>:5555`
+- Verify connection: `adb devices`
+
+### Alternative: Native Wireless Debugging (Android 11+)
+
+Android 11 and later have built-in wireless debugging:
+
+1. Go to **Settings > Developer Options > Wireless debugging**
+2. Enable and tap to view pairing code and port
+3. Pair: `adb pair <IP>:<PAIRING_PORT>` (enter pairing code when prompted)
+4. Connect: `adb connect <IP>:<DEBUG_PORT>`
+
+This method survives reboots after initial pairing.
 
 ## Architecture
 
