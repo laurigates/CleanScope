@@ -48,9 +48,12 @@ android_logger = "0.14"
 # Image decoding for MJPEG streams
 jpeg-decoder = "0.3"
 
-# UVC driver with vendored libusb
-# Note: Using a fork that supports vendored builds for Android
-# uvc = { git = "https://github.com/AberrantWolf/uvc-rs", features = ["vendor"] }
+# Low-level USB access via libusb
+# Using vendored libusb to avoid system dependency issues on Android
+libusb1-sys = { version = "0.7", features = ["vendored"] }
+
+# libc for raw pointer types used in libusb FFI
+libc = "0.2"
 
 [features]
 default = ["custom-protocol"]

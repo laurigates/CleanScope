@@ -1,4 +1,4 @@
-//! USB device handling for CleanScope
+//! USB device handling for `CleanScope`
 //!
 //! This module handles USB device detection, permission management,
 //! and UVC camera streaming on Android.
@@ -7,10 +7,13 @@ use tauri::AppHandle;
 
 #[cfg(target_os = "android")]
 use jni::{
-    objects::{JClass, JObject, JString, JValue},
+    objects::{JClass, JObject, JValue},
     sys::jint,
     JNIEnv,
 };
+
+#[cfg(target_os = "android")]
+use crate::libusb_android::{uvc, LibusbContext, LibusbDeviceHandle, LibusbError};
 
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
@@ -160,25 +163,252 @@ fn get_usb_file_descriptor() -> Option<i32> {
     Some(fd)
 }
 
+/// UVC Probe/Commit control structure (26 bytes for UVC 1.1)
+#[cfg(target_os = "android")]
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default)]
+struct UvcStreamControl {
+    bm_hint: u16,
+    b_format_index: u8,
+    b_frame_index: u8,
+    dw_frame_interval: u32,
+    w_key_frame_rate: u16,
+    w_p_frame_rate: u16,
+    w_comp_quality: u16,
+    w_comp_window_size: u16,
+    w_delay: u16,
+    dw_max_video_frame_size: u32,
+    dw_max_payload_transfer_size: u32,
+}
+
 /// Run the camera streaming loop
 #[cfg(target_os = "android")]
 fn run_camera_loop(fd: i32) {
     log::info!("Starting camera loop with fd: {}", fd);
 
-    // TODO: Initialize UVC context with the file descriptor
-    // This is where we would use the uvc crate to:
-    // 1. Create a UVC context from the file descriptor
-    // 2. Open the device
-    // 3. Set up frame callback
-    // 4. Start streaming
+    match run_camera_loop_inner(fd) {
+        Ok(()) => log::info!("Camera loop ended normally"),
+        Err(e) => log::error!("Camera loop error: {}", e),
+    }
+}
 
-    // For now, just log that we would be streaming
-    log::info!("Camera loop would start streaming from fd: {}", fd);
+#[cfg(target_os = "android")]
+fn run_camera_loop_inner(fd: i32) -> Result<(), LibusbError> {
+    // Initialize libusb context for Android (no device discovery)
+    let ctx = LibusbContext::new_android()?;
+    log::info!("libusb context created");
 
-    // Placeholder loop - in real implementation, this would be the frame processing loop
+    // Wrap the Android file descriptor as a libusb device handle
+    let dev = ctx.wrap_fd(fd)?;
+    log::info!("Android FD wrapped successfully");
+
+    // Get device descriptor to verify we have a video device
+    let desc = dev.get_device_descriptor()?;
+    log::info!(
+        "Device: VID={:04x} PID={:04x} Class={:02x}",
+        desc.vendor_id,
+        desc.product_id,
+        desc.device_class
+    );
+
+    // Claim the video streaming interface (typically interface 1)
+    // Interface 0 is usually the control interface, interface 1 is streaming
+    let streaming_interface = 1;
+    if let Err(e) = dev.claim_interface(streaming_interface) {
+        log::warn!("Could not claim interface {}: {}", streaming_interface, e);
+        // Try interface 0 as fallback
+        dev.claim_interface(0)?;
+    }
+
+    // Start UVC streaming
+    match start_uvc_streaming(&dev) {
+        Ok(endpoint) => {
+            log::info!("UVC streaming started on endpoint 0x{:02x}", endpoint);
+            stream_frames(&dev, endpoint)?;
+        }
+        Err(e) => {
+            log::error!("Failed to start UVC streaming: {}", e);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Start UVC streaming by sending probe/commit control requests
+#[cfg(target_os = "android")]
+fn start_uvc_streaming(dev: &LibusbDeviceHandle) -> Result<u8, LibusbError> {
+    log::info!("Initiating UVC probe/commit sequence");
+
+    // UVC probe control - request the camera's default format
+    let mut probe = UvcStreamControl::default();
+    probe.bm_hint = 1; // dwFrameInterval field is valid
+    probe.b_format_index = 1; // First format (usually MJPEG)
+    probe.b_frame_index = 1; // First frame size
+
+    // Request type: Class request to interface, direction OUT then IN
+    let request_type_out = uvc::USB_TYPE_CLASS | uvc::USB_RECIP_INTERFACE | uvc::USB_DIR_OUT;
+    let request_type_in = uvc::USB_TYPE_CLASS | uvc::USB_RECIP_INTERFACE | uvc::USB_DIR_IN;
+
+    let streaming_interface: u16 = 1;
+    let control_selector = uvc::UVC_VS_PROBE_CONTROL << 8;
+
+    // Convert struct to bytes for transfer
+    let probe_bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut probe as *mut UvcStreamControl as *mut u8,
+            std::mem::size_of::<UvcStreamControl>(),
+        )
+    };
+
+    // SET_CUR probe control
+    log::debug!("Sending UVC SET_CUR PROBE");
+    dev.control_transfer(
+        request_type_out,
+        uvc::UVC_SET_CUR,
+        control_selector,
+        streaming_interface,
+        probe_bytes,
+        1000,
+    )?;
+
+    // GET_CUR probe control - camera returns its chosen parameters
+    log::debug!("Sending UVC GET_CUR PROBE");
+    let mut response = [0u8; 26];
+    dev.control_transfer(
+        request_type_in,
+        uvc::UVC_GET_CUR,
+        control_selector,
+        streaming_interface,
+        &mut response,
+        1000,
+    )?;
+
+    log::info!("Camera probe response received");
+
+    // Parse the response to get the negotiated parameters
+    // Use read_unaligned because UvcStreamControl is packed
+    let negotiated: UvcStreamControl =
+        unsafe { std::ptr::read_unaligned(response.as_ptr() as *const _) };
+
+    // Copy fields to local variables to avoid unaligned access
+    let format_index = negotiated.b_format_index;
+    let frame_index = negotiated.b_frame_index;
+    let max_frame_size = negotiated.dw_max_video_frame_size;
+    log::info!(
+        "Negotiated: format={} frame={} max_frame_size={}",
+        format_index,
+        frame_index,
+        max_frame_size
+    );
+
+    // Commit the negotiated parameters
+    let commit_control = uvc::UVC_VS_COMMIT_CONTROL << 8;
+    log::debug!("Sending UVC SET_CUR COMMIT");
+    dev.control_transfer(
+        request_type_out,
+        uvc::UVC_SET_CUR,
+        commit_control,
+        streaming_interface,
+        &mut response,
+        1000,
+    )?;
+
+    log::info!("UVC streaming committed");
+
+    // Return the streaming endpoint address (typically 0x81 for bulk IN)
+    // This should be read from the endpoint descriptor, but most USB cameras use 0x81
+    Ok(0x81)
+}
+
+/// Stream frames from the camera
+#[cfg(target_os = "android")]
+fn stream_frames(dev: &LibusbDeviceHandle, endpoint: u8) -> Result<(), LibusbError> {
+    log::info!("Starting frame streaming from endpoint 0x{:02x}", endpoint);
+
+    // Buffer for receiving USB data
+    // USB packets are typically up to 512 bytes (full-speed) or 1024 bytes (high-speed)
+    // MJPEG frames can be several KB, so we need to accumulate packets
+    let mut packet_buffer = vec![0u8; 16384]; // 16KB per transfer
+    let mut frame_buffer = Vec::with_capacity(1024 * 1024); // 1MB for frame accumulation
+
+    let timeout_ms = 1000;
+    let mut frame_count = 0u32;
+
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        log::debug!("Camera loop tick (fd: {})", fd);
+        // Perform bulk transfer to read data
+        match dev.bulk_transfer(endpoint, &mut packet_buffer, timeout_ms) {
+            Ok(transferred) => {
+                if transferred > 0 {
+                    // UVC payloads have a header (usually 12 bytes)
+                    // The header contains info about frame boundaries
+                    if transferred > 12 {
+                        let header_len = packet_buffer[0] as usize;
+                        let header_flags = packet_buffer[1];
+                        let _pts = if header_len >= 6 {
+                            u32::from_le_bytes([
+                                packet_buffer[2],
+                                packet_buffer[3],
+                                packet_buffer[4],
+                                packet_buffer[5],
+                            ])
+                        } else {
+                            0
+                        };
+
+                        // Check for end of frame (bit 1 of header flags)
+                        let end_of_frame = (header_flags & 0x02) != 0;
+
+                        // Append payload data (skip header)
+                        if header_len < transferred {
+                            frame_buffer.extend_from_slice(&packet_buffer[header_len..transferred]);
+                        }
+
+                        if end_of_frame && !frame_buffer.is_empty() {
+                            frame_count += 1;
+
+                            // Check for JPEG markers
+                            if frame_buffer.len() >= 2
+                                && frame_buffer[0] == 0xFF
+                                && frame_buffer[1] == 0xD8
+                            {
+                                log::debug!(
+                                    "MJPEG frame {} received: {} bytes",
+                                    frame_count,
+                                    frame_buffer.len()
+                                );
+
+                                // TODO: Decode JPEG and emit to frontend
+                                // For now, just log the frame
+                                if frame_count % 30 == 0 {
+                                    log::info!(
+                                        "Received {} frames, last frame: {} bytes",
+                                        frame_count,
+                                        frame_buffer.len()
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "Non-JPEG frame received: {} bytes, header: {:02x?}",
+                                    frame_buffer.len(),
+                                    &frame_buffer[..std::cmp::min(16, frame_buffer.len())]
+                                );
+                            }
+
+                            frame_buffer.clear();
+                        }
+                    }
+                }
+            }
+            Err(LibusbError::Timeout) => {
+                // Timeout is expected when no data is available
+                log::trace!("Bulk transfer timeout");
+            }
+            Err(e) => {
+                log::error!("Bulk transfer error: {}", e);
+                return Err(e);
+            }
+        }
     }
 }
 

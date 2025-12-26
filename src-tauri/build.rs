@@ -1,3 +1,7 @@
+//! Build script for `CleanScope`
+//!
+//! Configures Android-specific build settings and runs Tauri's build process.
+
 fn main() {
     // Only run Android-specific logic when building for Android
     #[cfg(target_os = "android")]

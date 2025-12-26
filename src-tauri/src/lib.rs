@@ -1,8 +1,11 @@
-//! CleanScope - Privacy-respecting USB endoscope viewer
+//! `CleanScope` - Privacy-respecting USB endoscope viewer
 //!
 //! This module contains the core Tauri application logic and USB camera handling.
 
 mod usb;
+
+#[cfg(target_os = "android")]
+mod libusb_android;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -10,14 +13,18 @@ use tauri::{AppHandle, Emitter};
 /// USB device connection status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbStatus {
+    /// Whether a USB device is currently connected
     pub connected: bool,
+    /// Optional information about the connected device
     pub info: Option<String>,
 }
 
 /// Camera resolution information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
+    /// Width in pixels
     pub width: u32,
+    /// Height in pixels
     pub height: u32,
 }
 
@@ -66,6 +73,14 @@ pub fn emit_camera_frame(app: &AppHandle, width: u32, height: u32) {
     let _ = app.emit("camera-frame", Resolution { width, height });
 }
 
+/// Run the `CleanScope` application
+///
+/// Initializes logging, sets up the Tauri builder with commands and plugins,
+/// and starts the application.
+///
+/// # Panics
+///
+/// Panics if the Tauri application fails to start.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize logging
