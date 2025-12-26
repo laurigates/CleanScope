@@ -1,6 +1,6 @@
 # Work Overview: CleanScope
 
-## Current Phase: Scaffolding
+## Current Phase: UVC Streaming
 
 ### Completed
 - Tauri v2 + Rust Android app scaffolded
@@ -8,18 +8,22 @@
 - Android USB intent filters configured
 - JNI bridge for USB file descriptor access
 - Basic UI with connection status display
+- libusb1-sys integration with vendored libusb for Android
+- libusb Android wrapper (libusb_android.rs) with safe FFI
+- UVC streaming protocol implementation (probe/commit, bulk transfers)
+- MJPEG frame boundary detection
 
 ### In Progress
-- UVC camera streaming implementation
+- Connect MJPEG frames to frontend canvas
 
 ### Pending
-- Integrate UVC library with vendored libusb for Android
-- Implement MJPEG frame decoding pipeline
+- JPEG decoding with jpeg-decoder crate
 - Canvas rendering for camera frames
 - Resolution cycling functionality
 - Error handling for USB disconnection
+- Frame rate optimization
 
 ## Next Steps
-1. Find/fork uvc-rs with Android-compatible vendored libusb
-2. Implement frame callback and streaming loop
-3. Connect frame data to frontend canvas
+1. Emit decoded frames to frontend via Tauri events
+2. Render frames on HTML5 canvas
+3. Test with physical USB endoscope device

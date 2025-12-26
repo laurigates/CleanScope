@@ -1,70 +1,130 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { onDestroy, onMount } from "svelte";
 
-  let connectionStatus = $state<"disconnected" | "connecting" | "connected">("disconnected");
-  let cameraInfo = $state<string>("");
-  let currentResolution = $state<string>("");
-  let availableResolutions = $state<string[]>([]);
-  let errorMessage = $state<string>("");
+let connectionStatus = $state<"disconnected" | "connecting" | "connected">("disconnected");
+let cameraInfo = $state<string>("");
+let currentResolution = $state<string>("");
+const availableResolutions = $state<string[]>([]);
+let errorMessage = $state<string>("");
+let frameCount = $state<number>(0);
 
-  onMount(async () => {
-    // Listen for USB device events from Rust backend
-    await listen<{ connected: boolean; info?: string }>("usb-device-event", (event) => {
+// Canvas refs
+let canvas: HTMLCanvasElement;
+let ctx: CanvasRenderingContext2D | null = null;
+
+// Event listener cleanup functions
+const unlistenFns: UnlistenFn[] = [];
+
+onMount(async () => {
+  // Initialize canvas context
+  if (canvas) {
+    ctx = canvas.getContext("2d");
+  }
+
+  // Listen for USB device events from Rust backend
+  const unlistenUsb = await listen<{ connected: boolean; info?: string }>(
+    "usb-device-event",
+    (event) => {
       if (event.payload.connected) {
         connectionStatus = "connected";
         cameraInfo = event.payload.info || "USB Camera";
       } else {
         connectionStatus = "disconnected";
         cameraInfo = "";
+        frameCount = 0;
       }
-    });
+    },
+  );
+  unlistenFns.push(unlistenUsb);
 
-    // Listen for camera frames (for future canvas rendering)
-    await listen<{ width: number; height: number }>("camera-frame", (event) => {
-      currentResolution = `${event.payload.width}x${event.payload.height}`;
-    });
-
-    // Check initial connection status
+  // Listen for frame-ready events and fetch frame data
+  const unlistenFrame = await listen("frame-ready", async () => {
     try {
-      const status = await invoke<{ connected: boolean; info?: string }>("check_usb_status");
-      if (status.connected) {
-        connectionStatus = "connected";
-        cameraInfo = status.info || "USB Camera";
-      }
+      // Fetch raw JPEG bytes from Rust backend
+      const frameData: ArrayBuffer = await invoke("get_frame");
+      await renderFrame(frameData);
+      frameCount++;
     } catch (e) {
-      console.log("No USB device on startup");
+      // Silently ignore frame fetch errors (e.g., no frame available yet)
+      console.debug("Frame fetch error:", e);
     }
   });
+  unlistenFns.push(unlistenFrame);
 
-  async function cycleResolution() {
-    if (connectionStatus !== "connected") return;
-    try {
-      const newRes = await invoke<string>("cycle_resolution");
-      currentResolution = newRes;
-    } catch (e) {
-      errorMessage = `Failed to change resolution: ${e}`;
+  // Check initial connection status
+  try {
+    const status = await invoke<{ connected: boolean; info?: string }>("check_usb_status");
+    if (status.connected) {
+      connectionStatus = "connected";
+      cameraInfo = status.info || "USB Camera";
     }
+  } catch (e) {
+    console.log("No USB device on startup");
+  }
+});
+
+onDestroy(() => {
+  // Clean up event listeners
+  for (const unlisten of unlistenFns) {
+    unlisten();
+  }
+});
+
+/**
+ * Render a JPEG frame to the canvas using browser-native decoding
+ */
+async function renderFrame(data: ArrayBuffer): Promise<void> {
+  if (!ctx || !canvas) return;
+
+  // Create blob from raw JPEG bytes
+  const blob = new Blob([data], { type: "image/jpeg" });
+
+  // Use createImageBitmap for efficient decoding (off main thread)
+  const bitmap = await createImageBitmap(blob);
+
+  // Resize canvas to match frame dimensions (only if changed)
+  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    currentResolution = `${bitmap.width}x${bitmap.height}`;
   }
 
-  function getStatusColor(): string {
-    switch (connectionStatus) {
-      case "connected":
-        return "#4ade80";
-      case "connecting":
-        return "#fbbf24";
-      default:
-        return "#ef4444";
-    }
+  // Draw bitmap to canvas
+  ctx.drawImage(bitmap, 0, 0);
+
+  // Release bitmap resources
+  bitmap.close();
+}
+
+async function cycleResolution() {
+  if (connectionStatus !== "connected") return;
+  try {
+    const newRes = await invoke<string>("cycle_resolution");
+    currentResolution = newRes;
+  } catch (e) {
+    errorMessage = `Failed to change resolution: ${e}`;
   }
+}
+
+function getStatusColor(): string {
+  switch (connectionStatus) {
+    case "connected":
+      return "#4ade80";
+    case "connecting":
+      return "#fbbf24";
+    default:
+      return "#ef4444";
+  }
+}
 </script>
 
 <main>
   <div class="container">
     <!-- Video Display Area -->
     <div class="video-container">
-      <canvas id="camera-canvas"></canvas>
+      <canvas bind:this={canvas} id="camera-canvas"></canvas>
       {#if connectionStatus === "disconnected"}
         <div class="overlay">
           <div class="waiting-message">

@@ -3,7 +3,13 @@
 //! This module handles USB device detection, permission management,
 //! and UVC camera streaming on Android.
 
+use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
+
+#[cfg(target_os = "android")]
+use tauri::Emitter;
+
+use crate::FrameBuffer;
 
 #[cfg(target_os = "android")]
 use jni::{
@@ -17,7 +23,7 @@ use crate::libusb_android::{uvc, LibusbContext, LibusbDeviceHandle, LibusbError}
 
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
-pub fn init_usb_handler(app_handle: AppHandle) {
+pub fn init_usb_handler(app_handle: AppHandle, frame_buffer: Arc<Mutex<FrameBuffer>>) {
     log::info!("Initializing USB handler");
 
     #[cfg(target_os = "android")]
@@ -29,7 +35,7 @@ pub fn init_usb_handler(app_handle: AppHandle) {
 
             // Start the camera streaming loop in a new thread
             std::thread::spawn(move || {
-                run_camera_loop(fd);
+                run_camera_loop(fd, app_handle, frame_buffer);
             });
         } else {
             log::info!("No USB device found on startup");
@@ -40,6 +46,7 @@ pub fn init_usb_handler(app_handle: AppHandle) {
     {
         log::info!("USB handling not available on this platform");
         let _ = app_handle; // Suppress unused warning
+        let _ = frame_buffer; // Suppress unused warning
     }
 }
 
@@ -183,17 +190,21 @@ struct UvcStreamControl {
 
 /// Run the camera streaming loop
 #[cfg(target_os = "android")]
-fn run_camera_loop(fd: i32) {
+fn run_camera_loop(fd: i32, app_handle: AppHandle, frame_buffer: Arc<Mutex<FrameBuffer>>) {
     log::info!("Starting camera loop with fd: {}", fd);
 
-    match run_camera_loop_inner(fd) {
+    match run_camera_loop_inner(fd, app_handle, frame_buffer) {
         Ok(()) => log::info!("Camera loop ended normally"),
         Err(e) => log::error!("Camera loop error: {}", e),
     }
 }
 
 #[cfg(target_os = "android")]
-fn run_camera_loop_inner(fd: i32) -> Result<(), LibusbError> {
+fn run_camera_loop_inner(
+    fd: i32,
+    app_handle: AppHandle,
+    frame_buffer: Arc<Mutex<FrameBuffer>>,
+) -> Result<(), LibusbError> {
     // Initialize libusb context for Android (no device discovery)
     let ctx = LibusbContext::new_android()?;
     log::info!("libusb context created");
@@ -224,7 +235,7 @@ fn run_camera_loop_inner(fd: i32) -> Result<(), LibusbError> {
     match start_uvc_streaming(&dev) {
         Ok(endpoint) => {
             log::info!("UVC streaming started on endpoint 0x{:02x}", endpoint);
-            stream_frames(&dev, endpoint)?;
+            stream_frames(&dev, endpoint, app_handle, frame_buffer)?;
         }
         Err(e) => {
             log::error!("Failed to start UVC streaming: {}", e);
@@ -323,14 +334,21 @@ fn start_uvc_streaming(dev: &LibusbDeviceHandle) -> Result<u8, LibusbError> {
 
 /// Stream frames from the camera
 #[cfg(target_os = "android")]
-fn stream_frames(dev: &LibusbDeviceHandle, endpoint: u8) -> Result<(), LibusbError> {
+fn stream_frames(
+    dev: &LibusbDeviceHandle,
+    endpoint: u8,
+    app_handle: AppHandle,
+    shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
+) -> Result<(), LibusbError> {
+    use std::time::Instant;
+
     log::info!("Starting frame streaming from endpoint 0x{:02x}", endpoint);
 
     // Buffer for receiving USB data
     // USB packets are typically up to 512 bytes (full-speed) or 1024 bytes (high-speed)
     // MJPEG frames can be several KB, so we need to accumulate packets
     let mut packet_buffer = vec![0u8; 16384]; // 16KB per transfer
-    let mut frame_buffer = Vec::with_capacity(1024 * 1024); // 1MB for frame accumulation
+    let mut local_frame_buffer = Vec::with_capacity(1024 * 1024); // 1MB for frame accumulation
 
     let timeout_ms = 1000;
     let mut frame_count = 0u32;
@@ -361,41 +379,53 @@ fn stream_frames(dev: &LibusbDeviceHandle, endpoint: u8) -> Result<(), LibusbErr
 
                         // Append payload data (skip header)
                         if header_len < transferred {
-                            frame_buffer.extend_from_slice(&packet_buffer[header_len..transferred]);
+                            local_frame_buffer
+                                .extend_from_slice(&packet_buffer[header_len..transferred]);
                         }
 
-                        if end_of_frame && !frame_buffer.is_empty() {
+                        if end_of_frame && !local_frame_buffer.is_empty() {
                             frame_count += 1;
 
-                            // Check for JPEG markers
-                            if frame_buffer.len() >= 2
-                                && frame_buffer[0] == 0xFF
-                                && frame_buffer[1] == 0xD8
+                            // Check for JPEG markers (SOI: 0xFFD8)
+                            if local_frame_buffer.len() >= 2
+                                && local_frame_buffer[0] == 0xFF
+                                && local_frame_buffer[1] == 0xD8
                             {
                                 log::debug!(
                                     "MJPEG frame {} received: {} bytes",
                                     frame_count,
-                                    frame_buffer.len()
+                                    local_frame_buffer.len()
                                 );
 
-                                // TODO: Decode JPEG and emit to frontend
-                                // For now, just log the frame
+                                // Store frame in shared buffer for frontend retrieval
+                                {
+                                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                                    buffer.frame = local_frame_buffer.clone();
+                                    buffer.timestamp = Instant::now();
+                                    // Note: width/height would need JPEG parsing to determine
+                                    // For now, leave as 0 (frontend uses actual decoded dimensions)
+                                }
+
+                                // Emit lightweight notification (no payload) to trigger frontend fetch
+                                let _ = app_handle.emit("frame-ready", ());
+
                                 if frame_count % 30 == 0 {
                                     log::info!(
                                         "Received {} frames, last frame: {} bytes",
                                         frame_count,
-                                        frame_buffer.len()
+                                        local_frame_buffer.len()
                                     );
                                 }
                             } else {
                                 log::warn!(
                                     "Non-JPEG frame received: {} bytes, header: {:02x?}",
-                                    frame_buffer.len(),
-                                    &frame_buffer[..std::cmp::min(16, frame_buffer.len())]
+                                    local_frame_buffer.len(),
+                                    &local_frame_buffer
+                                        [..std::cmp::min(16, local_frame_buffer.len())]
                                 );
                             }
 
-                            frame_buffer.clear();
+                            local_frame_buffer.clear();
                         }
                     }
                 }
@@ -413,7 +443,7 @@ fn stream_frames(dev: &LibusbDeviceHandle, endpoint: u8) -> Result<(), LibusbErr
 }
 
 #[cfg(not(target_os = "android"))]
-fn run_camera_loop(_fd: i32) {
+fn run_camera_loop(_fd: i32, _app_handle: AppHandle, _frame_buffer: Arc<Mutex<FrameBuffer>>) {
     log::info!("Camera loop not available on this platform");
 }
 

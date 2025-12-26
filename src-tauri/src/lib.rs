@@ -8,7 +8,38 @@ mod usb;
 mod libusb_android;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tauri::{AppHandle, Emitter, State};
+
+/// Shared frame buffer for storing the latest camera frame
+pub struct FrameBuffer {
+    /// Raw JPEG frame data
+    pub frame: Vec<u8>,
+    /// Timestamp when frame was captured
+    pub timestamp: Instant,
+    /// Frame width in pixels
+    pub width: u32,
+    /// Frame height in pixels
+    pub height: u32,
+}
+
+impl Default for FrameBuffer {
+    fn default() -> Self {
+        Self {
+            frame: Vec::new(),
+            timestamp: Instant::now(),
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+/// Application state managed by Tauri
+pub struct AppState {
+    /// Shared frame buffer protected by mutex
+    pub frame_buffer: Arc<Mutex<FrameBuffer>>,
+}
 
 /// USB device connection status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +94,24 @@ fn get_resolutions() -> Result<Vec<Resolution>, String> {
     ])
 }
 
+/// Get the latest camera frame as raw bytes
+///
+/// Returns the frame as an `ipc::Response` containing raw JPEG data,
+/// which is transferred to JavaScript as an `ArrayBuffer` without Base64 encoding.
+#[tauri::command]
+fn get_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+    let buffer = state
+        .frame_buffer
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    if buffer.frame.is_empty() {
+        return Err("No frame available".to_string());
+    }
+
+    Ok(tauri::ipc::Response::new(buffer.frame.clone()))
+}
+
 /// Emit a USB device event to the frontend
 pub fn emit_usb_event(app: &AppHandle, connected: bool, info: Option<String>) {
     let _ = app.emit("usb-device-event", UsbStatus { connected, info });
@@ -100,22 +149,30 @@ pub fn run() {
 
     log::info!("CleanScope starting up");
 
+    // Create shared frame buffer for camera frames
+    let frame_buffer = Arc::new(Mutex::new(FrameBuffer::default()));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .manage(AppState {
+            frame_buffer: Arc::clone(&frame_buffer),
+        })
         .invoke_handler(tauri::generate_handler![
             check_usb_status,
             cycle_resolution,
             get_resolutions,
+            get_frame,
         ])
-        .setup(|_app| {
+        .setup(move |_app| {
             log::info!("Tauri app setup complete");
 
             // On Android, we'll initialize the USB handling here
             #[cfg(target_os = "android")]
             {
                 let app_handle = _app.handle().clone();
+                let frame_buffer_clone = Arc::clone(&frame_buffer);
                 std::thread::spawn(move || {
-                    usb::init_usb_handler(app_handle);
+                    usb::init_usb_handler(app_handle, frame_buffer_clone);
                 });
             }
 
