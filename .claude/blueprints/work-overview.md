@@ -1,6 +1,6 @@
 # Work Overview: CleanScope
 
-## Current Phase: UVC Streaming
+## Current Phase: Testing & Refinement
 
 ### Completed
 - Tauri v2 + Rust Android app scaffolded
@@ -12,18 +12,25 @@
 - libusb Android wrapper (libusb_android.rs) with safe FFI
 - UVC streaming protocol implementation (probe/commit, bulk transfers)
 - MJPEG frame boundary detection
+- Frame streaming architecture (ADR-001)
+  - FrameBuffer shared state with Arc<Mutex<>>
+  - get_frame command with ipc::Response
+  - Lightweight "frame-ready" event emission
+- Frontend canvas rendering with createImageBitmap()
 
-### In Progress
-- Connect MJPEG frames to frontend canvas
+### Architecture Decision Records
+- ADR-001: Frame Streaming Architecture (polling pattern)
+- ADR-002: JPEG Decoding Strategy (browser-native)
+- ADR-003: Resolution Negotiation Protocol (progressive)
 
 ### Pending
-- JPEG decoding with jpeg-decoder crate
-- Canvas rendering for camera frames
-- Resolution cycling functionality
+- Test on physical Android device with USB endoscope
+- Resolution cycling UI implementation
 - Error handling for USB disconnection
 - Frame rate optimization
+- Reconnection handling
 
 ## Next Steps
-1. Emit decoded frames to frontend via Tauri events
-2. Render frames on HTML5 canvas
-3. Test with physical USB endoscope device
+1. Deploy to physical device for end-to-end testing
+2. Implement resolution cycling based on ADR-003
+3. Add error recovery and reconnection logic
