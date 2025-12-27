@@ -255,12 +255,63 @@ android-uninstall:
     adb uninstall com.cleanscope.app || echo "App not installed"
 
 # ============================================================================
-# DEVICE & LOGS
+# ADB & CONNECTIVITY
 # ============================================================================
+
+# Set up ADB over WiFi for USB endoscope testing
+adb-wifi ip="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "{{ip}}" ]]; then
+        echo "Enabling ADB TCP/IP mode..."
+        adb tcpip 5555
+        echo ""
+        echo "Get your phone's IP address:"
+        adb shell ip addr show wlan0 | grep "inet "
+        echo ""
+        echo "Then run: just adb-wifi <IP>"
+    else
+        echo "Connecting to {{ip}}:5555..."
+        adb connect "{{ip}}:5555"
+        echo ""
+        echo "Verifying connection..."
+        adb devices
+        echo ""
+        echo "You can now unplug the USB cable."
+        echo "The endoscope can be plugged into the phone's USB-C port."
+    fi
 
 # List connected Android devices
 devices:
     adb devices -l
+
+# ============================================================================
+# DEVICE & LOGS
+# ============================================================================
+
+# Show USB-related logs and device info
+usb-debug:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Connected USB Devices ==="
+    adb shell dumpsys usb | grep -A5 "USB Device" || echo "No USB devices"
+    echo ""
+    echo "=== Recent USB Logs ==="
+    adb logcat -d | grep -E "(USB|UVC|libusb|CleanScope)" | tail -50
+
+# Force stop the app
+force-stop:
+    adb shell am force-stop com.cleanscope.app
+    @echo "App stopped"
+
+# Launch the app without rebuilding
+launch:
+    adb shell am start -n com.cleanscope.app/.MainActivity
+    @echo "App launched"
+
+# Uninstall and reinstall (clears app data)
+reinstall: android-uninstall android-install launch
+    @echo "App reinstalled with fresh data"
 
 # Stream app logs from device
 logs:
@@ -333,6 +384,29 @@ clean:
     rm -rf dist
     rm -rf src-tauri/target
     rm -rf src-tauri/gen/android/app/build
+
+# ============================================================================
+# ADR & DOCUMENTATION
+# ============================================================================
+
+# List all Architecture Decision Records
+adr-list:
+    @echo "Architecture Decision Records:"
+    @ls -1 .claude/blueprints/adr/*.md 2>/dev/null | grep -v manifest | while read f; do \
+        title=$$(head -1 "$$f" | sed 's/^# //'); \
+        echo "  $$(basename "$$f"): $$title"; \
+    done
+
+# Show frame streaming statistics from logs
+frame-stats:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Frame Streaming Statistics ==="
+    LOGS=$$(adb logcat -d | grep -E "MJPEG frame|Received.*frames")
+    echo "$$LOGS" | tail -20
+    echo ""
+    FRAME_COUNT=$$(echo "$$LOGS" | grep -oE "Received [0-9]+ frames" | tail -1)
+    echo "Latest: $$FRAME_COUNT"
 
 # ============================================================================
 # INTERNAL RECIPES
