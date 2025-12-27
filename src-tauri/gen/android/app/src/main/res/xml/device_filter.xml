@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB device filter for CleanScope
+     This file specifies which USB devices should trigger auto-launch.
+
+     UVC (USB Video Class) devices use:
+     - Class: 239 (0xEF) - Miscellaneous (for composite devices)
+     - Class: 14 (0x0E) - Video class
+
+     Common USB endoscope vendor IDs:
+     - Many cheap endoscopes use generic chipsets without unique vendor IDs
+     - The class-based filter below catches most UVC cameras
+-->
+<resources>
+    <!-- Match any UVC Video device (class 14 = 0x0E) -->
+    <usb-device class="14" />
+
+    <!-- Match miscellaneous class devices (class 239 = 0xEF)
+         Some composite UVC devices present as this class -->
+    <usb-device class="239" subclass="2" />
+
+    <!-- Common endoscope chipsets - add specific IDs if needed -->
+    <!-- Example: <usb-device vendor-id="1234" product-id="5678" /> -->
+</resources>

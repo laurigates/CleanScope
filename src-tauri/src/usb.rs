@@ -50,6 +50,133 @@ pub fn init_usb_handler(app_handle: AppHandle, frame_buffer: Arc<Mutex<FrameBuff
     }
 }
 
+/// Get the device name from the USB device in the intent that launched this activity.
+/// Returns the device name (e.g., "/dev/bus/usb/001/002") if launched via USB_DEVICE_ATTACHED.
+#[cfg(target_os = "android")]
+fn get_device_name_from_intent(env: &mut JNIEnv, activity: &JObject) -> Option<String> {
+    // Get the launching intent
+    let intent = env
+        .call_method(activity, "getIntent", "()Landroid/content/Intent;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    if intent.is_null() {
+        log::info!("No intent available");
+        return None;
+    }
+
+    // Get UsbManager.EXTRA_DEVICE constant ("device")
+    let extra_device_key = env
+        .get_static_field(
+            "android/hardware/usb/UsbManager",
+            "EXTRA_DEVICE",
+            "Ljava/lang/String;",
+        )
+        .ok()?
+        .l()
+        .ok()?;
+
+    // Get the UsbDevice from intent extras
+    let intent_device = env
+        .call_method(
+            &intent,
+            "getParcelableExtra",
+            "(Ljava/lang/String;)Landroid/os/Parcelable;",
+            &[JValue::Object(&extra_device_key)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+
+    if intent_device.is_null() {
+        log::info!("No USB device in intent extras");
+        return None;
+    }
+
+    // Get the device name from the intent's UsbDevice
+    let device_name_jstring = env
+        .call_method(&intent_device, "getDeviceName", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    let device_name: String = env.get_string((&device_name_jstring).into()).ok()?.into();
+
+    log::info!("Intent has USB device: {}", device_name);
+    Some(device_name)
+}
+
+/// Get USB device from UsbManager.getDeviceList(), optionally matching a specific device name.
+/// The device from getDeviceList() has the proper permission context for openDevice().
+#[cfg(target_os = "android")]
+fn get_device_from_manager<'a>(
+    env: &mut JNIEnv<'a>,
+    usb_manager: &JObject,
+    target_device_name: Option<&str>,
+) -> Option<JObject<'a>> {
+    // Get the device list as a HashMap<String, UsbDevice>
+    let device_map = env
+        .call_method(usb_manager, "getDeviceList", "()Ljava/util/HashMap;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    // If we have a target device name, try to get it directly from the map
+    if let Some(target_name) = target_device_name {
+        let key = env.new_string(target_name).ok()?;
+        let device = env
+            .call_method(
+                &device_map,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&key)],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+
+        if !device.is_null() {
+            log::info!("Found target device in device list: {}", target_name);
+            return Some(device);
+        }
+        log::warn!("Target device {} not found in device list", target_name);
+    }
+
+    // Fallback: get first available device
+    let values = env
+        .call_method(&device_map, "values", "()Ljava/util/Collection;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    let iterator = env
+        .call_method(&values, "iterator", "()Ljava/util/Iterator;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    let has_next = env
+        .call_method(&iterator, "hasNext", "()Z", &[])
+        .ok()?
+        .z()
+        .ok()?;
+
+    if !has_next {
+        log::info!("No USB devices in device list");
+        return None;
+    }
+
+    let device = env
+        .call_method(&iterator, "next", "()Ljava/lang/Object;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+
+    log::info!("Got first USB device from device list");
+    Some(device)
+}
+
 /// Get the USB file descriptor from Android via JNI
 #[cfg(target_os = "android")]
 fn get_usb_file_descriptor() -> Option<i32> {
@@ -84,63 +211,14 @@ fn get_usb_file_descriptor() -> Option<i32> {
         .l()
         .ok()?;
 
-    // Get the device list
-    let device_map = env
-        .call_method(&usb_manager, "getDeviceList", "()Ljava/util/HashMap;", &[])
-        .ok()?
-        .l()
-        .ok()?;
+    // Get device name from intent (if launched via USB_DEVICE_ATTACHED)
+    // Then look up the device in getDeviceList() - that object has proper permission context
+    let target_device_name = get_device_name_from_intent(&mut env, &activity);
 
-    // Get the values from the map
-    let values = env
-        .call_method(&device_map, "values", "()Ljava/util/Collection;", &[])
-        .ok()?
-        .l()
-        .ok()?;
+    // Get the device from the device list (using the intent's device name if available)
+    let device = get_device_from_manager(&mut env, &usb_manager, target_device_name.as_deref())?;
 
-    let iterator = env
-        .call_method(&values, "iterator", "()Ljava/util/Iterator;", &[])
-        .ok()?
-        .l()
-        .ok()?;
-
-    // Check if there's at least one device
-    let has_next = env
-        .call_method(&iterator, "hasNext", "()Z", &[])
-        .ok()?
-        .z()
-        .ok()?;
-
-    if !has_next {
-        log::info!("No USB devices found");
-        return None;
-    }
-
-    // Get the first device
-    let device = env
-        .call_method(&iterator, "next", "()Ljava/lang/Object;", &[])
-        .ok()?
-        .l()
-        .ok()?;
-
-    // Check if we have permission
-    let has_permission = env
-        .call_method(
-            &usb_manager,
-            "hasPermission",
-            "(Landroid/hardware/usb/UsbDevice;)Z",
-            &[JValue::Object(&device)],
-        )
-        .ok()?
-        .z()
-        .ok()?;
-
-    if !has_permission {
-        log::warn!("No USB permission for device");
-        return None;
-    }
-
-    log::info!("USB Permission Granted");
+    log::info!("Attempting to open USB device");
 
     // Open the device and get the file descriptor
     let connection = env
