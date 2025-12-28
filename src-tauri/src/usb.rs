@@ -19,7 +19,10 @@ use jni::{
 };
 
 #[cfg(target_os = "android")]
-use crate::libusb_android::{uvc, LibusbContext, LibusbDeviceHandle, LibusbError};
+use crate::libusb_android::{
+    uvc, EndpointInfo, IsochronousStream, LibusbContext, LibusbDeviceHandle, LibusbError,
+    SendableContextPtr, TransferType,
+};
 
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
@@ -300,33 +303,185 @@ fn run_camera_loop_inner(
         desc.device_class
     );
 
+    // Enumerate all endpoints to understand what the device supports
+    log::info!("=== Enumerating USB endpoints ===");
+    let endpoint_info = dev.find_streaming_endpoint()?;
+    log::info!("=== Endpoint enumeration complete ===");
+
+    let ep_info = match endpoint_info {
+        Some(info) => {
+            log::info!(
+                "Selected streaming endpoint: 0x{:02x} ({:?}) on interface {}.{}, maxPacket={} x{}",
+                info.address,
+                info.transfer_type,
+                info.interface_number,
+                info.alt_setting,
+                info.max_packet_size,
+                info.transactions_per_microframe
+            );
+            info
+        }
+        None => {
+            log::error!("No streaming endpoint found in device descriptors");
+            return Err(LibusbError::NotFound);
+        }
+    };
+
     // Claim the video streaming interface (typically interface 1)
     // Interface 0 is usually the control interface, interface 1 is streaming
-    let streaming_interface = 1;
+    let streaming_interface = ep_info.interface_number as i32;
     if let Err(e) = dev.claim_interface(streaming_interface) {
         log::warn!("Could not claim interface {}: {}", streaming_interface, e);
         // Try interface 0 as fallback
         dev.claim_interface(0)?;
     }
 
-    // Start UVC streaming
-    match start_uvc_streaming(&dev) {
-        Ok(endpoint) => {
-            log::info!("UVC streaming started on endpoint 0x{:02x}", endpoint);
+    // Start UVC streaming (probe/commit sequence)
+    let endpoint = start_uvc_streaming(&dev, Some(&ep_info))?;
+    log::info!("UVC streaming started on endpoint 0x{:02x}", endpoint);
+
+    // Choose streaming method based on endpoint type
+    match ep_info.transfer_type {
+        TransferType::Isochronous => {
+            log::info!("Using ISOCHRONOUS transfers for video streaming");
+            stream_frames_isochronous(&ctx, &dev, &ep_info, app_handle, frame_buffer)?;
+        }
+        TransferType::Bulk => {
+            log::info!("Using BULK transfers for video streaming");
             stream_frames(&dev, endpoint, app_handle, frame_buffer)?;
         }
-        Err(e) => {
-            log::error!("Failed to start UVC streaming: {}", e);
-            return Err(e);
+        _ => {
+            log::error!(
+                "Unsupported endpoint transfer type: {:?}",
+                ep_info.transfer_type
+            );
+            return Err(LibusbError::NotSupported);
         }
     }
 
     Ok(())
 }
 
+/// Stream frames using isochronous transfers
+#[cfg(target_os = "android")]
+fn stream_frames_isochronous(
+    ctx: &LibusbContext,
+    dev: &LibusbDeviceHandle,
+    ep_info: &EndpointInfo,
+    app_handle: AppHandle,
+    shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
+) -> Result<(), LibusbError> {
+    use std::time::Instant;
+    use tauri::Emitter;
+
+    log::info!(
+        "Starting isochronous streaming on endpoint 0x{:02x}, max_packet={}",
+        ep_info.address,
+        ep_info.max_packet_size
+    );
+
+    // Create the isochronous stream
+    // SAFETY: We hold references to ctx and dev for the duration of streaming
+    let mut iso_stream = unsafe {
+        IsochronousStream::new(
+            ctx.get_context_ptr(),
+            dev.get_handle_ptr(),
+            ep_info.address,
+            ep_info.max_packet_size,
+        )?
+    };
+
+    // Get the frame receiver before starting
+    let frame_receiver = iso_stream.take_frame_receiver().ok_or(LibusbError::Other)?;
+
+    // Start the transfers
+    iso_stream.start()?;
+
+    // Spawn a thread to run the libusb event loop
+    let event_loop_handle = {
+        // Wrap the raw pointer in a Send-safe wrapper (uses usize internally)
+        let ctx_ptr = SendableContextPtr::new(ctx.get_context_ptr());
+        let stop_flag = iso_stream.stop_flag.clone();
+
+        std::thread::spawn(move || {
+            log::info!("Event loop thread started");
+
+            let mut timeval = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000 as libc::suseconds_t, // 100ms timeout
+            };
+
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe {
+                    let ret =
+                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
+                    if ret < 0 {
+                        let err = LibusbError::from(ret);
+                        if err != LibusbError::Interrupted {
+                            log::error!("Event loop error: {}", err);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            log::info!("Event loop thread exiting");
+        })
+    };
+
+    // Process received frames and emit to frontend
+    let mut frame_count = 0u32;
+
+    loop {
+        match frame_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(frame_data) => {
+                frame_count += 1;
+
+                // Store frame in shared buffer
+                {
+                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                    buffer.frame = frame_data;
+                    buffer.timestamp = Instant::now();
+                }
+
+                // Emit lightweight notification to trigger frontend fetch
+                let _ = app_handle.emit("frame-ready", ());
+
+                if frame_count % 30 == 0 {
+                    log::info!("Received {} frames via isochronous transfer", frame_count);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!("No frames received in 5 seconds");
+                // Check if we should continue
+                if iso_stream.is_stopped() {
+                    log::info!("Stream stopped, exiting frame loop");
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::info!("Frame channel disconnected, exiting");
+                break;
+            }
+        }
+    }
+
+    // Stop the stream
+    iso_stream.stop();
+
+    // Wait for event loop thread to finish
+    let _ = event_loop_handle.join();
+
+    log::info!("Isochronous streaming ended after {} frames", frame_count);
+    Ok(())
+}
+
 /// Start UVC streaming by sending probe/commit control requests
 #[cfg(target_os = "android")]
-fn start_uvc_streaming(dev: &LibusbDeviceHandle) -> Result<u8, LibusbError> {
+fn start_uvc_streaming(
+    dev: &LibusbDeviceHandle,
+    endpoint_info: Option<&EndpointInfo>,
+) -> Result<u8, LibusbError> {
     log::info!("Initiating UVC probe/commit sequence");
 
     // UVC probe control - request the camera's default format
@@ -405,9 +560,15 @@ fn start_uvc_streaming(dev: &LibusbDeviceHandle) -> Result<u8, LibusbError> {
 
     log::info!("UVC streaming committed");
 
-    // Return the streaming endpoint address (typically 0x81 for bulk IN)
-    // This should be read from the endpoint descriptor, but most USB cameras use 0x81
-    Ok(0x81)
+    // Set the alternate setting to enable the streaming endpoint
+    // Use the alt setting from endpoint info if available, otherwise default to 1
+    let alt_setting = endpoint_info.map(|ep| ep.alt_setting as i32).unwrap_or(1);
+    let streaming_interface_i32 = streaming_interface as i32;
+    dev.set_interface_alt_setting(streaming_interface_i32, alt_setting)?;
+
+    // Return the streaming endpoint address from descriptor, or default to 0x81
+    let endpoint_addr = endpoint_info.map(|ep| ep.address).unwrap_or(0x81);
+    Ok(endpoint_addr)
 }
 
 /// Stream frames from the camera

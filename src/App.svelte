@@ -9,6 +9,7 @@ let currentResolution = $state<string>("");
 const availableResolutions = $state<string[]>([]);
 let errorMessage = $state<string>("");
 let frameCount = $state<number>(0);
+let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
 
 // Canvas refs
 let canvas: HTMLCanvasElement;
@@ -62,6 +63,15 @@ onMount(async () => {
     }
   } catch (e) {
     console.log("No USB device on startup");
+  }
+
+  // Get build info
+  try {
+    buildInfo = await invoke<{ version: string; git_hash: string; build_time: string }>(
+      "get_build_info",
+    );
+  } catch (e) {
+    console.log("Could not get build info:", e);
   }
 });
 
@@ -156,11 +166,16 @@ function getStatusColor(): string {
         </span>
       </div>
 
-      {#if currentResolution}
-        <button class="resolution-btn" onclick={cycleResolution}>
-          {currentResolution}
-        </button>
-      {/if}
+      <div class="status-right">
+        {#if buildInfo}
+          <span class="build-info">v{buildInfo.version} ({buildInfo.git_hash})</span>
+        {/if}
+        {#if currentResolution}
+          <button class="resolution-btn" onclick={cycleResolution}>
+            {currentResolution}
+          </button>
+        {/if}
+      </div>
     </div>
 
     {#if errorMessage}
@@ -278,6 +293,18 @@ function getStatusColor(): string {
 
   .status-text {
     font-size: 0.875rem;
+  }
+
+  .status-right {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .build-info {
+    font-size: 0.7rem;
+    color: #666;
+    font-family: monospace;
   }
 
   .resolution-btn {

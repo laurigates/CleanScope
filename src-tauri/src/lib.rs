@@ -59,6 +59,27 @@ pub struct Resolution {
     pub height: u32,
 }
 
+/// Build information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildInfo {
+    /// Application version from Cargo.toml
+    pub version: String,
+    /// Git commit hash (short)
+    pub git_hash: String,
+    /// Build timestamp
+    pub build_time: String,
+}
+
+/// Get build information (version, git hash, build time)
+#[tauri::command]
+fn get_build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_hash: env!("BUILD_GIT_HASH").to_string(),
+        build_time: env!("BUILD_TIMESTAMP").to_string(),
+    }
+}
+
 /// Check the current USB device status
 #[tauri::command]
 fn check_usb_status() -> Result<UsbStatus, String> {
@@ -158,6 +179,7 @@ pub fn run() {
             frame_buffer: Arc::clone(&frame_buffer),
         })
         .invoke_handler(tauri::generate_handler![
+            get_build_info,
             check_usb_status,
             cycle_resolution,
             get_resolutions,

@@ -11,6 +11,9 @@ docs/
 # Tauri build
 src-tauri/target/
 
+# Root target (symlink or build artifacts)
+target/
+
 # Generated Android files (keep manifest templates)
 src-tauri/gen/android/.gradle/
 src-tauri/gen/android/build/
