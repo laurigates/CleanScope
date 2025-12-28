@@ -281,6 +281,235 @@ adb-wifi ip="":
         echo "The endoscope can be plugged into the phone's USB-C port."
     fi
 
+# Check ADB WiFi connection status
+wifi-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== ADB Connection Status ==="
+    echo ""
+
+    # Get list of devices
+    DEVICES=$(adb devices -l 2>/dev/null | tail -n +2 | grep -v "^$" || true)
+
+    if [[ -z "$DEVICES" ]]; then
+        echo "No devices connected."
+        echo ""
+        echo "To connect via WiFi, run: just wifi-setup"
+        exit 0
+    fi
+
+    echo "Connected devices:"
+    echo ""
+
+    # Parse each device and show connection type
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then continue; fi
+
+        DEVICE_ID=$(echo "$line" | awk '{print $1}')
+        STATUS=$(echo "$line" | awk '{print $2}')
+        MODEL=$(echo "$line" | grep -oE "model:[^ ]+" | cut -d: -f2 || echo "unknown")
+
+        if [[ "$DEVICE_ID" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+            CONNECTION_TYPE="WiFi"
+            ICON="📶"
+        else
+            CONNECTION_TYPE="USB"
+            ICON="🔌"
+        fi
+
+        echo "  $ICON $DEVICE_ID"
+        echo "    Status: $STATUS"
+        echo "    Model: $MODEL"
+        echo "    Connection: $CONNECTION_TYPE"
+        echo ""
+    done <<< "$DEVICES"
+
+    # Check if any WiFi connection exists
+    if echo "$DEVICES" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+"; then
+        echo "WiFi connection active - ready for USB endoscope testing!"
+    else
+        echo "Only USB connections found."
+        echo "For endoscope testing, set up WiFi with: just wifi-setup"
+    fi
+
+# Complete WiFi setup workflow (enable tcpip, show IP, connect)
+wifi-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== ADB WiFi Setup ==="
+    echo ""
+    echo "This sets up wireless ADB so you can use the USB-C port for the endoscope."
+    echo ""
+
+    # Check if any device is connected
+    if ! adb devices | grep -qE "device$"; then
+        echo "ERROR: No device connected via USB."
+        echo ""
+        echo "Please connect your phone via USB cable first, then run this again."
+        exit 1
+    fi
+
+    # Check if already connected via WiFi
+    if adb devices | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+.*device$"; then
+        echo "Already connected via WiFi!"
+        adb devices -l | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+"
+        echo ""
+        echo "You can unplug the USB cable and connect the endoscope."
+        exit 0
+    fi
+
+    echo "Step 1: Enabling TCP/IP mode on port 5555..."
+    adb tcpip 5555
+    sleep 2
+
+    echo ""
+    echo "Step 2: Getting phone's WiFi IP address..."
+    PHONE_IP=$(adb shell ip addr show wlan0 2>/dev/null | grep -oE "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | awk '{print $2}' || true)
+
+    if [[ -z "$PHONE_IP" ]]; then
+        echo ""
+        echo "ERROR: Could not detect phone's IP address."
+        echo "Make sure your phone is connected to WiFi."
+        echo ""
+        echo "You can find the IP manually in Settings > WiFi > (your network) > IP address"
+        echo "Then run: adb connect <IP>:5555"
+        exit 1
+    fi
+
+    echo "Phone IP: $PHONE_IP"
+    echo ""
+    echo "Step 3: Connecting via WiFi..."
+    adb connect "$PHONE_IP:5555"
+    sleep 1
+
+    echo ""
+    echo "Step 4: Verifying connection..."
+    if adb devices | grep -qE "^$PHONE_IP:5555.*device$"; then
+        echo ""
+        echo "SUCCESS! Connected to $PHONE_IP:5555"
+        echo ""
+        echo "You can now:"
+        echo "  1. Unplug the USB cable from your phone"
+        echo "  2. Plug the USB endoscope into your phone's USB-C port"
+        echo "  3. Run: just wifi-deploy    (to build and install the app)"
+        echo "  4. Run: just logs           (to monitor the app)"
+    else
+        echo ""
+        echo "WARNING: Connection may have failed. Check with: just wifi-status"
+    fi
+
+# Build and deploy to WiFi-connected device
+wifi-deploy: _require-android
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== WiFi Deploy ==="
+    echo ""
+
+    # Check for WiFi connection
+    if ! adb devices | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+.*device$"; then
+        echo "WARNING: No WiFi connection detected."
+        echo ""
+        if adb devices | grep -qE "device$"; then
+            echo "USB device found. Proceeding with USB deployment..."
+        else
+            echo "No device connected at all."
+            echo "Run 'just wifi-setup' to set up WiFi connection first."
+            exit 1
+        fi
+    else
+        echo "WiFi connection active."
+    fi
+
+    echo ""
+    echo "Building Android APK (debug)..."
+    npm run tauri:android:build -- --debug
+
+    echo ""
+    echo "Installing APK to device..."
+    APK="src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
+    if [[ ! -f "$APK" ]]; then
+        APK="src-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk"
+    fi
+    if [[ ! -f "$APK" ]]; then
+        echo "ERROR: APK not found after build."
+        exit 1
+    fi
+    adb install -r "$APK"
+
+    echo ""
+    echo "Launching app..."
+    adb shell am start -n com.cleanscope.app/.MainActivity
+
+    echo ""
+    echo "Deploy complete! The app should now be running on your device."
+    echo ""
+    echo "To view logs: just logs"
+
+# Full USB endoscope testing workflow
+endoscope-test: _require-android
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== USB Endoscope Testing Workflow ==="
+    echo ""
+
+    # Step 1: Check WiFi connection
+    echo "Checking ADB connection..."
+    if adb devices | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+.*device$"; then
+        WIFI_IP=$(adb devices | grep -oE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+" | head -1)
+        echo "WiFi connection active: $WIFI_IP"
+    elif adb devices | grep -qE "device$"; then
+        echo "Only USB connection found."
+        echo ""
+        echo "For endoscope testing, you need WiFi ADB (the USB port is needed for the endoscope)."
+        echo ""
+        read -p "Set up WiFi connection now? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            just wifi-setup
+            echo ""
+            echo "Now run 'just endoscope-test' again after unplugging USB."
+            exit 0
+        else
+            echo "Continuing with USB (endoscope cannot be connected)..."
+        fi
+    else
+        echo "ERROR: No device connected."
+        echo ""
+        echo "Connect your phone via USB and run: just wifi-setup"
+        exit 1
+    fi
+
+    echo ""
+    echo "Building and deploying app..."
+    npm run tauri:android:build -- --debug
+
+    APK="src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
+    if [[ ! -f "$APK" ]]; then
+        APK="src-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk"
+    fi
+    adb install -r "$APK"
+
+    echo ""
+    echo "Launching app..."
+    adb shell am start -n com.cleanscope.app/.MainActivity
+
+    echo ""
+    echo "============================================"
+    echo "  READY FOR ENDOSCOPE TESTING"
+    echo "============================================"
+    echo ""
+    echo "1. Make sure USB cable is UNPLUGGED from phone"
+    echo "2. Plug the USB endoscope into phone's USB-C port"
+    echo "3. The app should auto-launch and request permission"
+    echo "4. Watch the logs below for frame data..."
+    echo ""
+    echo "Press Ctrl+C to stop log streaming"
+    echo "============================================"
+    echo ""
+
+    # Stream logs
+    adb logcat -s CleanScope:* RustStdoutStderr:* AndroidRuntime:E
+
 # List connected Android devices
 devices:
     adb devices -l

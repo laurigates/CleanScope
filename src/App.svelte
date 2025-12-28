@@ -11,6 +11,40 @@ let errorMessage = $state<string>("");
 let frameCount = $state<number>(0);
 let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
 
+// Streaming status for detailed feedback
+let streamingStatus = $state<string>("Waiting for device...");
+let wasConnected = $state<boolean>(false);
+
+// FPS calculation - track timestamps of recent frames
+const FPS_SAMPLE_SIZE = 30; // Number of frames to average over
+let frameTimestamps = $state<number[]>([]);
+const currentFps = $derived.by(() => {
+  if (frameTimestamps.length < 2) return 0;
+  const oldestTimestamp = frameTimestamps[0];
+  const newestTimestamp = frameTimestamps[frameTimestamps.length - 1];
+  const timeSpanMs = newestTimestamp - oldestTimestamp;
+  if (timeSpanMs <= 0) return 0;
+  // FPS = (number of intervals) / (time span in seconds)
+  return Math.round(((frameTimestamps.length - 1) / timeSpanMs) * 1000);
+});
+
+// Derived streaming status message
+const displayStatus = $derived.by(() => {
+  if (connectionStatus === "disconnected") {
+    return wasConnected ? "Connection lost" : "Waiting for device...";
+  }
+  if (connectionStatus === "connecting") {
+    return "Device connected, initializing...";
+  }
+  if (connectionStatus === "connected") {
+    if (frameCount === 0) {
+      return "Connected, waiting for frames...";
+    }
+    return `Streaming (${currentFps} fps)`;
+  }
+  return streamingStatus;
+});
+
 // Canvas refs
 let canvas: HTMLCanvasElement;
 let ctx: CanvasRenderingContext2D | null = null;
@@ -31,14 +65,31 @@ onMount(async () => {
       if (event.payload.connected) {
         connectionStatus = "connected";
         cameraInfo = event.payload.info || "USB Camera";
+        wasConnected = true;
       } else {
         connectionStatus = "disconnected";
         cameraInfo = "";
         frameCount = 0;
+        frameTimestamps = [];
       }
     },
   );
   unlistenFns.push(unlistenUsb);
+
+  // Listen for detailed USB status updates from Rust backend
+  const unlistenUsbStatus = await listen<{ status: string; detail?: string }>(
+    "usb-status",
+    (event) => {
+      streamingStatus = event.payload.detail || event.payload.status;
+      // Update connection status based on status string
+      if (event.payload.status === "connecting") {
+        connectionStatus = "connecting";
+      } else if (event.payload.status === "error") {
+        errorMessage = event.payload.detail || "USB error occurred";
+      }
+    },
+  );
+  unlistenFns.push(unlistenUsbStatus);
 
   // Listen for frame-ready events and fetch frame data
   const unlistenFrame = await listen("frame-ready", async () => {
@@ -47,6 +98,10 @@ onMount(async () => {
       const frameData: ArrayBuffer = await invoke("get_frame");
       await renderFrame(frameData);
       frameCount++;
+
+      // Track timestamp for FPS calculation
+      const now = performance.now();
+      frameTimestamps = [...frameTimestamps.slice(-(FPS_SAMPLE_SIZE - 1)), now];
     } catch (e) {
       // Silently ignore frame fetch errors (e.g., no frame available yet)
       console.debug("Frame fetch error:", e);
@@ -156,17 +211,17 @@ function getStatusColor(): string {
       <div class="status-indicator">
         <span class="dot" style="background-color: {getStatusColor()}"></span>
         <span class="status-text">
-          {#if connectionStatus === "connected"}
-            {cameraInfo}
-          {:else if connectionStatus === "connecting"}
-            Connecting...
-          {:else}
-            Disconnected
-          {/if}
+          {displayStatus}
         </span>
+        {#if connectionStatus === "connected" && cameraInfo}
+          <span class="camera-name">{cameraInfo}</span>
+        {/if}
       </div>
 
       <div class="status-right">
+        {#if frameCount > 0}
+          <span class="frame-count">{frameCount.toLocaleString()} frames</span>
+        {/if}
         {#if buildInfo}
           <span class="build-info">v{buildInfo.version} ({buildInfo.git_hash})</span>
         {/if}
@@ -293,6 +348,20 @@ function getStatusColor(): string {
 
   .status-text {
     font-size: 0.875rem;
+  }
+
+  .camera-name {
+    font-size: 0.75rem;
+    color: #888;
+    margin-left: 0.5rem;
+    padding-left: 0.5rem;
+    border-left: 1px solid #444;
+  }
+
+  .frame-count {
+    font-size: 0.75rem;
+    color: #888;
+    font-family: monospace;
   }
 
   .status-right {
