@@ -269,6 +269,18 @@ struct UvcStreamControl {
     dw_max_payload_transfer_size: u32,
 }
 
+/// Maximum number of format indices to try when searching for MJPEG
+#[cfg(target_os = "android")]
+const MAX_FORMAT_INDEX: u8 = 4;
+
+/// Number of frames to check before deciding if format is MJPEG
+#[cfg(target_os = "android")]
+const FRAMES_TO_CHECK_FORMAT: u32 = 10;
+
+/// Timeout in seconds for format detection
+#[cfg(target_os = "android")]
+const FORMAT_DETECTION_TIMEOUT_SECS: u64 = 10;
+
 /// Run the camera streaming loop
 #[cfg(target_os = "android")]
 fn run_camera_loop(fd: i32, app_handle: AppHandle, frame_buffer: Arc<Mutex<FrameBuffer>>) {
@@ -336,34 +348,303 @@ fn run_camera_loop_inner(
         dev.claim_interface(0)?;
     }
 
-    // Start UVC streaming (probe/commit sequence)
-    let endpoint = start_uvc_streaming(&dev, Some(&ep_info))?;
-    log::info!("UVC streaming started on endpoint 0x{:02x}", endpoint);
+    // Try different format indices to find MJPEG format
+    // Format index 1 is not guaranteed to be MJPEG - varies by device
+    for format_index in 1..=MAX_FORMAT_INDEX {
+        log::info!(
+            "=== Trying format index {} of {} ===",
+            format_index,
+            MAX_FORMAT_INDEX
+        );
 
-    // Choose streaming method based on endpoint type
-    match ep_info.transfer_type {
-        TransferType::Isochronous => {
-            log::info!("Using ISOCHRONOUS transfers for video streaming");
-            stream_frames_isochronous(&ctx, &dev, &ep_info, app_handle, frame_buffer)?;
-        }
-        TransferType::Bulk => {
-            log::info!("Using BULK transfers for video streaming");
-            stream_frames(&dev, endpoint, app_handle, frame_buffer)?;
-        }
-        _ => {
-            log::error!(
-                "Unsupported endpoint transfer type: {:?}",
-                ep_info.transfer_type
-            );
-            return Err(LibusbError::NotSupported);
+        // Start UVC streaming with this format index
+        let endpoint = match start_uvc_streaming(&dev, Some(&ep_info), format_index) {
+            Ok(ep) => ep,
+            Err(e) => {
+                log::warn!(
+                    "Failed to start streaming with format {}: {}",
+                    format_index,
+                    e
+                );
+                continue;
+            }
+        };
+        log::info!(
+            "UVC streaming started on endpoint 0x{:02x} with format {}",
+            endpoint,
+            format_index
+        );
+
+        // Choose streaming method based on endpoint type
+        let result = match ep_info.transfer_type {
+            TransferType::Isochronous => {
+                log::info!("Using ISOCHRONOUS transfers for video streaming");
+                stream_frames_isochronous_with_format_detection(
+                    &ctx,
+                    &dev,
+                    &ep_info,
+                    app_handle.clone(),
+                    frame_buffer.clone(),
+                    format_index,
+                )
+            }
+            TransferType::Bulk => {
+                log::info!("Using BULK transfers for video streaming");
+                stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())
+            }
+            _ => {
+                log::error!(
+                    "Unsupported endpoint transfer type: {:?}",
+                    ep_info.transfer_type
+                );
+                Err(LibusbError::NotSupported)
+            }
+        };
+
+        match result {
+            Ok(FormatDetectionResult::MjpegFound) => {
+                log::info!(
+                    "MJPEG format confirmed at index {}, streaming continues",
+                    format_index
+                );
+                return Ok(());
+            }
+            Ok(FormatDetectionResult::NotMjpeg) => {
+                log::info!("Format {} is not MJPEG, trying next format", format_index);
+                // Reset interface before trying next format
+                let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+                continue;
+            }
+            Err(e) => {
+                log::warn!("Streaming error with format {}: {}", format_index, e);
+                // Reset interface before trying next format
+                let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+                continue;
+            }
         }
     }
 
-    Ok(())
+    log::error!(
+        "Could not find MJPEG format after trying {} format indices",
+        MAX_FORMAT_INDEX
+    );
+    Err(LibusbError::NotFound)
 }
 
-/// Stream frames using isochronous transfers
+/// Result of format detection during streaming
 #[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FormatDetectionResult {
+    /// MJPEG frames detected, continue streaming
+    MjpegFound,
+    /// Not MJPEG format, try next format index
+    NotMjpeg,
+}
+
+/// Stream frames using isochronous transfers with format detection
+/// Returns MjpegFound if JPEG frames are detected and continues streaming,
+/// or NotMjpeg if the format doesn't appear to be MJPEG
+#[cfg(target_os = "android")]
+fn stream_frames_isochronous_with_format_detection(
+    ctx: &LibusbContext,
+    dev: &LibusbDeviceHandle,
+    ep_info: &EndpointInfo,
+    app_handle: AppHandle,
+    shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
+    format_index: u8,
+) -> Result<FormatDetectionResult, LibusbError> {
+    use std::time::{Duration, Instant};
+    use tauri::Emitter;
+
+    log::info!(
+        "Starting isochronous streaming with format detection (format_index={})",
+        format_index
+    );
+
+    // Create the isochronous stream
+    let mut iso_stream = unsafe {
+        IsochronousStream::new(
+            ctx.get_context_ptr(),
+            dev.get_handle_ptr(),
+            ep_info.address,
+            ep_info.max_packet_size,
+        )?
+    };
+
+    let frame_receiver = iso_stream.take_frame_receiver().ok_or(LibusbError::Other)?;
+    iso_stream.start()?;
+
+    // Spawn event loop thread
+    let event_loop_handle = {
+        let ctx_ptr = SendableContextPtr::new(ctx.get_context_ptr());
+        let stop_flag = iso_stream.stop_flag.clone();
+
+        std::thread::spawn(move || {
+            let mut timeval = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000 as libc::suseconds_t,
+            };
+
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe {
+                    let ret =
+                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
+                    if ret < 0 {
+                        let err = LibusbError::from(ret);
+                        if err != LibusbError::Interrupted {
+                            log::error!("Event loop error: {}", err);
+                            break;
+                        }
+                    }
+                }
+            }
+            log::info!("Format detection event loop exiting");
+        })
+    };
+
+    // Phase 1: Format detection - check first N frames for JPEG markers
+    let detection_start = Instant::now();
+    let detection_timeout = Duration::from_secs(FORMAT_DETECTION_TIMEOUT_SECS);
+    let mut frames_checked = 0u32;
+    let mut jpeg_frames = 0u32;
+    let mut non_jpeg_frames = 0u32;
+
+    log::info!(
+        "Format detection phase: checking up to {} frames for JPEG markers",
+        FRAMES_TO_CHECK_FORMAT
+    );
+
+    while frames_checked < FRAMES_TO_CHECK_FORMAT {
+        if detection_start.elapsed() > detection_timeout {
+            log::warn!(
+                "Format detection timeout after {} frames ({} JPEG, {} non-JPEG)",
+                frames_checked,
+                jpeg_frames,
+                non_jpeg_frames
+            );
+            break;
+        }
+
+        match frame_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(frame_data) => {
+                frames_checked += 1;
+
+                // Check for JPEG SOI marker (0xFFD8)
+                let is_jpeg =
+                    frame_data.len() >= 2 && frame_data[0] == 0xFF && frame_data[1] == 0xD8;
+
+                if is_jpeg {
+                    jpeg_frames += 1;
+                    log::info!(
+                        "Frame {}: JPEG detected ({} bytes)",
+                        frames_checked,
+                        frame_data.len()
+                    );
+                } else {
+                    non_jpeg_frames += 1;
+                    // Log first few bytes for debugging
+                    let header: Vec<u8> = frame_data.iter().take(8).copied().collect();
+                    log::info!(
+                        "Frame {}: Not JPEG ({} bytes, header: {:02x?})",
+                        frames_checked,
+                        frame_data.len(),
+                        header
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!("Timeout waiting for frame during format detection");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::error!("Frame channel disconnected during format detection");
+                iso_stream.stop();
+                let _ = event_loop_handle.join();
+                return Err(LibusbError::Pipe);
+            }
+        }
+    }
+
+    // Decide if this format is MJPEG
+    // Require at least 50% JPEG frames to consider it MJPEG
+    let is_mjpeg_format = jpeg_frames > 0 && jpeg_frames >= frames_checked / 2;
+
+    log::info!(
+        "Format detection complete: {} JPEG / {} total frames - {}",
+        jpeg_frames,
+        frames_checked,
+        if is_mjpeg_format {
+            "MJPEG CONFIRMED"
+        } else {
+            "NOT MJPEG"
+        }
+    );
+
+    if !is_mjpeg_format {
+        // Not MJPEG, stop streaming and return
+        iso_stream.stop();
+        let _ = event_loop_handle.join();
+        return Ok(FormatDetectionResult::NotMjpeg);
+    }
+
+    // Phase 2: MJPEG confirmed, continue streaming
+    log::info!(
+        "MJPEG format confirmed at index {}, continuing to stream",
+        format_index
+    );
+
+    // Emit status update to frontend
+    let _ = app_handle.emit(
+        "usb-status",
+        serde_json::json!({
+            "status": "streaming",
+            "detail": format!("MJPEG format (index {})", format_index)
+        }),
+    );
+
+    let mut frame_count = frames_checked;
+
+    loop {
+        match frame_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(frame_data) => {
+                frame_count += 1;
+
+                // Store frame in shared buffer
+                {
+                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                    buffer.frame = frame_data;
+                    buffer.timestamp = Instant::now();
+                }
+
+                // Emit notification to trigger frontend fetch
+                let _ = app_handle.emit("frame-ready", ());
+
+                if frame_count % 30 == 0 {
+                    log::info!("Received {} frames via isochronous transfer", frame_count);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!("No frames received in 5 seconds");
+                if iso_stream.is_stopped() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::info!("Frame channel disconnected, exiting");
+                break;
+            }
+        }
+    }
+
+    iso_stream.stop();
+    let _ = event_loop_handle.join();
+
+    log::info!("Streaming ended after {} total frames", frame_count);
+    Ok(FormatDetectionResult::MjpegFound)
+}
+
+/// Stream frames using isochronous transfers (legacy, for backwards compatibility)
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
 fn stream_frames_isochronous(
     ctx: &LibusbContext,
     dev: &LibusbDeviceHandle,
@@ -486,14 +767,17 @@ fn stream_frames_isochronous(
 fn start_uvc_streaming(
     dev: &LibusbDeviceHandle,
     endpoint_info: Option<&EndpointInfo>,
+    format_index: u8,
 ) -> Result<u8, LibusbError> {
-    log::info!("Initiating UVC probe/commit sequence");
+    log::info!(
+        "Initiating UVC probe/commit sequence with format_index={}",
+        format_index
+    );
 
     // UVC probe control - request camera format
-    // Format index 1 is usually the primary format
     let mut probe = UvcStreamControl::default();
     probe.bm_hint = 1; // dwFrameInterval field is valid
-    probe.b_format_index = 1; // First format
+    probe.b_format_index = format_index; // Try specified format
     probe.b_frame_index = 1; // First frame size
 
     // Request type: Class request to interface, direction OUT then IN
@@ -585,17 +869,21 @@ fn start_uvc_streaming(
     Ok(endpoint_addr)
 }
 
-/// Stream frames from the camera
+/// Stream frames from the camera using bulk transfers
+/// Note: Most endoscopes use isochronous transfers, this is a fallback
 #[cfg(target_os = "android")]
 fn stream_frames(
     dev: &LibusbDeviceHandle,
     endpoint: u8,
     app_handle: AppHandle,
     shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
-) -> Result<(), LibusbError> {
+) -> Result<FormatDetectionResult, LibusbError> {
     use std::time::Instant;
 
-    log::info!("Starting frame streaming from endpoint 0x{:02x}", endpoint);
+    log::info!(
+        "Starting bulk frame streaming from endpoint 0x{:02x}",
+        endpoint
+    );
 
     // Buffer for receiving USB data
     // USB packets are typically up to 512 bytes (full-speed) or 1024 bytes (high-speed)
@@ -605,6 +893,9 @@ fn stream_frames(
 
     let timeout_ms = 1000;
     let mut frame_count = 0u32;
+    let mut jpeg_frames = 0u32;
+    let mut non_jpeg_frames = 0u32;
+    let mut format_confirmed = false;
 
     loop {
         // Perform bulk transfer to read data
@@ -640,10 +931,12 @@ fn stream_frames(
                             frame_count += 1;
 
                             // Check for JPEG markers (SOI: 0xFFD8)
-                            if local_frame_buffer.len() >= 2
+                            let is_jpeg = local_frame_buffer.len() >= 2
                                 && local_frame_buffer[0] == 0xFF
-                                && local_frame_buffer[1] == 0xD8
-                            {
+                                && local_frame_buffer[1] == 0xD8;
+
+                            if is_jpeg {
+                                jpeg_frames += 1;
                                 log::debug!(
                                     "MJPEG frame {} received: {} bytes",
                                     frame_count,
@@ -655,11 +948,9 @@ fn stream_frames(
                                     let mut buffer = shared_frame_buffer.lock().unwrap();
                                     buffer.frame = local_frame_buffer.clone();
                                     buffer.timestamp = Instant::now();
-                                    // Note: width/height would need JPEG parsing to determine
-                                    // For now, leave as 0 (frontend uses actual decoded dimensions)
                                 }
 
-                                // Emit lightweight notification (no payload) to trigger frontend fetch
+                                // Emit lightweight notification to trigger frontend fetch
                                 let _ = app_handle.emit("frame-ready", ());
 
                                 if frame_count % 30 == 0 {
@@ -670,12 +961,32 @@ fn stream_frames(
                                     );
                                 }
                             } else {
+                                non_jpeg_frames += 1;
                                 log::warn!(
                                     "Non-JPEG frame received: {} bytes, header: {:02x?}",
                                     local_frame_buffer.len(),
                                     &local_frame_buffer
                                         [..std::cmp::min(16, local_frame_buffer.len())]
                                 );
+                            }
+
+                            // Format detection: check after FRAMES_TO_CHECK_FORMAT frames
+                            if !format_confirmed && frame_count >= FRAMES_TO_CHECK_FORMAT {
+                                let is_mjpeg = jpeg_frames > 0 && jpeg_frames >= frame_count / 2;
+                                log::info!(
+                                    "Bulk format detection: {} JPEG / {} total - {}",
+                                    jpeg_frames,
+                                    frame_count,
+                                    if is_mjpeg {
+                                        "MJPEG CONFIRMED"
+                                    } else {
+                                        "NOT MJPEG"
+                                    }
+                                );
+                                if !is_mjpeg {
+                                    return Ok(FormatDetectionResult::NotMjpeg);
+                                }
+                                format_confirmed = true;
                             }
 
                             local_frame_buffer.clear();
