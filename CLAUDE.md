@@ -49,39 +49,34 @@ just emulator-create   # Create AVD named "cleanscope"
 
 Most Android phones have a single USB-C port, which is needed for the endoscope. Use ADB over WiFi to deploy and debug while the endoscope is connected.
 
-### Setup Procedure
+### Quick Start (Justfile Shortcuts)
+
+```bash
+just wifi-setup      # Automated: enable tcpip, detect IP, connect
+just wifi-status     # Check connection type (WiFi vs USB)
+just wifi-deploy     # Build + install + launch in one command
+just endoscope-test  # Full workflow: deploy + stream logs
+```
+
+### Manual Setup Procedure
 
 1. **Connect phone via USB** (temporarily, for initial setup)
 
-2. **Enable TCP/IP mode:**
+2. **Run automated setup:**
    ```bash
-   adb tcpip 5555
+   just wifi-setup
    ```
+   This enables TCP/IP mode, detects the phone's IP, and connects automatically.
 
-3. **Get phone's IP address:**
+3. **Unplug USB cable** - ADB now runs over WiFi
+
+4. **Deploy and test:**
    ```bash
-   adb shell ip addr show wlan0 | grep "inet "
+   just endoscope-test
    ```
-   Look for the IP address (e.g., `192.168.1.42`)
+   This builds, installs, launches the app, and streams logs.
 
-4. **Connect wirelessly:**
-   ```bash
-   adb connect <PHONE_IP>:5555
-   ```
-
-5. **Unplug USB cable** - ADB now runs over WiFi
-
-6. **Deploy the app:**
-   ```bash
-   just android-dev
-   ```
-
-7. **Plug endoscope into phone's USB-C port**
-
-8. **Monitor logs:**
-   ```bash
-   just logs
-   ```
+5. **Plug endoscope into phone's USB-C port**
 
 ### Requirements
 
@@ -91,8 +86,8 @@ Most Android phones have a single USB-C port, which is needed for the endoscope.
 ### Reconnection
 
 - Connection persists until phone reboots
-- If connection drops, reconnect with: `adb connect <PHONE_IP>:5555`
-- Verify connection: `adb devices`
+- Check status: `just wifi-status`
+- If connection drops, run: `just wifi-setup` again
 
 ### Alternative: Native Wireless Debugging (Android 11+)
 
@@ -133,5 +128,17 @@ This method survives reboots after initial pairing.
 
 - Desktop builds compile but USB functionality is stubbed (Android-only via JNI)
 - Android builds require: Rust target `aarch64-linux-android`, Android SDK, NDK (`NDK_HOME` env var)
-- Most endoscopes use MJPEG format (handled by `jpeg-decoder` crate)
 - UVC library commented out in Cargo.toml pending vendored libusb fork for Android
+
+## Video Format Notes
+
+**UVC Format Negotiation:**
+- Endoscopes advertise multiple formats (MJPEG, YUY2/uncompressed)
+- Format index 1 is NOT guaranteed to be MJPEG - varies by device
+- Current code hardcodes `b_format_index = 1` in `usb.rs:start_uvc_streaming()`
+- If frames lack JPEG markers (0xFFD8), try incrementing format_index
+
+**Format Detection:**
+- MJPEG frames: Start with 0xFFD8, typically 5-50KB
+- YUY2 frames: No markers, size = width × height × 2 bytes
+- Frame size hints: 50-125KB without JPEG markers likely indicates YUY2
