@@ -411,10 +411,15 @@ fn stream_frames_isochronous(
                 tv_usec: 100_000 as libc::suseconds_t, // 100ms timeout
             };
 
+            let mut iteration = 0u32;
             while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 unsafe {
                     let ret =
                         libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
+                    iteration += 1;
+                    if iteration <= 5 || iteration % 50 == 0 {
+                        log::debug!("Event loop iteration {}, ret={}", iteration, ret);
+                    }
                     if ret < 0 {
                         let err = LibusbError::from(ret);
                         if err != LibusbError::Interrupted {
@@ -425,7 +430,7 @@ fn stream_frames_isochronous(
                 }
             }
 
-            log::info!("Event loop thread exiting");
+            log::info!("Event loop thread exiting after {} iterations", iteration);
         })
     };
 
@@ -484,10 +489,11 @@ fn start_uvc_streaming(
 ) -> Result<u8, LibusbError> {
     log::info!("Initiating UVC probe/commit sequence");
 
-    // UVC probe control - request the camera's default format
+    // UVC probe control - request camera format
+    // Format index 1 is usually the primary format
     let mut probe = UvcStreamControl::default();
     probe.bm_hint = 1; // dwFrameInterval field is valid
-    probe.b_format_index = 1; // First format (usually MJPEG)
+    probe.b_format_index = 1; // First format
     probe.b_frame_index = 1; // First frame size
 
     // Request type: Class request to interface, direction OUT then IN
@@ -539,12 +545,20 @@ fn start_uvc_streaming(
     let format_index = negotiated.b_format_index;
     let frame_index = negotiated.b_frame_index;
     let max_frame_size = negotiated.dw_max_video_frame_size;
+    let max_payload = negotiated.dw_max_payload_transfer_size;
+    let frame_interval = negotiated.dw_frame_interval;
+
     log::info!(
-        "Negotiated: format={} frame={} max_frame_size={}",
+        "Negotiated: format={} frame={} max_frame_size={} max_payload={} frame_interval={}",
         format_index,
         frame_index,
-        max_frame_size
+        max_frame_size,
+        max_payload,
+        frame_interval
     );
+
+    // Log raw probe response for debugging
+    log::debug!("Raw probe response: {:02x?}", &response[..26]);
 
     // Commit the negotiated parameters
     let commit_control = uvc::UVC_VS_COMMIT_CONTROL << 8;

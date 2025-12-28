@@ -709,14 +709,24 @@ const NUM_TRANSFERS: usize = 4;
 /// Timeout for event handling in milliseconds
 const EVENT_TIMEOUT_MS: i32 = 100;
 
+/// Shared state for frame accumulation across all transfers
+struct SharedFrameState {
+    /// Buffer to accumulate frame data across packets
+    frame_buffer: Vec<u8>,
+    /// Last seen frame ID (FID bit) for detecting frame boundaries
+    last_frame_id: Option<bool>,
+    /// Whether we've synced to a frame boundary
+    synced: bool,
+}
+
 /// Context passed to the isochronous transfer callback
 struct IsoCallbackContext {
     /// Channel to send received frame data
     frame_sender: std::sync::mpsc::Sender<Vec<u8>>,
     /// Flag to signal when streaming should stop
     stop_flag: Arc<AtomicBool>,
-    /// Buffer to accumulate frame data across packets
-    frame_buffer: Vec<u8>,
+    /// Shared frame state (protected by mutex for thread-safety)
+    shared_state: Arc<std::sync::Mutex<SharedFrameState>>,
     /// Max packet size for this endpoint
     max_packet_size: u16,
 }
@@ -758,6 +768,13 @@ impl IsochronousStream {
         let (frame_sender, frame_receiver) = std::sync::mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        // Create shared state for frame accumulation (shared across all transfers)
+        let shared_state = Arc::new(std::sync::Mutex::new(SharedFrameState {
+            frame_buffer: Vec::with_capacity(2 * 1024 * 1024), // 2MB for 1280x720 YUY2
+            last_frame_id: None,
+            synced: false,
+        }));
+
         let buffer_size = (max_packet_size as usize) * (ISO_PACKETS_PER_TRANSFER as usize);
 
         let mut transfers = Vec::with_capacity(NUM_TRANSFERS);
@@ -783,7 +800,7 @@ impl IsochronousStream {
             let context = Box::new(IsoCallbackContext {
                 frame_sender: frame_sender.clone(),
                 stop_flag: Arc::clone(&stop_flag),
-                frame_buffer: Vec::with_capacity(1024 * 1024), // 1MB for frame accumulation
+                shared_state: Arc::clone(&shared_state),
                 max_packet_size,
             });
 
@@ -955,6 +972,8 @@ extern "system" fn iso_transfer_callback(transfer: *mut libusb1_sys::libusb_tran
 
 /// Inner implementation of the isochronous transfer callback
 unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfer) {
+    log::debug!(">>> ISO CALLBACK INVOKED <<<");
+
     let xfr = &mut *transfer;
     let context = &mut *(xfr.user_data as *mut IsoCallbackContext);
 
@@ -965,6 +984,7 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
     }
 
     let status = TransferStatus::from(xfr.status);
+    log::debug!("Transfer status: {:?}", status);
 
     match status {
         TransferStatus::Completed => {
@@ -999,9 +1019,20 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
 /// Process individual isochronous packets from a completed transfer
 unsafe fn process_iso_packets(
     xfr: &mut libusb1_sys::libusb_transfer,
-    context: &mut IsoCallbackContext,
+    context: &IsoCallbackContext,
 ) {
     let num_packets = xfr.num_iso_packets as usize;
+    let mut packets_with_data = 0;
+    let mut total_bytes = 0usize;
+
+    // Lock the shared state for the duration of packet processing
+    let mut state = match context.shared_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::error!("Shared state mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
 
     for i in 0..num_packets {
         // Get packet descriptor
@@ -1013,13 +1044,18 @@ unsafe fn process_iso_packets(
         let actual_length = pkt_desc.actual_length as usize;
 
         if pkt_status != TransferStatus::Completed {
-            log::trace!("Packet {} status: {:?}", i, pkt_status);
+            if i == 0 {
+                log::debug!("Packet 0 status: {:?}", pkt_status);
+            }
             continue;
         }
 
         if actual_length == 0 {
             continue;
         }
+
+        packets_with_data += 1;
+        total_bytes += actual_length;
 
         // Calculate packet buffer offset
         let offset = i * (context.max_packet_size as usize);
@@ -1035,37 +1071,115 @@ unsafe fn process_iso_packets(
         let header_len = pkt_data[0] as usize;
         let header_flags = pkt_data[1];
         let end_of_frame = (header_flags & 0x02) != 0;
+        let frame_id = (header_flags & 0x01) != 0;
+        let error = (header_flags & 0x40) != 0;
+
+        // Log unusual header situations
+        if error {
+            log::warn!("UVC error flag set in packet {}", i);
+            // Clear buffer on error - frame is corrupted
+            state.frame_buffer.clear();
+            state.synced = false;
+            continue;
+        }
+
+        // Detect frame boundary by FID toggle
+        if let Some(last_fid) = state.last_frame_id {
+            if frame_id != last_fid && !end_of_frame {
+                // FID toggled - this is the start of a new frame
+                // If we have accumulated data, it's from a previous incomplete frame
+                if !state.frame_buffer.is_empty() && state.synced {
+                    log::debug!(
+                        "FID toggle detected with {} bytes accumulated (discarding partial frame)",
+                        state.frame_buffer.len()
+                    );
+                }
+                state.frame_buffer.clear();
+                state.synced = true; // Now synced to frame boundary
+            }
+        }
+        state.last_frame_id = Some(frame_id);
+
+        // Only accumulate data if we're synced
+        if !state.synced {
+            // Skip until we see a FID toggle (frame boundary)
+            continue;
+        }
 
         // Extract payload (skip header)
-        if header_len < actual_length {
+        if header_len >= 2 && header_len <= actual_length {
             let payload = &pkt_data[header_len..];
-            context.frame_buffer.extend_from_slice(payload);
+            state.frame_buffer.extend_from_slice(payload);
+        } else if header_len > actual_length {
+            log::warn!(
+                "Invalid header length {} > packet size {}",
+                header_len,
+                actual_length
+            );
         }
 
         // Check for end of frame
-        if end_of_frame && !context.frame_buffer.is_empty() {
+        if end_of_frame && !state.frame_buffer.is_empty() {
+            let frame_size = state.frame_buffer.len();
+
             // Check for JPEG SOI marker (0xFFD8)
-            if context.frame_buffer.len() >= 2
-                && context.frame_buffer[0] == 0xFF
-                && context.frame_buffer[1] == 0xD8
-            {
-                log::debug!("Complete MJPEG frame: {} bytes", context.frame_buffer.len());
+            if frame_size >= 2 && state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8 {
+                log::info!("Complete MJPEG frame: {} bytes", frame_size);
 
                 // Send the frame to the receiver
-                let frame = std::mem::take(&mut context.frame_buffer);
+                let frame = std::mem::take(&mut state.frame_buffer);
                 if let Err(e) = context.frame_sender.send(frame) {
                     log::warn!("Failed to send frame: {}", e);
                 }
             } else {
-                log::trace!(
-                    "Non-JPEG frame discarded: {} bytes, header: {:02x?}",
-                    context.frame_buffer.len(),
-                    &context.frame_buffer[..std::cmp::min(8, context.frame_buffer.len())]
-                );
+                // Not JPEG at offset 0 - scan for SOI marker
+                let mut soi_offset: Option<usize> = None;
+                for j in 0..frame_size.saturating_sub(1) {
+                    if state.frame_buffer[j] == 0xFF && state.frame_buffer[j + 1] == 0xD8 {
+                        soi_offset = Some(j);
+                        break;
+                    }
+                }
+
+                if let Some(offset) = soi_offset {
+                    // Found JPEG SOI - extract frame starting from there
+                    log::info!(
+                        "Found JPEG SOI at offset {} in {} byte frame",
+                        offset,
+                        frame_size
+                    );
+                    let jpeg_frame: Vec<u8> = state.frame_buffer[offset..].to_vec();
+                    if let Err(e) = context.frame_sender.send(jpeg_frame) {
+                        log::warn!("Failed to send frame: {}", e);
+                    }
+                } else if frame_size >= 50000 {
+                    // Reasonable size frame, send it anyway - might be valid data
+                    log::info!(
+                        "Sending {} byte frame (no JPEG marker, assuming video data)",
+                        frame_size
+                    );
+                    let frame = std::mem::take(&mut state.frame_buffer);
+                    if let Err(e) = context.frame_sender.send(frame) {
+                        log::warn!("Failed to send frame: {}", e);
+                    }
+                } else {
+                    log::trace!("Discarding small {} byte frame", frame_size);
+                }
             }
 
             // Clear buffer for next frame
-            context.frame_buffer.clear();
+            state.frame_buffer.clear();
         }
+    }
+
+    // Log summary for debugging
+    if packets_with_data > 0 || total_bytes > 0 {
+        log::debug!(
+            "Transfer processed: {}/{} packets with data, {} total bytes, buffer now {} bytes",
+            packets_with_data,
+            num_packets,
+            total_bytes,
+            state.frame_buffer.len()
+        );
     }
 }
