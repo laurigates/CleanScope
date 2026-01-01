@@ -536,6 +536,18 @@ impl LibusbDeviceHandle {
                         if is_video_class && is_streaming { " [VIDEO STREAMING]" } else { "" }
                     );
 
+                    // Parse UVC format descriptors from class-specific extra bytes
+                    if is_video_class && is_streaming && altsetting.extra_length > 0 {
+                        let extra_bytes = std::slice::from_raw_parts(
+                            altsetting.extra,
+                            altsetting.extra_length as usize,
+                        );
+                        let formats = uvc::parse_format_descriptors(extra_bytes);
+                        for fmt in &formats {
+                            log::info!("  Available format: {:?}", fmt);
+                        }
+                    }
+
                     // Iterate through endpoints
                     for k in 0..altsetting.bNumEndpoints as usize {
                         let ep = &*altsetting.endpoint.add(k);
@@ -633,6 +645,54 @@ impl LibusbDeviceHandle {
             Ok(streaming_endpoint)
         }
     }
+
+    /// Get UVC format descriptors from the device.
+    /// Returns a list of all formats and their frame descriptors (resolutions).
+    pub fn get_format_descriptors(&self) -> Result<Vec<uvc::UvcFormatInfo>, LibusbError> {
+        unsafe {
+            let device = self.get_device();
+            let mut cfg_desc: *const libusb1_sys::libusb_config_descriptor = std::ptr::null();
+
+            let ret = libusb1_sys::libusb_get_active_config_descriptor(device, &mut cfg_desc);
+            if ret < 0 {
+                return Err(LibusbError::from(ret));
+            }
+
+            let cfg = &*cfg_desc;
+            let mut all_formats = Vec::new();
+
+            // Iterate through interfaces looking for video streaming interface
+            for i in 0..cfg.bNumInterfaces as usize {
+                let interface = &*cfg.interface.add(i);
+
+                for j in 0..interface.num_altsetting as usize {
+                    let altsetting = &*interface.altsetting.add(j);
+
+                    let is_video_class = altsetting.bInterfaceClass == 0x0E;
+                    let is_streaming = altsetting.bInterfaceSubClass == 0x02;
+
+                    if is_video_class && is_streaming && altsetting.extra_length > 0 {
+                        let extra_bytes = std::slice::from_raw_parts(
+                            altsetting.extra,
+                            altsetting.extra_length as usize,
+                        );
+                        let formats = uvc::parse_format_descriptors(extra_bytes);
+                        all_formats.extend(formats);
+                        // Only parse from first matching interface
+                        if !all_formats.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                if !all_formats.is_empty() {
+                    break;
+                }
+            }
+
+            libusb1_sys::libusb_free_config_descriptor(cfg_desc as *mut _);
+            Ok(all_formats)
+        }
+    }
 }
 
 impl Drop for LibusbDeviceHandle {
@@ -692,6 +752,217 @@ pub mod uvc {
     /// Endpoint direction
     pub const USB_ENDPOINT_IN: u8 = 0x80;
     pub const USB_ENDPOINT_OUT: u8 = 0x00;
+
+    /// UVC Video Streaming Interface Descriptor Subtypes
+    pub const VS_UNDEFINED: u8 = 0x00;
+    pub const VS_INPUT_HEADER: u8 = 0x01;
+    pub const VS_OUTPUT_HEADER: u8 = 0x02;
+    pub const VS_STILL_IMAGE_FRAME: u8 = 0x03;
+    pub const VS_FORMAT_UNCOMPRESSED: u8 = 0x04;
+    pub const VS_FRAME_UNCOMPRESSED: u8 = 0x05;
+    pub const VS_FORMAT_MJPEG: u8 = 0x06;
+    pub const VS_FRAME_MJPEG: u8 = 0x07;
+    pub const VS_FORMAT_MPEG2TS: u8 = 0x0A;
+    pub const VS_FORMAT_DV: u8 = 0x0C;
+    pub const VS_COLORFORMAT: u8 = 0x0D;
+    pub const VS_FORMAT_FRAME_BASED: u8 = 0x10;
+    pub const VS_FRAME_FRAME_BASED: u8 = 0x11;
+    pub const VS_FORMAT_STREAM_BASED: u8 = 0x12;
+
+    /// UVC format GUID for YUY2
+    pub const YUY2_GUID: [u8; 16] = [
+        0x59, 0x55, 0x59, 0x32, // "YUY2"
+        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// UVC format GUID for NV12
+    pub const NV12_GUID: [u8; 16] = [
+        0x4E, 0x56, 0x31, 0x32, // "NV12"
+        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// Parsed UVC frame descriptor (resolution info)
+    #[derive(Debug, Clone, Copy)]
+    pub struct UvcFrameInfo {
+        pub frame_index: u8,
+        pub width: u16,
+        pub height: u16,
+        pub max_frame_size: u32,
+    }
+
+    /// Parsed UVC format information
+    #[derive(Debug, Clone)]
+    pub struct UvcFormatInfo {
+        pub format_index: u8,
+        pub format_type: UvcFormatType,
+        pub num_frame_descriptors: u8,
+        pub guid: Option<[u8; 16]>,
+        pub bits_per_pixel: Option<u8>,
+        pub frames: Vec<UvcFrameInfo>,
+    }
+
+    /// UVC format types
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UvcFormatType {
+        Mjpeg,
+        Uncompressed,
+        FrameBased,
+        Unknown(u8),
+    }
+
+    /// Parse UVC class-specific descriptors from interface extra bytes
+    pub fn parse_format_descriptors(extra: &[u8]) -> Vec<UvcFormatInfo> {
+        let mut formats = Vec::new();
+        let mut offset = 0;
+
+        while offset + 2 < extra.len() {
+            let desc_len = extra[offset] as usize;
+            if desc_len < 3 || offset + desc_len > extra.len() {
+                break;
+            }
+
+            let desc_type = extra[offset + 1];
+            let desc_subtype = extra[offset + 2];
+
+            // Check if this is a class-specific Video Streaming descriptor (0x24 = CS_INTERFACE)
+            if desc_type == 0x24 {
+                match desc_subtype {
+                    VS_FORMAT_MJPEG if desc_len >= 11 => {
+                        let format_index = extra[offset + 3];
+                        let num_frame_descs = extra[offset + 4];
+                        log::info!(
+                            "Found MJPEG format: index={}, frame_descriptors={}",
+                            format_index,
+                            num_frame_descs
+                        );
+                        formats.push(UvcFormatInfo {
+                            format_index,
+                            format_type: UvcFormatType::Mjpeg,
+                            num_frame_descriptors: num_frame_descs,
+                            guid: None,
+                            bits_per_pixel: None,
+                            frames: Vec::new(),
+                        });
+                    }
+                    VS_FORMAT_UNCOMPRESSED if desc_len >= 27 => {
+                        let format_index = extra[offset + 3];
+                        let num_frame_descs = extra[offset + 4];
+                        let mut guid = [0u8; 16];
+                        guid.copy_from_slice(&extra[offset + 5..offset + 21]);
+                        let bits_per_pixel = extra[offset + 21];
+
+                        // Try to identify the format from GUID
+                        let format_name = if guid == YUY2_GUID {
+                            "YUY2"
+                        } else if guid == NV12_GUID {
+                            "NV12"
+                        } else {
+                            "Unknown"
+                        };
+
+                        log::info!(
+                            "Found Uncompressed format: index={}, type={}, bpp={}, frame_descriptors={}",
+                            format_index, format_name, bits_per_pixel, num_frame_descs
+                        );
+                        log::debug!("  GUID: {:02x?}", &guid);
+
+                        formats.push(UvcFormatInfo {
+                            format_index,
+                            format_type: UvcFormatType::Uncompressed,
+                            num_frame_descriptors: num_frame_descs,
+                            guid: Some(guid),
+                            bits_per_pixel: Some(bits_per_pixel),
+                            frames: Vec::new(),
+                        });
+                    }
+                    VS_FORMAT_FRAME_BASED if desc_len >= 28 => {
+                        let format_index = extra[offset + 3];
+                        let num_frame_descs = extra[offset + 4];
+                        let mut guid = [0u8; 16];
+                        guid.copy_from_slice(&extra[offset + 5..offset + 21]);
+                        let bits_per_pixel = extra[offset + 21];
+
+                        log::info!(
+                            "Found Frame-Based format: index={}, bpp={}, frame_descriptors={}",
+                            format_index,
+                            bits_per_pixel,
+                            num_frame_descs
+                        );
+                        log::debug!("  GUID: {:02x?}", &guid);
+
+                        formats.push(UvcFormatInfo {
+                            format_index,
+                            format_type: UvcFormatType::FrameBased,
+                            num_frame_descriptors: num_frame_descs,
+                            guid: Some(guid),
+                            bits_per_pixel: Some(bits_per_pixel),
+                            frames: Vec::new(),
+                        });
+                    }
+                    VS_INPUT_HEADER => {
+                        if desc_len >= 13 {
+                            let num_formats = extra[offset + 3];
+                            log::info!("VS Input Header: {} format(s) available", num_formats);
+                        }
+                    }
+                    VS_FRAME_UNCOMPRESSED | VS_FRAME_MJPEG => {
+                        // Parse frame descriptor to get resolution info
+                        // Offset 3: frame index
+                        // Offset 5-6: wWidth (little-endian)
+                        // Offset 7-8: wHeight (little-endian)
+                        // Offset 9-12: dwMinBitRate
+                        // Offset 13-16: dwMaxBitRate
+                        // Offset 17-20: dwMaxVideoFrameBufferSize
+                        if desc_len >= 21 {
+                            let frame_index = extra[offset + 3];
+                            let width = u16::from_le_bytes([extra[offset + 5], extra[offset + 6]]);
+                            let height = u16::from_le_bytes([extra[offset + 7], extra[offset + 8]]);
+                            let max_frame_size = u32::from_le_bytes([
+                                extra[offset + 17],
+                                extra[offset + 18],
+                                extra[offset + 19],
+                                extra[offset + 20],
+                            ]);
+                            let format_type_name = if desc_subtype == VS_FRAME_UNCOMPRESSED {
+                                "Uncompressed"
+                            } else {
+                                "MJPEG"
+                            };
+                            log::info!(
+                                "  Frame {}: {}x{} ({}) max_size={}",
+                                frame_index,
+                                width,
+                                height,
+                                format_type_name,
+                                max_frame_size
+                            );
+
+                            // Add this frame to the most recently added format
+                            if let Some(format) = formats.last_mut() {
+                                format.frames.push(UvcFrameInfo {
+                                    frame_index,
+                                    width,
+                                    height,
+                                    max_frame_size,
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        log::debug!(
+                            "UVC VS descriptor subtype {:02x}, len={}",
+                            desc_subtype,
+                            desc_len
+                        );
+                    }
+                }
+            }
+
+            offset += desc_len;
+        }
+
+        formats
+    }
 }
 
 // ============================================================================
@@ -709,6 +980,37 @@ const NUM_TRANSFERS: usize = 4;
 /// Timeout for event handling in milliseconds
 const EVENT_TIMEOUT_MS: i32 = 100;
 
+/// Known YUY2 frame sizes for common resolutions (2 bytes per pixel)
+const YUY2_FRAME_SIZES: &[(usize, u32, u32)] = &[
+    (1843200, 1280, 720), // 720p
+    (921600, 640, 720),   // Half 720p width
+    (614400, 640, 480),   // VGA
+    (460800, 640, 360),   // 360p
+    (153600, 320, 240),   // QVGA
+];
+
+/// Minimum acceptable frame size for uncompressed video (~75% of QVGA)
+const MIN_UNCOMPRESSED_FRAME_SIZE: usize = 115200;
+
+/// Check if frame_size represents a complete uncompressed frame
+fn is_complete_uncompressed_frame(frame_size: usize) -> bool {
+    // Check against known frame sizes with 5% tolerance
+    for &(expected_size, _width, _height) in YUY2_FRAME_SIZES {
+        let lower = expected_size * 95 / 100;
+        let upper = expected_size * 105 / 100;
+        if frame_size >= lower && frame_size <= upper {
+            return true;
+        }
+    }
+
+    // Fallback: accept any frame >= 90% of 720p size
+    let min_720p = 1843200 * 90 / 100; // ~1.66MB
+    frame_size >= min_720p
+}
+
+/// Expected YUY2 frame size for 720p (1280 * 720 * 2)
+const EXPECTED_YUY2_720P_SIZE: usize = 1843200;
+
 /// Shared state for frame accumulation across all transfers
 struct SharedFrameState {
     /// Buffer to accumulate frame data across packets
@@ -717,6 +1019,8 @@ struct SharedFrameState {
     last_frame_id: Option<bool>,
     /// Whether we've synced to a frame boundary
     synced: bool,
+    /// Detected format: true = MJPEG, false = uncompressed (YUY2)
+    is_mjpeg: Option<bool>,
 }
 
 /// Context passed to the isochronous transfer callback
@@ -773,6 +1077,7 @@ impl IsochronousStream {
             frame_buffer: Vec::with_capacity(2 * 1024 * 1024), // 2MB for 1280x720 YUY2
             last_frame_id: None,
             synced: false,
+            is_mjpeg: None, // Will be detected from first frame data
         }));
 
         let buffer_size = (max_packet_size as usize) * (ISO_PACKETS_PER_TRANSFER as usize);
@@ -1070,32 +1375,120 @@ unsafe fn process_iso_packets(
 
         let header_len = pkt_data[0] as usize;
         let header_flags = pkt_data[1];
-        let end_of_frame = (header_flags & 0x02) != 0;
-        let frame_id = (header_flags & 0x01) != 0;
-        let error = (header_flags & 0x40) != 0;
 
-        // Log unusual header situations
+        // IMPORTANT: Check if this packet has a valid UVC header BEFORE interpreting flags
+        // Many cameras only include the UVC header on the FIRST packet of each transfer.
+        // Subsequent packets are pure payload data where byte 0/1 are video data, not header.
+        //
+        // UVC header format:
+        // - Byte 0: Header length (2-12 bytes typically)
+        // - Byte 1: BFH (Bit Field Header) flags
+        //   - Bit 0: FID (Frame ID toggle)
+        //   - Bit 1: EOF (End of Frame)
+        //   - Bit 2: PTS present
+        //   - Bit 3: SCR present
+        //   - Bit 4: Reserved
+        //   - Bit 5: Still image
+        //   - Bit 6: Error
+        //   - Bit 7: EOH (End of Header) - should ALWAYS be 1 for valid headers
+        //
+        // UVC cameras include a header on packets that contain frame data.
+        // The header starts with: byte 0 = length (2-12), byte 1 = flags with EOH bit set.
+        //
+        // CHALLENGE: YUY2 video data can have byte patterns that look like headers:
+        // - Byte 0 could be 2-12 (common Y/U/V values)
+        // - Byte 1 could have bit 7 set (values 128-255 are common for bright pixels)
+        //
+        // SOLUTION: Use stricter header validation:
+        // 1. Header length must be EXACTLY 2 or 12 (the common UVC header sizes)
+        // 2. EOH bit (0x80) must be set
+        // 3. For 12-byte headers, PTS and/or SCR flags should be set (bits 2-3)
+        //    For 2-byte headers, no PTS/SCR flags should be set
+        let has_eoh = (header_flags & 0x80) != 0;
+        let pts_flag = (header_flags & 0x04) != 0; // Bit 2: PTS present
+        let scr_flag = (header_flags & 0x08) != 0; // Bit 3: SCR present
+
+        let is_uvc_header = if header_len == 2 && has_eoh && !pts_flag && !scr_flag {
+            // Minimal 2-byte header: length=2, EOH set, no PTS/SCR
+            true
+        } else if header_len == 12 && has_eoh && (pts_flag || scr_flag) {
+            // Full 12-byte header with PTS and/or SCR
+            true
+        } else {
+            // Not a valid UVC header pattern
+            false
+        };
+
+        // Only parse UVC flags if we have a valid header
+        let (end_of_frame, frame_id, error) = if is_uvc_header {
+            (
+                (header_flags & 0x02) != 0, // EOF
+                (header_flags & 0x01) != 0, // FID
+                (header_flags & 0x40) != 0, // Error
+            )
+        } else {
+            // No header - these bytes are payload, not flags
+            // Use last known FID to maintain sync
+            (false, state.last_frame_id.unwrap_or(false), false)
+        };
+
+        // Handle UVC error flag (only if this is actually a header)
         if error {
-            log::warn!("UVC error flag set in packet {}", i);
-            // Clear buffer on error - frame is corrupted
-            state.frame_buffer.clear();
-            state.synced = false;
+            // For MJPEG: Error likely means corrupted JPEG, need to clear
+            let is_mjpeg = state.is_mjpeg.unwrap_or(false);
+            if is_mjpeg {
+                log::warn!("UVC error in MJPEG packet {} - clearing buffer", i);
+                state.frame_buffer.clear();
+                state.synced = false;
+                continue;
+            }
+            // For YUY2: Skip this packet but don't clear buffer
+            log::debug!("UVC error flag in YUY2 packet {} - skipping packet", i);
             continue;
         }
 
-        // Detect frame boundary by FID toggle
+        // Detect format from first substantial data
+        if state.is_mjpeg.is_none() && state.frame_buffer.len() >= 2 {
+            let is_jpeg = state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8;
+            state.is_mjpeg = Some(is_jpeg);
+            if is_jpeg {
+                log::info!("Detected MJPEG format from JPEG SOI marker");
+            } else {
+                log::info!(
+                    "Detected uncompressed (YUY2) format - using size-based frame detection"
+                );
+            }
+        }
+
+        // FID toggle handling depends on format
+        let is_mjpeg = state.is_mjpeg.unwrap_or(false);
+
         if let Some(last_fid) = state.last_frame_id {
-            if frame_id != last_fid && !end_of_frame {
-                // FID toggled - this is the start of a new frame
-                // If we have accumulated data, it's from a previous incomplete frame
-                if !state.frame_buffer.is_empty() && state.synced {
-                    log::debug!(
-                        "FID toggle detected with {} bytes accumulated (discarding partial frame)",
-                        state.frame_buffer.len()
-                    );
+            if frame_id != last_fid {
+                // FID toggled - this indicates a new frame is starting
+                if is_mjpeg {
+                    // MJPEG: FID toggle is reliable frame boundary
+                    let frame_size = state.frame_buffer.len();
+                    if frame_size > 0 && state.synced {
+                        let has_jpeg_marker = frame_size >= 2
+                            && state.frame_buffer[0] == 0xFF
+                            && state.frame_buffer[1] == 0xD8;
+                        if has_jpeg_marker {
+                            log::info!(
+                                "Complete MJPEG frame: {} bytes (trigger: FID toggle)",
+                                frame_size
+                            );
+                            let frame = std::mem::take(&mut state.frame_buffer);
+                            if let Err(e) = context.frame_sender.send(frame) {
+                                log::warn!("Failed to send frame: {}", e);
+                            }
+                        }
+                    }
+                    state.frame_buffer.clear();
                 }
-                state.frame_buffer.clear();
-                state.synced = true; // Now synced to frame boundary
+                // For YUY2: Don't use FID toggle - this camera toggles it mid-frame
+                // We rely on size-based detection instead
+                state.synced = true;
             }
         }
         state.last_frame_id = Some(frame_id);
@@ -1106,35 +1499,77 @@ unsafe fn process_iso_packets(
             continue;
         }
 
-        // Extract payload (skip header)
-        if header_len >= 2 && header_len <= actual_length {
-            let payload = &pkt_data[header_len..];
-            state.frame_buffer.extend_from_slice(payload);
-        } else if header_len > actual_length {
-            log::warn!(
-                "Invalid header length {} > packet size {}",
-                header_len,
-                actual_length
-            );
+        // Extract payload (skip header if present)
+        // We already determined is_uvc_header earlier
+        let bytes_added = if is_uvc_header {
+            // This packet has a UVC header - skip it to get to payload
+            if header_len <= actual_length {
+                let payload = &pkt_data[header_len..];
+                state.frame_buffer.extend_from_slice(payload);
+                payload.len()
+            } else {
+                log::warn!(
+                    "Header length {} > packet size {}, skipping",
+                    header_len,
+                    actual_length
+                );
+                0
+            }
+        } else {
+            // Pure payload data - append entire packet
+            state.frame_buffer.extend_from_slice(pkt_data);
+            pkt_data.len()
+        };
+
+        // Suppress unused variable warning
+        let _ = bytes_added;
+
+        // For YUY2/uncompressed: Check if buffer has reached expected frame size
+        // This is the primary frame detection mechanism for uncompressed video
+        if !is_mjpeg {
+            let frame_size = state.frame_buffer.len();
+            if frame_size >= EXPECTED_YUY2_720P_SIZE {
+                // Buffer has accumulated a complete frame - send it
+                let overflow = frame_size - EXPECTED_YUY2_720P_SIZE;
+                if overflow > 0 {
+                    log::debug!(
+                        "Complete YUY2 frame: {} bytes ({} overflow bytes discarded)",
+                        EXPECTED_YUY2_720P_SIZE,
+                        overflow
+                    );
+                }
+                // Take exactly the expected frame size
+                let frame: Vec<u8> = state
+                    .frame_buffer
+                    .drain(..EXPECTED_YUY2_720P_SIZE)
+                    .collect();
+                // IMPORTANT: Clear any overflow bytes - these are UVC headers that weren't
+                // properly detected and would corrupt the next frame if left in the buffer
+                state.frame_buffer.clear();
+                if let Err(e) = context.frame_sender.send(frame) {
+                    log::warn!("Failed to send frame: {}", e);
+                }
+            }
         }
 
-        // Check for end of frame
-        if end_of_frame && !state.frame_buffer.is_empty() {
+        // For MJPEG: EOF is reliable, send immediately
+        if is_mjpeg && end_of_frame && !state.frame_buffer.is_empty() {
             let frame_size = state.frame_buffer.len();
 
             // Check for JPEG SOI marker (0xFFD8)
-            if frame_size >= 2 && state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8 {
-                log::info!("Complete MJPEG frame: {} bytes", frame_size);
+            let has_jpeg_marker =
+                frame_size >= 2 && state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8;
 
-                // Send the frame to the receiver
+            if has_jpeg_marker {
+                log::info!("Complete MJPEG frame: {} bytes (trigger: EOF)", frame_size);
                 let frame = std::mem::take(&mut state.frame_buffer);
                 if let Err(e) = context.frame_sender.send(frame) {
                     log::warn!("Failed to send frame: {}", e);
                 }
             } else {
-                // Not JPEG at offset 0 - scan for SOI marker
+                // Scan for SOI marker in case it's offset
                 let mut soi_offset: Option<usize> = None;
-                for j in 0..frame_size.saturating_sub(1) {
+                for j in 0..frame_size.saturating_sub(1).min(100) {
                     if state.frame_buffer[j] == 0xFF && state.frame_buffer[j + 1] == 0xD8 {
                         soi_offset = Some(j);
                         break;
@@ -1142,7 +1577,6 @@ unsafe fn process_iso_packets(
                 }
 
                 if let Some(offset) = soi_offset {
-                    // Found JPEG SOI - extract frame starting from there
                     log::info!(
                         "Found JPEG SOI at offset {} in {} byte frame",
                         offset,
@@ -1152,22 +1586,8 @@ unsafe fn process_iso_packets(
                     if let Err(e) = context.frame_sender.send(jpeg_frame) {
                         log::warn!("Failed to send frame: {}", e);
                     }
-                } else if frame_size >= 50000 {
-                    // Reasonable size frame, send it anyway - might be valid data
-                    log::info!(
-                        "Sending {} byte frame (no JPEG marker, assuming video data)",
-                        frame_size
-                    );
-                    let frame = std::mem::take(&mut state.frame_buffer);
-                    if let Err(e) = context.frame_sender.send(frame) {
-                        log::warn!("Failed to send frame: {}", e);
-                    }
-                } else {
-                    log::trace!("Discarding small {} byte frame", frame_size);
                 }
             }
-
-            // Clear buffer for next frame
             state.frame_buffer.clear();
         }
     }

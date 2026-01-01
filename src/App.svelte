@@ -11,6 +11,12 @@ let errorMessage = $state<string>("");
 let frameCount = $state<number>(0);
 let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
 
+// Display settings for debugging (width, height, stride, offset)
+let widthSetting = $state<string>("W:Auto");
+let heightSetting = $state<string>("H:Auto");
+let strideSetting = $state<string>("S:Auto");
+let offsetSetting = $state<string>("O:+0");
+
 // Streaming status for detailed feedback
 let streamingStatus = $state<string>("Waiting for device...");
 let wasConnected = $state<boolean>(false);
@@ -26,6 +32,36 @@ const currentFps = $derived.by(() => {
   if (timeSpanMs <= 0) return 0;
   // FPS = (number of intervals) / (time span in seconds)
   return Math.round(((frameTimestamps.length - 1) / timeSpanMs) * 1000);
+});
+
+// Curated color palette - distinct, visible on dark backgrounds
+// Colors chosen to be maximally distinguishable from each other
+const BUILD_COLORS = [
+  "#f87171", // red-400
+  "#fb923c", // orange-400
+  "#fbbf24", // amber-400
+  "#a3e635", // lime-400
+  "#4ade80", // green-400
+  "#2dd4bf", // teal-400
+  "#22d3ee", // cyan-400
+  "#60a5fa", // blue-400
+  "#a78bfa", // violet-400
+  "#f472b6", // pink-400
+  "#e879f9", // fuchsia-400
+  "#c084fc", // purple-400
+];
+
+// Hash a git hash string to a color index
+function hashToColorIndex(hash: string): number {
+  // Use first 6 chars of hash, parse as hex, mod by palette size
+  const hexValue = parseInt(hash.slice(0, 6), 16);
+  return hexValue % BUILD_COLORS.length;
+}
+
+// Get color for current build
+const buildColor = $derived.by(() => {
+  if (!buildInfo?.git_hash) return "#9ca3af"; // gray fallback
+  return BUILD_COLORS[hashToColorIndex(buildInfo.git_hash)];
 });
 
 // Derived streaming status message
@@ -94,9 +130,13 @@ onMount(async () => {
   // Listen for frame-ready events and fetch frame data
   const unlistenFrame = await listen("frame-ready", async () => {
     try {
-      // Fetch raw JPEG bytes from Rust backend
-      const frameData: ArrayBuffer = await invoke("get_frame");
-      await renderFrame(frameData);
+      // Fetch frame info (format, dimensions) and raw bytes in parallel
+      const [frameInfo, frameData] = await Promise.all([
+        invoke<{ width: number; height: number; format: string }>("get_frame_info"),
+        invoke<ArrayBuffer>("get_frame"),
+      ]);
+
+      await renderFrame(frameData, frameInfo.format, frameInfo.width, frameInfo.height);
       frameCount++;
 
       // Track timestamp for FPS calculation
@@ -138,29 +178,64 @@ onDestroy(() => {
 });
 
 /**
- * Render a JPEG frame to the canvas using browser-native decoding
+ * Render a frame to the canvas
+ * Supports both JPEG (from MJPEG cameras) and RGB24 (from YUY2 cameras)
  */
-async function renderFrame(data: ArrayBuffer): Promise<void> {
+async function renderFrame(
+  data: ArrayBuffer,
+  format: string,
+  width: number,
+  height: number,
+): Promise<void> {
   if (!ctx || !canvas) return;
 
-  // Create blob from raw JPEG bytes
-  const blob = new Blob([data], { type: "image/jpeg" });
+  if (format === "jpeg") {
+    // JPEG: Use browser-native decoding via createImageBitmap
+    const blob = new Blob([data], { type: "image/jpeg" });
+    const bitmap = await createImageBitmap(blob);
 
-  // Use createImageBitmap for efficient decoding (off main thread)
-  const bitmap = await createImageBitmap(blob);
+    // Resize canvas to match frame dimensions (only if changed)
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      currentResolution = `${bitmap.width}x${bitmap.height}`;
+    }
 
-  // Resize canvas to match frame dimensions (only if changed)
-  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    currentResolution = `${bitmap.width}x${bitmap.height}`;
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+  } else {
+    // RGB24: Convert to RGBA and use putImageData
+    const rgb = new Uint8Array(data);
+    const expectedSize = width * height * 3;
+
+    if (rgb.length < expectedSize) {
+      console.debug(`RGB frame too small: ${rgb.length} < ${expectedSize}`);
+      return;
+    }
+
+    // Resize canvas if needed
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      currentResolution = `${width}x${height}`;
+    }
+
+    // Convert RGB24 to RGBA32 (canvas requires alpha channel)
+    const imageData = ctx.createImageData(width, height);
+    const rgba = imageData.data;
+    const pixelCount = width * height;
+
+    for (let i = 0; i < pixelCount; i++) {
+      const rgbIdx = i * 3;
+      const rgbaIdx = i * 4;
+      rgba[rgbaIdx] = rgb[rgbIdx]; // R
+      rgba[rgbaIdx + 1] = rgb[rgbIdx + 1]; // G
+      rgba[rgbaIdx + 2] = rgb[rgbIdx + 2]; // B
+      rgba[rgbaIdx + 3] = 255; // A (fully opaque)
+    }
+
+    ctx.putImageData(imageData, 0, 0);
   }
-
-  // Draw bitmap to canvas
-  ctx.drawImage(bitmap, 0, 0);
-
-  // Release bitmap resources
-  bitmap.close();
 }
 
 async function cycleResolution() {
@@ -170,6 +245,38 @@ async function cycleResolution() {
     currentResolution = newRes;
   } catch (e) {
     errorMessage = `Failed to change resolution: ${e}`;
+  }
+}
+
+async function cycleWidth() {
+  try {
+    widthSetting = await invoke<string>("cycle_width");
+  } catch (e) {
+    errorMessage = `Failed to change width: ${e}`;
+  }
+}
+
+async function cycleHeight() {
+  try {
+    heightSetting = await invoke<string>("cycle_height");
+  } catch (e) {
+    errorMessage = `Failed to change height: ${e}`;
+  }
+}
+
+async function cycleStride() {
+  try {
+    strideSetting = await invoke<string>("cycle_stride");
+  } catch (e) {
+    errorMessage = `Failed to change stride: ${e}`;
+  }
+}
+
+async function cycleOffset() {
+  try {
+    offsetSetting = await invoke<string>("cycle_offset");
+  } catch (e) {
+    errorMessage = `Failed to change offset: ${e}`;
   }
 }
 
@@ -223,14 +330,20 @@ function getStatusColor(): string {
           <span class="frame-count">{frameCount.toLocaleString()} frames</span>
         {/if}
         {#if buildInfo}
-          <span class="build-info">v{buildInfo.version} ({buildInfo.git_hash})</span>
-        {/if}
-        {#if currentResolution}
-          <button class="resolution-btn" onclick={cycleResolution}>
-            {currentResolution}
-          </button>
+          <span class="build-info" style="color: {buildColor}">v{buildInfo.version} ({buildInfo.git_hash})</span>
         {/if}
       </div>
+    </div>
+
+    <!-- Debug controls row -->
+    <div class="debug-controls">
+      <button class="debug-btn" onclick={cycleWidth}>{widthSetting}</button>
+      <button class="debug-btn" onclick={cycleHeight}>{heightSetting}</button>
+      <button class="debug-btn" onclick={cycleStride}>{strideSetting}</button>
+      <button class="debug-btn" onclick={cycleOffset}>{offsetSetting}</button>
+      {#if currentResolution}
+        <button class="debug-btn detected">{currentResolution}</button>
+      {/if}
     </div>
 
     {#if errorMessage}
@@ -243,20 +356,20 @@ function getStatusColor(): string {
 </main>
 
 <style>
-  :global(body) {
+  :global(html, body) {
     margin: 0;
     padding: 0;
     background: #0a0a0a;
     color: white;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     overflow: hidden;
-    height: 100vh;
-    width: 100vw;
+    height: 100%;
+    width: 100%;
   }
 
   main {
-    height: 100vh;
-    width: 100vw;
+    position: fixed;
+    inset: 0;
     display: flex;
     flex-direction: column;
   }
@@ -300,7 +413,7 @@ function getStatusColor(): string {
     width: 64px;
     height: 64px;
     margin: 0 auto 1rem;
-    color: #666;
+    color: #9ca3af;
   }
 
   .camera-icon svg {
@@ -316,7 +429,7 @@ function getStatusColor(): string {
 
   .hint {
     font-size: 0.875rem;
-    color: #666;
+    color: #9ca3af;
   }
 
   .status-bar {
@@ -352,7 +465,7 @@ function getStatusColor(): string {
 
   .camera-name {
     font-size: 0.75rem;
-    color: #888;
+    color: #a1a1aa;
     margin-left: 0.5rem;
     padding-left: 0.5rem;
     border-left: 1px solid #444;
@@ -360,7 +473,7 @@ function getStatusColor(): string {
 
   .frame-count {
     font-size: 0.75rem;
-    color: #888;
+    color: #a1a1aa;
     font-family: monospace;
   }
 
@@ -371,8 +484,8 @@ function getStatusColor(): string {
   }
 
   .build-info {
-    font-size: 0.7rem;
-    color: #666;
+    font-size: 0.75rem;
+    color: #9ca3af;
     font-family: monospace;
   }
 
@@ -391,15 +504,55 @@ function getStatusColor(): string {
     background: #444;
   }
 
+  .debug-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+    background: #111;
+    border-top: 1px solid #333;
+    justify-content: center;
+  }
+
+  .debug-btn {
+    background: #2563eb;
+    border: none;
+    color: white;
+    padding: 0.75rem;
+    border-radius: 8px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    min-width: 48px;
+    min-height: 48px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .debug-btn:hover {
+    background: #3b82f6;
+  }
+
+  .debug-btn.detected {
+    background: #059669;
+  }
+
+  .debug-btn.detected:hover {
+    background: #10b981;
+  }
+
   .error-banner {
     position: fixed;
-    bottom: 60px;
-    left: 1rem;
-    right: 1rem;
+    bottom: calc(120px + env(safe-area-inset-bottom));
+    left: max(1rem, env(safe-area-inset-left));
+    right: max(1rem, env(safe-area-inset-right));
     background: #dc2626;
     color: white;
     padding: 0.75rem 1rem;
-    border-radius: 4px;
+    border-radius: 8px;
     display: flex;
     justify-content: space-between;
     align-items: center;
