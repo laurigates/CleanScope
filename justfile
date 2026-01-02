@@ -224,6 +224,7 @@ emulator-run name="cleanscope":
 
 # Run Android development (builds, installs, launches on connected device)
 android-dev: _require-android
+    adb shell am force-stop com.cleanscope.app || true
     npm run tauri:android:dev
 
 # Build Android APK (debug)
@@ -332,7 +333,32 @@ wifi-status:
         echo "For endoscope testing, set up WiFi with: just wifi-setup"
     fi
 
-# Complete WiFi setup workflow (enable tcpip, show IP, connect)
+# Connect to a known WiFi ADB device (no USB required if already paired)
+wifi-connect ip="192.168.0.25" port="5555":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== ADB WiFi Connect ==="
+    echo ""
+    echo "Connecting to {{ip}}:{{port}}..."
+
+    # Try to connect
+    if adb connect "{{ip}}:{{port}}" 2>&1 | grep -qE "connected|already"; then
+        echo ""
+        echo "SUCCESS! Connected to {{ip}}:{{port}}"
+        adb devices -l | grep -E "{{ip}}"
+    else
+        echo ""
+        echo "Connection failed. The device may need to be re-paired."
+        echo ""
+        echo "Options:"
+        echo "  1. Connect phone via USB and run: just wifi-setup"
+        echo "  2. Use Android 11+ Wireless Debugging (no USB needed):"
+        echo "     Settings > Developer Options > Wireless debugging"
+        echo "     Then: adb pair <IP>:<PAIRING_PORT>"
+        exit 1
+    fi
+
+# Complete WiFi setup workflow (requires USB for initial setup)
 wifi-setup:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -341,14 +367,6 @@ wifi-setup:
     echo "This sets up wireless ADB so you can use the USB-C port for the endoscope."
     echo ""
 
-    # Check if any device is connected
-    if ! adb devices | grep -qE "device$"; then
-        echo "ERROR: No device connected via USB."
-        echo ""
-        echo "Please connect your phone via USB cable first, then run this again."
-        exit 1
-    fi
-
     # Check if already connected via WiFi
     if adb devices | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+.*device$"; then
         echo "Already connected via WiFi!"
@@ -356,6 +374,18 @@ wifi-setup:
         echo ""
         echo "You can unplug the USB cable and connect the endoscope."
         exit 0
+    fi
+
+    # Check if any device is connected (USB or otherwise)
+    if ! adb devices | grep -qE "device$"; then
+        echo "No device connected."
+        echo ""
+        echo "Options:"
+        echo "  1. Connect phone via USB cable and run this again"
+        echo "  2. If you know the IP, run: just wifi-connect <IP>"
+        echo "  3. Use Android 11+ Wireless Debugging (no USB needed):"
+        echo "     Settings > Developer Options > Wireless debugging"
+        exit 1
     fi
 
     echo "Step 1: Enabling TCP/IP mode on port 5555..."
@@ -372,7 +402,7 @@ wifi-setup:
         echo "Make sure your phone is connected to WiFi."
         echo ""
         echo "You can find the IP manually in Settings > WiFi > (your network) > IP address"
-        echo "Then run: adb connect <IP>:5555"
+        echo "Then run: just wifi-connect <IP>"
         exit 1
     fi
 
@@ -393,10 +423,15 @@ wifi-setup:
         echo "  2. Plug the USB endoscope into your phone's USB-C port"
         echo "  3. Run: just wifi-deploy    (to build and install the app)"
         echo "  4. Run: just logs           (to monitor the app)"
+        echo ""
+        echo "To reconnect later without USB: just wifi-connect $PHONE_IP"
     else
         echo ""
         echo "WARNING: Connection may have failed. Check with: just wifi-status"
     fi
+
+# Default phone IP for quick reconnection (set to your phone's IP)
+PHONE_IP := "192.168.0.25"
 
 # Build and deploy to WiFi-connected device
 wifi-deploy: _require-android
@@ -404,6 +439,20 @@ wifi-deploy: _require-android
     set -euo pipefail
     echo "=== WiFi Deploy ==="
     echo ""
+
+    # Check for any connection
+    if ! adb devices | grep -qE "device$"; then
+        echo "No device connected. Attempting to reconnect to {{PHONE_IP}}:5555..."
+        if adb connect "{{PHONE_IP}}:5555" 2>&1 | grep -qE "connected|already"; then
+            echo "Reconnected!"
+        else
+            echo ""
+            echo "Could not connect. Options:"
+            echo "  1. Run: just wifi-connect <IP>"
+            echo "  2. Connect via USB and run: just wifi-setup"
+            exit 1
+        fi
+    fi
 
     # Check for WiFi connection
     if ! adb devices | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+.*device$"; then
@@ -413,7 +462,7 @@ wifi-deploy: _require-android
             echo "USB device found. Proceeding with USB deployment..."
         else
             echo "No device connected at all."
-            echo "Run 'just wifi-setup' to set up WiFi connection first."
+            echo "Run 'just wifi-connect' or 'just wifi-setup' first."
             exit 1
         fi
     else
@@ -423,6 +472,10 @@ wifi-deploy: _require-android
     echo ""
     echo "Building Android APK (debug)..."
     npm run tauri:android:build -- --debug
+
+    echo ""
+    echo "Stopping existing app..."
+    adb shell am force-stop com.cleanscope.app || true
 
     echo ""
     echo "Installing APK to device..."

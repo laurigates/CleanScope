@@ -10,6 +10,16 @@ const availableResolutions = $state<string[]>([]);
 let errorMessage = $state<string>("");
 let frameCount = $state<number>(0);
 let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
+let captureResult = $state<{
+  path: string;
+  raw_path: string | null;
+  size: number;
+  raw_size: number;
+  header_hex: string;
+  format_hint: string;
+  width: number;
+  height: number;
+} | null>(null);
 
 // Display settings for debugging (width, height, stride, offset)
 let widthSetting = $state<string>("W:Auto");
@@ -280,6 +290,24 @@ async function cycleOffset() {
   }
 }
 
+async function captureFrame() {
+  try {
+    captureResult = await invoke<{
+      path: string;
+      raw_path: string | null;
+      size: number;
+      raw_size: number;
+      header_hex: string;
+      format_hint: string;
+      width: number;
+      height: number;
+    }>("dump_frame");
+    console.log("Frame captured:", captureResult);
+  } catch (e) {
+    errorMessage = `Failed to capture frame: ${e}`;
+  }
+}
+
 function getStatusColor(): string {
   switch (connectionStatus) {
     case "connected":
@@ -341,10 +369,34 @@ function getStatusColor(): string {
       <button class="debug-btn" onclick={cycleHeight}>{heightSetting}</button>
       <button class="debug-btn" onclick={cycleStride}>{strideSetting}</button>
       <button class="debug-btn" onclick={cycleOffset}>{offsetSetting}</button>
+      <button class="debug-btn capture" onclick={captureFrame}>Capture</button>
       {#if currentResolution}
         <button class="debug-btn detected">{currentResolution}</button>
       {/if}
     </div>
+
+    {#if captureResult}
+      <div class="capture-info">
+        <div class="capture-header">
+          <span class="capture-title">Captured Frame</span>
+          <button class="dismiss-btn" onclick={() => captureResult = null}>×</button>
+        </div>
+        <div class="capture-details">
+          <div><strong>Dimensions:</strong> {captureResult.width}x{captureResult.height}</div>
+          <div><strong>Processed:</strong> {captureResult.size.toLocaleString()} bytes (RGB)</div>
+          {#if captureResult.raw_size > 0}
+            <div><strong>Raw:</strong> {captureResult.raw_size.toLocaleString()} bytes ({captureResult.format_hint})</div>
+          {/if}
+          <div class="hex-dump"><strong>Raw header:</strong> <code>{captureResult.header_hex}</code></div>
+        </div>
+        <div class="capture-hint">
+          {#if captureResult.raw_path}
+            <div>Raw: <code>adb shell run-as com.cleanscope.app cat "{captureResult.raw_path}" > raw.yuy2</code></div>
+          {/if}
+          <div>RGB: <code>adb shell run-as com.cleanscope.app cat "{captureResult.path}" > frame.rgb</code></div>
+        </div>
+      </div>
+    {/if}
 
     {#if errorMessage}
       <div class="error-banner">
@@ -542,6 +594,83 @@ function getStatusColor(): string {
 
   .debug-btn.detected:hover {
     background: #10b981;
+  }
+
+  .debug-btn.capture {
+    background: #7c3aed;
+  }
+
+  .debug-btn.capture:hover {
+    background: #8b5cf6;
+  }
+
+  .capture-info {
+    background: #1e1b4b;
+    border: 1px solid #4c1d95;
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin: 0 1rem 0.5rem;
+    font-size: 0.75rem;
+  }
+
+  .capture-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .capture-title {
+    font-weight: 600;
+    color: #a78bfa;
+  }
+
+  .dismiss-btn {
+    background: transparent;
+    border: none;
+    color: #9ca3af;
+    font-size: 1.25rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+  }
+
+  .capture-details {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    color: #e2e8f0;
+  }
+
+  .capture-details code {
+    background: #312e81;
+    padding: 0.125rem 0.25rem;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    word-break: break-all;
+  }
+
+  .hex-dump code {
+    display: block;
+    margin-top: 0.25rem;
+    padding: 0.375rem;
+    font-family: monospace;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .capture-hint {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid #4c1d95;
+    color: #9ca3af;
+    font-size: 0.7rem;
+  }
+
+  .capture-hint code {
+    background: #312e81;
+    padding: 0.125rem 0.25rem;
+    border-radius: 3px;
   }
 
   .error-banner {

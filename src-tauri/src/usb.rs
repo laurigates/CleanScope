@@ -722,12 +722,14 @@ fn stream_frames_isochronous_with_format_detection(
     );
 
     // Create the isochronous stream
+    // For format detection, we use 0 as expected frame size (MJPEG uses EOF markers, not size)
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
+            0, // MJPEG uses EOF markers, not frame size
         )?
     };
 
@@ -930,12 +932,14 @@ fn stream_frames_isochronous(
 
     // Create the isochronous stream
     // SAFETY: We hold references to ctx and dev for the duration of streaming
+    // For legacy MJPEG streaming, we use 0 as expected frame size (MJPEG uses EOF markers)
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
+            0, // MJPEG uses EOF markers, not frame size
         )?
     };
 
@@ -1047,22 +1051,27 @@ fn stream_frames_yuy2(
     use std::time::{Duration, Instant};
     use tauri::Emitter;
 
+    // Calculate expected frame size from descriptor resolution (YUY2 = 2 bytes per pixel)
+    let expected_frame_size = (descriptor_width * descriptor_height * 2) as usize;
+
     log::info!(
-        "Starting YUY2 streaming with RGB conversion, descriptor resolution: {}x{}",
+        "Starting YUY2 streaming with RGB conversion, descriptor resolution: {}x{}, expected frame size: {} bytes",
         descriptor_width,
-        descriptor_height
+        descriptor_height,
+        expected_frame_size
     );
 
     // Emit connected event to update frontend UI
     crate::emit_usb_event(&app_handle, true, Some("YUY2 Camera".to_string()));
 
-    // Create the isochronous stream
+    // Create the isochronous stream with descriptor-based frame size
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
+            expected_frame_size,
         )?
     };
 
@@ -1226,10 +1235,11 @@ fn stream_frames_yuy2(
                                 );
                             }
 
-                            // Store RGB frame in shared buffer
+                            // Store both RGB and raw YUY2 frames in shared buffer
                             {
                                 let mut buffer = shared_frame_buffer.lock().unwrap();
                                 buffer.frame = rgb_data;
+                                buffer.raw_frame = frame_data.clone(); // Store raw YUY2 for debugging
                                 buffer.timestamp = Instant::now();
                                 buffer.width = width;
                                 buffer.height = height;
@@ -1395,58 +1405,21 @@ fn start_uvc_streaming_with_resolution(
         }
     }
 
-    // Check if actual frame size from probe response differs significantly from descriptor
-    // Some cameras report different actual frame sizes than what descriptors claim
+    // Log if probe's max_frame_size differs from descriptor
+    // IMPORTANT: Always trust the descriptor resolution, not the probe response.
+    // Some cameras report incorrect max_frame_size in probe responses (e.g., 1843200 for 720p
+    // when the camera only supports 640x480 per the descriptor). Using the wrong size causes
+    // multiple frames to be concatenated, resulting in horizontal banding artifacts.
     let descriptor_frame_size = (width as u32) * (height as u32) * 2; // YUY2 = 2 bytes per pixel
-    if max_frame_size > descriptor_frame_size * 2 {
-        // Actual frame is much larger - infer resolution from max_frame_size
-        // Common YUY2 sizes: 1280x720=1843200, 640x480=614400, etc.
-        let (inferred_w, inferred_h) = match max_frame_size {
-            1843200 => (1280, 720), // 720p
-            921600 => (640, 720),   // Half 720p width
-            614400 => (640, 480),   // VGA
-            460800 => (640, 360),   // 360p
-            345600 => (480, 360),
-            153600 => (320, 240), // QVGA
-            _ => {
-                // Try to find a matching resolution in descriptors
-                let mut found = false;
-                for format in &formats {
-                    for frame in &format.frames {
-                        if frame.max_frame_size == max_frame_size {
-                            width = frame.width;
-                            height = frame.height;
-                            found = true;
-                            log::info!(
-                                "Matched frame size {} to descriptor: {}x{}",
-                                max_frame_size,
-                                width,
-                                height
-                            );
-                            break;
-                        }
-                    }
-                    if found {
-                        break;
-                    }
-                }
-                (width, height)
-            }
-        };
-
-        if inferred_w != width || inferred_h != height {
-            log::warn!(
-                "Probe max_frame_size={} doesn't match descriptor {}x{} ({}), using inferred {}x{}",
-                max_frame_size,
-                width,
-                height,
-                descriptor_frame_size,
-                inferred_w,
-                inferred_h
-            );
-            width = inferred_w;
-            height = inferred_h;
-        }
+    if max_frame_size != descriptor_frame_size {
+        log::warn!(
+            "Probe max_frame_size={} differs from descriptor {}x{} ({}). TRUSTING DESCRIPTOR.",
+            max_frame_size,
+            width,
+            height,
+            descriptor_frame_size
+        );
+        // Do NOT override width/height - the descriptor is authoritative
     }
 
     if !found_descriptor {

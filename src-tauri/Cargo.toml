@@ -49,6 +49,9 @@ android_logger = "0.14"
 # Image decoding for MJPEG streams
 jpeg-decoder = "0.3"
 
+# YUV to RGB conversion for raw video formats
+yuvutils-rs = "0.7"
+
 # Low-level USB access via libusb
 # Using vendored libusb to avoid system dependency issues on Android
 libusb1-sys = { version = "0.7", features = ["vendored"] }

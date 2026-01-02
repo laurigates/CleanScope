@@ -10,12 +10,14 @@ mod libusb_android;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Shared frame buffer for storing the latest camera frame
 pub struct FrameBuffer {
-    /// Raw JPEG frame data
+    /// Processed frame data (JPEG or RGB)
     pub frame: Vec<u8>,
+    /// Raw frame data before conversion (for debugging)
+    pub raw_frame: Vec<u8>,
     /// Timestamp when frame was captured
     pub timestamp: Instant,
     /// Frame width in pixels
@@ -28,6 +30,7 @@ impl Default for FrameBuffer {
     fn default() -> Self {
         Self {
             frame: Vec::new(),
+            raw_frame: Vec::new(),
             timestamp: Instant::now(),
             width: 0,
             height: 0,
@@ -191,6 +194,159 @@ fn get_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String>
     }
 
     Ok(tauri::ipc::Response::new(buffer.frame.clone()))
+}
+
+/// Captured frame information returned to frontend
+#[derive(Debug, Clone, serde::Serialize)]
+struct CapturedFrame {
+    /// Path where processed frame was saved
+    path: String,
+    /// Path where raw frame was saved (if available)
+    raw_path: Option<String>,
+    /// Processed frame size in bytes
+    size: usize,
+    /// Raw frame size in bytes
+    raw_size: usize,
+    /// First 64 bytes of raw frame as hex for quick inspection
+    header_hex: String,
+    /// Detected format hint
+    format_hint: String,
+    /// Frame dimensions if known
+    width: u32,
+    height: u32,
+}
+
+/// Dump the current frame to files for analysis
+///
+/// Saves both the processed frame (RGB/JPEG) and the raw frame (YUY2) if available.
+/// Returns information about the captured frames including file paths.
+#[tauri::command]
+fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<CapturedFrame, String> {
+    use std::io::Write;
+
+    let buffer = state
+        .frame_buffer
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    if buffer.frame.is_empty() {
+        return Err("No frame available to dump".to_string());
+    }
+
+    // Get app cache directory (works on Android)
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Could not get cache dir: {}", e))?;
+
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("Could not create cache dir: {}", e))?;
+
+    // Generate filename with timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Detect format from raw frame first bytes (if available), otherwise from processed frame
+    let raw_available = !buffer.raw_frame.is_empty();
+    let analysis_data = if raw_available {
+        &buffer.raw_frame
+    } else {
+        &buffer.frame
+    };
+
+    let (format_hint, raw_extension) =
+        if analysis_data.len() >= 2 && analysis_data[0] == 0xFF && analysis_data[1] == 0xD8 {
+            ("MJPEG (JPEG SOI marker)", "jpg")
+        } else {
+            // Check if it looks like YUY2 (alternating Y/U/Y/V pattern)
+            // YUY2 typically has Y values (0-255) with U/V around 128 for gray
+            let possible_yuy2 = analysis_data.len() >= 4
+                && analysis_data
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .take(100)
+                    .all(|&b| b > 100 && b < 156);
+            if possible_yuy2 {
+                ("YUY2/YUYV (UV values near 128)", "yuy2")
+            } else {
+                ("Raw video data", "raw")
+            }
+        };
+
+    // Save processed frame (RGB or JPEG)
+    let processed_ext =
+        if buffer.frame.len() >= 2 && buffer.frame[0] == 0xFF && buffer.frame[1] == 0xD8 {
+            "jpg"
+        } else {
+            "rgb"
+        };
+    let processed_filename = format!(
+        "frame_{}_{}x{}.{}",
+        timestamp, buffer.width, buffer.height, processed_ext
+    );
+    let processed_filepath = cache_dir.join(&processed_filename);
+
+    let mut file = std::fs::File::create(&processed_filepath)
+        .map_err(|e| format!("Could not create file: {}", e))?;
+    file.write_all(&buffer.frame)
+        .map_err(|e| format!("Could not write frame: {}", e))?;
+
+    log::info!(
+        "Dumped processed frame to {}: {} bytes",
+        processed_filepath.display(),
+        buffer.frame.len()
+    );
+
+    // Save raw frame if available
+    let raw_path = if raw_available {
+        let raw_filename = format!(
+            "frame_{}_{}x{}_raw.{}",
+            timestamp, buffer.width, buffer.height, raw_extension
+        );
+        let raw_filepath = cache_dir.join(&raw_filename);
+
+        let mut file = std::fs::File::create(&raw_filepath)
+            .map_err(|e| format!("Could not create raw file: {}", e))?;
+        file.write_all(&buffer.raw_frame)
+            .map_err(|e| format!("Could not write raw frame: {}", e))?;
+
+        log::info!(
+            "Dumped raw frame to {}: {} bytes, format: {}",
+            raw_filepath.display(),
+            buffer.raw_frame.len(),
+            format_hint
+        );
+
+        Some(raw_filepath.to_string_lossy().to_string())
+    } else {
+        log::info!("No raw frame available (might be MJPEG mode)");
+        None
+    };
+
+    // Generate hex dump of first 64 bytes of raw frame
+    let header_bytes: Vec<u8> = analysis_data.iter().take(64).copied().collect();
+    let header_hex = header_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    log::info!("Header: {}", header_hex);
+
+    Ok(CapturedFrame {
+        path: processed_filepath.to_string_lossy().to_string(),
+        raw_path,
+        size: buffer.frame.len(),
+        raw_size: buffer.raw_frame.len(),
+        header_hex,
+        format_hint: format_hint.to_string(),
+        width: buffer.width,
+        height: buffer.height,
+    })
 }
 
 /// Get frame metadata (dimensions and format)
@@ -382,10 +538,13 @@ pub fn run() {
     let stride_index = Arc::new(Mutex::new(None));
     let offset_index = Arc::new(Mutex::new(0usize));
 
-    // Clone Arcs for the setup closure (currently unused but kept for future use)
-    let _display_settings_clone = Arc::clone(&display_settings);
-    let _width_index_clone = Arc::clone(&width_index);
-    let _stride_index_clone = Arc::clone(&stride_index);
+    // Clone Arcs for the setup closure (used in Android USB handler)
+    #[allow(unused_variables)]
+    let display_settings_clone = Arc::clone(&display_settings);
+    #[allow(unused_variables)]
+    let width_index_clone = Arc::clone(&width_index);
+    #[allow(unused_variables)]
+    let stride_index_clone = Arc::clone(&stride_index);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -404,6 +563,7 @@ pub fn run() {
             get_resolutions,
             get_frame,
             get_frame_info,
+            dump_frame,
             cycle_width,
             cycle_height,
             cycle_stride,

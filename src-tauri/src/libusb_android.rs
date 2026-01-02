@@ -1021,6 +1021,8 @@ struct SharedFrameState {
     synced: bool,
     /// Detected format: true = MJPEG, false = uncompressed (YUY2)
     is_mjpeg: Option<bool>,
+    /// Expected frame size for uncompressed video (from descriptor, not probe)
+    expected_frame_size: usize,
 }
 
 /// Context passed to the isochronous transfer callback
@@ -1033,6 +1035,8 @@ struct IsoCallbackContext {
     shared_state: Arc<std::sync::Mutex<SharedFrameState>>,
     /// Max packet size for this endpoint
     max_packet_size: u16,
+    /// Expected frame size for uncompressed video (from descriptor)
+    expected_frame_size: usize,
 }
 
 /// Manages isochronous USB transfers for video streaming
@@ -1063,21 +1067,42 @@ impl IsochronousStream {
     /// # Safety
     /// The caller must ensure the device handle and context remain valid
     /// for the lifetime of this stream.
+    ///
+    /// # Arguments
+    /// * `ctx` - libusb context pointer
+    /// * `handle` - libusb device handle pointer
+    /// * `endpoint` - Endpoint address
+    /// * `max_packet_size` - Maximum packet size for the endpoint
+    /// * `expected_frame_size` - Expected frame size from descriptor (e.g., 614400 for 640x480 YUY2)
     pub unsafe fn new(
         ctx: *mut libusb1_sys::libusb_context,
         handle: *mut libusb1_sys::libusb_device_handle,
         endpoint: u8,
         max_packet_size: u16,
+        expected_frame_size: usize,
     ) -> Result<Self, LibusbError> {
         let (frame_sender, frame_receiver) = std::sync::mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        // Use provided expected_frame_size, fall back to 720p if 0
+        let frame_size = if expected_frame_size > 0 {
+            expected_frame_size
+        } else {
+            EXPECTED_YUY2_720P_SIZE
+        };
+
+        log::info!(
+            "Creating isochronous stream with expected frame size: {} bytes",
+            frame_size
+        );
+
         // Create shared state for frame accumulation (shared across all transfers)
         let shared_state = Arc::new(std::sync::Mutex::new(SharedFrameState {
-            frame_buffer: Vec::with_capacity(2 * 1024 * 1024), // 2MB for 1280x720 YUY2
+            frame_buffer: Vec::with_capacity(frame_size + 1024), // Frame size + margin
             last_frame_id: None,
             synced: false,
             is_mjpeg: None, // Will be detected from first frame data
+            expected_frame_size: frame_size,
         }));
 
         let buffer_size = (max_packet_size as usize) * (ISO_PACKETS_PER_TRANSFER as usize);
@@ -1107,6 +1132,7 @@ impl IsochronousStream {
                 stop_flag: Arc::clone(&stop_flag),
                 shared_state: Arc::clone(&shared_state),
                 max_packet_size,
+                expected_frame_size: frame_size,
             });
 
             transfers.push(transfer);
@@ -1115,10 +1141,11 @@ impl IsochronousStream {
         }
 
         log::info!(
-            "Allocated {} isochronous transfers, {} packets each, {} bytes per packet",
+            "Allocated {} isochronous transfers, {} packets each, {} bytes per packet (buffer {})",
             NUM_TRANSFERS,
             ISO_PACKETS_PER_TRANSFER,
-            max_packet_size
+            max_packet_size,
+            buffer_size
         );
 
         Ok(Self {
@@ -1321,6 +1348,61 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
     }
 }
 
+/// Validates a potential UVC payload header and returns the header length if valid.
+///
+/// Per USB Video Class spec, payload headers have this structure:
+/// - Byte 0: Header length (includes this byte)
+/// - Byte 1: BFH flags (bit 7 = EOH must be 1)
+/// - Bytes 2-5: PTS (4 bytes, optional, present if bit 2 set)
+/// - Bytes 6-11: SCR (6 bytes, optional, present if bit 3 set)
+///
+/// Valid lengths based on flags:
+/// - PTS=0, SCR=0: length = 2
+/// - PTS=1, SCR=0: length = 6
+/// - PTS=0, SCR=1: length = 8
+/// - PTS=1, SCR=1: length = 12
+///
+/// Returns `Some(header_len)` if valid, `None` if this is not a UVC header.
+#[inline]
+fn validate_uvc_header(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+
+    let header_len = data[0] as usize;
+    let header_flags = data[1];
+
+    // EOH (End of Header) bit MUST be set for valid headers
+    if (header_flags & 0x80) == 0 {
+        return None;
+    }
+
+    // Extract PTS/SCR flags
+    let pts_flag = (header_flags & 0x04) != 0;
+    let scr_flag = (header_flags & 0x08) != 0;
+    let reserved_bit = (header_flags & 0x10) != 0;
+
+    // Reserved bit should be 0 (helps reject false positives from video data)
+    if reserved_bit {
+        return None;
+    }
+
+    // Calculate expected length: base (2) + PTS (4 if present) + SCR (6 if present)
+    let expected_len = 2 + if pts_flag { 4 } else { 0 } + if scr_flag { 6 } else { 0 };
+
+    // Validate declared length matches expected
+    if header_len != expected_len {
+        return None;
+    }
+
+    // Ensure header fits within packet
+    if header_len > data.len() {
+        return None;
+    }
+
+    Some(header_len)
+}
+
 /// Process individual isochronous packets from a completed transfer
 unsafe fn process_iso_packets(
     xfr: &mut libusb1_sys::libusb_transfer,
@@ -1338,6 +1420,10 @@ unsafe fn process_iso_packets(
             poisoned.into_inner()
         }
     };
+
+    // Log first transfer's packet layout once
+    static LAYOUT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let should_log_layout = !LAYOUT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed);
 
     for i in 0..num_packets {
         // Get packet descriptor
@@ -1367,60 +1453,46 @@ unsafe fn process_iso_packets(
         let pkt_data = std::slice::from_raw_parts(xfr.buffer.add(offset), actual_length);
 
         // UVC payloads have a header (typically 2-12 bytes)
-        // Header byte 0: header length
-        // Header byte 1: bit flags (bit 1 = end of frame)
-        if actual_length < 2 {
-            continue;
+        // Use validate_uvc_header() to properly detect headers with all valid lengths
+        // (2, 6, 8, or 12 bytes depending on PTS/SCR flags)
+        let validated_header = validate_uvc_header(pkt_data);
+        let is_uvc_header = validated_header.is_some();
+        let header_len = validated_header.unwrap_or(0);
+
+        // Log packet layout for debugging (first transfer only)
+        if should_log_layout && packets_with_data <= 20 {
+            let first_bytes: Vec<u8> = pkt_data.iter().take(24).copied().collect();
+            let flags_str = if is_uvc_header {
+                let flags = pkt_data[1];
+                format!(
+                    "hdr=12 EOF={} FID={}",
+                    (flags & 0x02) != 0,
+                    (flags & 0x01) != 0
+                )
+            } else {
+                "no-hdr".to_string()
+            };
+            // Also show what payload bytes we'll actually use
+            let payload_start = if is_uvc_header { header_len } else { 0 };
+            let payload_preview: Vec<u8> = pkt_data
+                .iter()
+                .skip(payload_start)
+                .take(8)
+                .copied()
+                .collect();
+            log::info!(
+                "Pkt[{}]: len={}, {}, payload[{}..]: {:02x?}",
+                i,
+                actual_length,
+                flags_str,
+                payload_start,
+                payload_preview
+            );
         }
 
-        let header_len = pkt_data[0] as usize;
-        let header_flags = pkt_data[1];
-
-        // IMPORTANT: Check if this packet has a valid UVC header BEFORE interpreting flags
-        // Many cameras only include the UVC header on the FIRST packet of each transfer.
-        // Subsequent packets are pure payload data where byte 0/1 are video data, not header.
-        //
-        // UVC header format:
-        // - Byte 0: Header length (2-12 bytes typically)
-        // - Byte 1: BFH (Bit Field Header) flags
-        //   - Bit 0: FID (Frame ID toggle)
-        //   - Bit 1: EOF (End of Frame)
-        //   - Bit 2: PTS present
-        //   - Bit 3: SCR present
-        //   - Bit 4: Reserved
-        //   - Bit 5: Still image
-        //   - Bit 6: Error
-        //   - Bit 7: EOH (End of Header) - should ALWAYS be 1 for valid headers
-        //
-        // UVC cameras include a header on packets that contain frame data.
-        // The header starts with: byte 0 = length (2-12), byte 1 = flags with EOH bit set.
-        //
-        // CHALLENGE: YUY2 video data can have byte patterns that look like headers:
-        // - Byte 0 could be 2-12 (common Y/U/V values)
-        // - Byte 1 could have bit 7 set (values 128-255 are common for bright pixels)
-        //
-        // SOLUTION: Use stricter header validation:
-        // 1. Header length must be EXACTLY 2 or 12 (the common UVC header sizes)
-        // 2. EOH bit (0x80) must be set
-        // 3. For 12-byte headers, PTS and/or SCR flags should be set (bits 2-3)
-        //    For 2-byte headers, no PTS/SCR flags should be set
-        let has_eoh = (header_flags & 0x80) != 0;
-        let pts_flag = (header_flags & 0x04) != 0; // Bit 2: PTS present
-        let scr_flag = (header_flags & 0x08) != 0; // Bit 3: SCR present
-
-        let is_uvc_header = if header_len == 2 && has_eoh && !pts_flag && !scr_flag {
-            // Minimal 2-byte header: length=2, EOH set, no PTS/SCR
-            true
-        } else if header_len == 12 && has_eoh && (pts_flag || scr_flag) {
-            // Full 12-byte header with PTS and/or SCR
-            true
-        } else {
-            // Not a valid UVC header pattern
-            false
-        };
-
         // Only parse UVC flags if we have a valid header
-        let (end_of_frame, frame_id, error) = if is_uvc_header {
+        let (end_of_frame, frame_id, error) = if let Some(_hdr_len) = validated_header {
+            let header_flags = pkt_data[1];
             (
                 (header_flags & 0x02) != 0, // EOF
                 (header_flags & 0x01) != 0, // FID
@@ -1502,11 +1574,32 @@ unsafe fn process_iso_packets(
         // Extract payload (skip header if present)
         // We already determined is_uvc_header earlier
         let bytes_added = if is_uvc_header {
+            // Log header packets for debugging
+            static HEADER_LOGGED: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let log_count = HEADER_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if log_count < 20 {
+                let preview: Vec<u8> = pkt_data.iter().take(16).copied().collect();
+                log::info!(
+                    "Header packet {}: {} bytes, hdr_len={}, EOF={}, first 16: {:02x?}",
+                    log_count,
+                    actual_length,
+                    header_len,
+                    end_of_frame,
+                    preview
+                );
+            }
+
             // This packet has a UVC header - skip it to get to payload
             if header_len <= actual_length {
                 let payload = &pkt_data[header_len..];
-                state.frame_buffer.extend_from_slice(payload);
-                payload.len()
+                // Skip zero-filled payloads (incomplete/dropped data)
+                if payload.len() > 8 && payload[0..8].iter().all(|&b| b == 0) {
+                    0
+                } else {
+                    state.frame_buffer.extend_from_slice(payload);
+                    payload.len()
+                }
             } else {
                 log::warn!(
                     "Header length {} > packet size {}, skipping",
@@ -1516,9 +1609,32 @@ unsafe fn process_iso_packets(
                 0
             }
         } else {
-            // Pure payload data - append entire packet
-            state.frame_buffer.extend_from_slice(pkt_data);
-            pkt_data.len()
+            // No UVC header detected - this might be:
+            // 1. Pure payload continuation (valid)
+            // 2. A header we failed to detect (would corrupt data)
+            //
+            // Log first few bytes to help debug
+            static PAYLOAD_LOGGED: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let log_count = PAYLOAD_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if log_count < 20 {
+                let preview: Vec<u8> = pkt_data.iter().take(16).copied().collect();
+                log::info!(
+                    "Non-header packet {}: {} bytes, first 16: {:02x?}",
+                    log_count,
+                    actual_length,
+                    preview
+                );
+            }
+
+            // Pure payload data - but skip zero-filled packets (dropped/incomplete transfers)
+            if actual_length > 8 && pkt_data[0..8].iter().all(|&b| b == 0) {
+                // Zero-filled packet - skip it
+                0
+            } else {
+                state.frame_buffer.extend_from_slice(pkt_data);
+                pkt_data.len()
+            }
         };
 
         // Suppress unused variable warning
@@ -1527,22 +1643,20 @@ unsafe fn process_iso_packets(
         // For YUY2/uncompressed: Check if buffer has reached expected frame size
         // This is the primary frame detection mechanism for uncompressed video
         if !is_mjpeg {
-            let frame_size = state.frame_buffer.len();
-            if frame_size >= EXPECTED_YUY2_720P_SIZE {
+            let buffer_size = state.frame_buffer.len();
+            let expected_size = state.expected_frame_size;
+            if buffer_size >= expected_size {
                 // Buffer has accumulated a complete frame - send it
-                let overflow = frame_size - EXPECTED_YUY2_720P_SIZE;
+                let overflow = buffer_size - expected_size;
                 if overflow > 0 {
                     log::debug!(
                         "Complete YUY2 frame: {} bytes ({} overflow bytes discarded)",
-                        EXPECTED_YUY2_720P_SIZE,
+                        expected_size,
                         overflow
                     );
                 }
                 // Take exactly the expected frame size
-                let frame: Vec<u8> = state
-                    .frame_buffer
-                    .drain(..EXPECTED_YUY2_720P_SIZE)
-                    .collect();
+                let frame: Vec<u8> = state.frame_buffer.drain(..expected_size).collect();
                 // IMPORTANT: Clear any overflow bytes - these are UVC headers that weren't
                 // properly detected and would corrupt the next frame if left in the buffer
                 state.frame_buffer.clear();
@@ -1601,5 +1715,109 @@ unsafe fn process_iso_packets(
             total_bytes,
             state.frame_buffer.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_uvc_header;
+
+    #[test]
+    fn test_2_byte_header_minimal() {
+        // Minimal header: len=2, EOH set (0x80), no PTS/SCR flags
+        let data = [0x02, 0x80, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), Some(2));
+    }
+
+    #[test]
+    fn test_2_byte_header_with_fid_eof() {
+        // 2-byte header with FID and EOF flags set: 0x83 = EOH + EOF + FID
+        let data = [0x02, 0x83, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), Some(2));
+    }
+
+    #[test]
+    fn test_6_byte_header_pts_only() {
+        // PTS header: len=6, EOH set, PTS flag set (0x84 = 0x80 | 0x04)
+        let data = [0x06, 0x84, 0x00, 0x00, 0x00, 0x00, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), Some(6));
+    }
+
+    #[test]
+    fn test_8_byte_header_scr_only() {
+        // SCR header: len=8, EOH set, SCR flag set (0x88 = 0x80 | 0x08)
+        let data = [0x08, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAB];
+        assert_eq!(validate_uvc_header(&data), Some(8));
+    }
+
+    #[test]
+    fn test_12_byte_header_pts_and_scr() {
+        // Full header: len=12, EOH set, PTS+SCR flags (0x8C = 0x80 | 0x04 | 0x08)
+        let data = [0x0C, 0x8C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB];
+        assert_eq!(validate_uvc_header(&data), Some(12));
+    }
+
+    #[test]
+    fn test_reject_no_eoh_bit() {
+        // EOH bit not set - should reject
+        let data = [0x02, 0x00, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_length_mismatch_too_large() {
+        // Says 12 bytes but only PTS flag set (should be 6)
+        let data = [0x0C, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_length_mismatch_too_small() {
+        // Says 2 bytes but PTS flag set (should be 6)
+        let data = [0x02, 0x84, 0xAB, 0xCD, 0xEF, 0x12];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_reserved_bit_set() {
+        // Reserved bit (0x10) set - should reject
+        let data = [0x02, 0x90, 0xAB, 0xCD]; // 0x90 = EOH + reserved
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_too_short_data() {
+        // Data too short to be a header
+        let data = [0x02];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_empty_data() {
+        let data: [u8; 0] = [];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_reject_header_exceeds_packet() {
+        // Header claims 6 bytes but packet only has 4
+        let data = [0x06, 0x84, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), None);
+    }
+
+    #[test]
+    fn test_yuy2_false_positive_protection() {
+        // YUY2 data that might look like a header:
+        // Y=2 (could be header_len=2), U=128 (has EOH bit set)
+        // But this should be rejected because 0x80 has no extra flags
+        // and length matches, so it would actually be accepted as valid 2-byte header.
+        // The key protection is the reserved bit check and length/flag consistency.
+        let data = [0x02, 0x80, 0xAB, 0xCD];
+        // This is actually a valid 2-byte header pattern
+        assert_eq!(validate_uvc_header(&data), Some(2));
+
+        // But with reserved bit set (0x90), it's rejected
+        let data_with_reserved = [0x02, 0x90, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data_with_reserved), None);
     }
 }

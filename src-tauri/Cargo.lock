@@ -388,6 +388,7 @@ dependencies = [
  "tauri-plugin-shell",
  "thiserror 2.0.17",
  "tokio",
+ "yuvutils-rs",
 ]
 
 [[package]]
@@ -809,6 +810,15 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "fast_transpose"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87fd7bef897517e02c834586f88572f4e2f485d5e9c0bbd1f3497ed6b5a7f6e2"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]
@@ -4917,6 +4927,16 @@ dependencies = [
  "quote",
  "syn 2.0.111",
  "synstructure",
+]
+
+[[package]]
+name = "yuvutils-rs"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19ec636b74cbfea55477c6bce7eb747025c4a03c6f1465038533c0c414cca3de"
+dependencies = [
+ "fast_transpose",
+ "num-traits",
 ]
 
 [[package]]
