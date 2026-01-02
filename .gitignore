@@ -5,8 +5,10 @@ node_modules/
 dist/
 build/
 
-# Generated documentation
-docs/
+# Generated documentation (API docs, cargo doc output)
+# Note: Hand-written docs in docs/ are tracked
+docs/api/
+docs/rustdoc/
 
 # Tauri build
 src-tauri/target/
