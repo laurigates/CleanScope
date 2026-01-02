@@ -48,3 +48,8 @@ coverage/
 
 # Cache
 .cache/
+
+# Debug frame captures
+src-tauri/*.raw
+src-tauri/*.yuy2
+src-tauri/frame_*.png
