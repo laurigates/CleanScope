@@ -18,6 +18,7 @@
          Some composite UVC devices present as this class -->
     <usb-device class="239" subclass="2" />
 
-    <!-- Common endoscope chipsets - add specific IDs if needed -->
-    <!-- Example: <usb-device vendor-id="1234" product-id="5678" /> -->
+    <!-- Tested endoscope devices -->
+    <!-- Generic HD camera (USB-C endoscope) -->
+    <usb-device vendor-id="13468" product-id="1041" />
 </resources>
