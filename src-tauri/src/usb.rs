@@ -729,7 +729,8 @@ fn stream_frames_isochronous_with_format_detection(
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
-            0, // MJPEG uses EOF markers, not frame size
+            0,    // MJPEG uses EOF markers, not frame size
+            None, // No packet capture for format detection
         )?
     };
 
@@ -939,7 +940,8 @@ fn stream_frames_isochronous(
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
-            0, // MJPEG uses EOF markers, not frame size
+            0,    // MJPEG uses EOF markers, not frame size
+            None, // No packet capture for legacy streaming
         )?
     };
 
@@ -1072,6 +1074,7 @@ fn stream_frames_yuy2(
             ep_info.address,
             ep_info.max_packet_size,
             expected_frame_size,
+            None, // No packet capture (can be enabled for E2E testing)
         )?
     };
 
@@ -1606,8 +1609,146 @@ fn stream_frames(
 }
 
 #[cfg(not(target_os = "android"))]
-fn run_camera_loop(_fd: i32, _app_handle: AppHandle, _frame_buffer: Arc<Mutex<FrameBuffer>>) {
-    log::info!("Camera loop not available on this platform");
+fn run_camera_loop(_fd: i32, app_handle: AppHandle, frame_buffer: Arc<Mutex<FrameBuffer>>) {
+    if let Ok(replay_path) = std::env::var("CLEANSCOPE_REPLAY_PATH") {
+        log::info!("Desktop replay mode: {}", replay_path);
+        replay_frame_loop(app_handle, frame_buffer, &replay_path);
+    } else {
+        log::info!(
+            "Desktop mode (no replay path set - set CLEANSCOPE_REPLAY_PATH to enable replay)"
+        );
+    }
+}
+
+/// Replay frames from a captured packet file for desktop testing.
+///
+/// This function loads packets from a binary capture file and replays them
+/// through the frame assembler, updating the `FrameBuffer` and emitting events
+/// just like the Android USB path does.
+#[cfg(not(target_os = "android"))]
+fn replay_frame_loop(
+    app_handle: AppHandle,
+    frame_buffer: Arc<Mutex<FrameBuffer>>,
+    replay_path: &str,
+) {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+    use tauri::Emitter;
+
+    use crate::replay::{PacketReplay, ReplayConfig};
+
+    let path = Path::new(replay_path);
+
+    // Verify file exists
+    if !path.exists() {
+        log::error!("Replay file not found: {}", replay_path);
+        crate::emit_usb_event(
+            &app_handle,
+            false,
+            Some(format!("Replay file not found: {}", replay_path)),
+        );
+        return;
+    }
+
+    // Load packets from capture file
+    let config = ReplayConfig {
+        speed: 1.0,          // Real-time playback
+        loop_playback: true, // Loop continuously for E2E testing
+        ..Default::default()
+    };
+
+    let mut replay = match PacketReplay::load_with_config(path, config) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Failed to load replay file: {}", e);
+            crate::emit_usb_event(
+                &app_handle,
+                false,
+                Some(format!("Failed to load replay: {}", e)),
+            );
+            return;
+        }
+    };
+
+    // Get metadata for display info
+    let info = if let Some(meta) = replay.metadata() {
+        format!(
+            "Replay: {}x{} {} ({} packets)",
+            meta.width,
+            meta.height,
+            meta.format_type,
+            replay.packet_count()
+        )
+    } else {
+        format!("Replay: {} packets", replay.packet_count())
+    };
+
+    // Emit connected event
+    crate::emit_usb_event(&app_handle, true, Some(info));
+
+    log::info!(
+        "Starting replay: {} packets, {} ms duration",
+        replay.packet_count(),
+        replay.duration_ms()
+    );
+
+    // Start the replay thread and get the frame receiver
+    let frame_rx = match replay.start() {
+        Ok(rx) => rx,
+        Err(e) => {
+            log::error!("Failed to start replay: {}", e);
+            crate::emit_usb_event(
+                &app_handle,
+                false,
+                Some(format!("Failed to start replay: {}", e)),
+            );
+            return;
+        }
+    };
+
+    let mut frame_count = 0u64;
+    let start_time = Instant::now();
+
+    // Process frames from the replay channel
+    loop {
+        match frame_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(frame_data) => {
+                frame_count += 1;
+
+                // Store frame in shared buffer
+                {
+                    let mut buffer = frame_buffer.lock().unwrap();
+                    buffer.frame = frame_data;
+                    buffer.timestamp = Instant::now();
+                }
+
+                // Emit notification to trigger frontend fetch
+                let _ = app_handle.emit("frame-ready", ());
+
+                if frame_count.is_multiple_of(30) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let fps = frame_count as f64 / elapsed;
+                    log::info!("Replay: {} frames, {:.1} fps", frame_count, fps);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No frames for 5 seconds - replay might have ended or stalled
+                log::warn!("Replay timeout - no frames received for 5 seconds");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Channel closed - replay thread ended
+                log::info!("Replay channel closed after {} frames", frame_count);
+                break;
+            }
+        }
+    }
+
+    // Emit disconnected event
+    crate::emit_usb_event(
+        &app_handle,
+        false,
+        Some(format!("Replay ended ({} frames)", frame_count)),
+    );
 }
 
 /// JNI callback for USB device attached events

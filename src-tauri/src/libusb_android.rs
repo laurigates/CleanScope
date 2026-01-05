@@ -1025,6 +1025,9 @@ struct SharedFrameState {
     expected_frame_size: usize,
 }
 
+// Forward declaration for capture module
+use crate::capture::CaptureState;
+
 /// Context passed to the isochronous transfer callback
 struct IsoCallbackContext {
     /// Channel to send received frame data
@@ -1037,6 +1040,8 @@ struct IsoCallbackContext {
     max_packet_size: u16,
     /// Expected frame size for uncompressed video (from descriptor)
     expected_frame_size: usize,
+    /// Optional capture state for recording raw packets (E2E testing)
+    capture_state: Option<Arc<CaptureState>>,
 }
 
 /// Manages isochronous USB transfers for video streaming
@@ -1074,12 +1079,14 @@ impl IsochronousStream {
     /// * `endpoint` - Endpoint address
     /// * `max_packet_size` - Maximum packet size for the endpoint
     /// * `expected_frame_size` - Expected frame size from descriptor (e.g., 614400 for 640x480 YUY2)
+    /// * `capture_state` - Optional capture state for recording raw packets (E2E testing)
     pub unsafe fn new(
         ctx: *mut libusb1_sys::libusb_context,
         handle: *mut libusb1_sys::libusb_device_handle,
         endpoint: u8,
         max_packet_size: u16,
         expected_frame_size: usize,
+        capture_state: Option<Arc<CaptureState>>,
     ) -> Result<Self, LibusbError> {
         let (frame_sender, frame_receiver) = std::sync::mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1133,6 +1140,7 @@ impl IsochronousStream {
                 shared_state: Arc::clone(&shared_state),
                 max_packet_size,
                 expected_frame_size: frame_size,
+                capture_state: capture_state.clone(),
             });
 
             transfers.push(transfer);
@@ -1451,6 +1459,15 @@ unsafe fn process_iso_packets(
         // Calculate packet buffer offset
         let offset = i * (context.max_packet_size as usize);
         let pkt_data = std::slice::from_raw_parts(xfr.buffer.add(offset), actual_length);
+
+        // Record raw packet for E2E testing (before any parsing)
+        // Fast path: atomic check avoids allocation when not capturing
+        if let Some(capture_state) = &context.capture_state {
+            if capture_state.is_capturing() {
+                // Endpoint is stored in the transfer's endpoint field
+                capture_state.add_packet(pkt_data, xfr.endpoint);
+            }
+        }
 
         // UVC payloads have a header (typically 2-12 bytes)
         // Use validate_uvc_header() to properly detect headers with all valid lengths

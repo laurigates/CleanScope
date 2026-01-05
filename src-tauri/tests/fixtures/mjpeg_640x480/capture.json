@@ -1,0 +1,12 @@
+{
+  "vendor_id": 4660,
+  "product_id": 22136,
+  "format_type": "mjpeg",
+  "width": 640,
+  "height": 480,
+  "total_packets": 3,
+  "total_frames": 1,
+  "duration_ms": 33,
+  "total_bytes": 719,
+  "description": "Synthetic test fixture with minimal 8x8 MJPEG frame for E2E testing"
+}
