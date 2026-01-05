@@ -52,7 +52,8 @@ Most Android phones have a single USB-C port, which is needed for the endoscope.
 ### Quick Start (Justfile Shortcuts)
 
 ```bash
-just wifi-setup      # Automated: enable tcpip, detect IP, connect
+just wifi-setup      # Automated: enable tcpip, detect IP, connect (requires USB)
+just wifi-connect    # Reconnect to known IP without USB (default: 192.168.0.25)
 just wifi-status     # Check connection type (WiFi vs USB)
 just wifi-deploy     # Build + install + launch in one command
 just endoscope-test  # Full workflow: deploy + stream logs
@@ -87,7 +88,8 @@ just endoscope-test  # Full workflow: deploy + stream logs
 
 - Connection persists until phone reboots
 - Check status: `just wifi-status`
-- If connection drops, run: `just wifi-setup` again
+- If connection drops: `just wifi-connect` (no USB needed if IP unchanged)
+- For new IP or first-time setup: `just wifi-setup` (requires USB)
 
 ### Alternative: Native Wireless Debugging (Android 11+)
 
@@ -105,15 +107,38 @@ This method survives reboots after initial pairing.
 **Frontend (src/):** Svelte 5 with runes syntax. Communicates with Rust via Tauri commands (`invoke()`) and event listeners (`listen()`).
 
 **Backend (src-tauri/):**
-- `lib.rs` - Tauri commands, app setup, event emission
-- `usb.rs` - USB device handling via JNI (Android-only, `#[cfg(target_os = "android")]`)
+- `lib.rs` - Tauri commands, app setup, event emission, display settings
+- `usb.rs` - UVC negotiation, YUV conversion, frame streaming
+- `libusb_android.rs` - Low-level USB/isochronous transfers, UVC header parsing, frame assembly
 
 **Android USB Flow:**
 1. USB camera plugged in → Android triggers `USB_DEVICE_ATTACHED` intent
 2. App auto-launches via AndroidManifest.xml intent filter
 3. Permission auto-granted via device_filter.xml matching
 4. `usb.rs` gets file descriptor via JNI → UsbManager → UsbDeviceConnection
-5. Frames streamed and emitted to frontend via `emit_camera_frame()`
+5. UVC PROBE/COMMIT negotiates format (MJPEG or YUY2) and resolution
+6. Isochronous transfers stream video data via `libusb_android.rs`
+7. Frames assembled, converted to RGB, emitted to frontend
+
+## Video Pipeline
+
+```
+USB Camera (UVC) → Isochronous USB Transfers → Frame Assembly → YUV→RGB → Frontend Canvas
+     ↓                      ↓                        ↓              ↓           ↓
+ Advertises            libusb_android.rs      process_iso_packets  usb.rs    App.svelte
+ 640x480 YUY2          (1024-byte packets)    (strip headers,     (yuvutils)  (ImageData)
+                                               accumulate)
+```
+
+**Key files in pipeline:**
+| Stage | File | Function |
+|-------|------|----------|
+| UVC negotiation | `usb.rs` | `start_uvc_streaming()` |
+| Isochronous transfers | `libusb_android.rs` | `IsochronousStream`, `iso_transfer_callback` |
+| UVC header parsing | `libusb_android.rs` | `validate_uvc_header()` |
+| Frame assembly | `libusb_android.rs` | `process_iso_packets()` |
+| YUV→RGB conversion | `usb.rs` | `convert_yuv422_to_rgb()`, `stream_frames_yuy2()` |
+| Display | `src/App.svelte` | `renderFrame()` |
 
 ## Key Modification Points
 
@@ -135,10 +160,52 @@ This method survives reboots after initial pairing.
 **UVC Format Negotiation:**
 - Endoscopes advertise multiple formats (MJPEG, YUY2/uncompressed)
 - Format index 1 is NOT guaranteed to be MJPEG - varies by device
-- Current code hardcodes `b_format_index = 1` in `usb.rs:start_uvc_streaming()`
-- If frames lack JPEG markers (0xFFD8), try incrementing format_index
+- App has UI toggle to skip MJPEG detection and go straight to YUY2
+- If frames lack JPEG markers (0xFFD8), app falls back to YUY2 processing
 
 **Format Detection:**
 - MJPEG frames: Start with 0xFFD8, typically 5-50KB
-- YUY2 frames: No markers, size = width × height × 2 bytes
+- YUY2 frames: No markers, size = width × height × 2 bytes (e.g., 614,400 for 640×480)
 - Frame size hints: 50-125KB without JPEG markers likely indicates YUY2
+
+**YUV Pixel Formats:**
+- YUYV (YUY2): Byte order Y0-U-Y1-V (luminance first) - most common
+- UYVY: Byte order U-Y0-V-Y1 (chrominance first) - less common
+- App has UI toggle to switch between YUYV and UYVY
+- Wrong format causes green/magenta color cast
+
+## Debugging Video Issues
+
+**Common artifacts and causes:**
+
+| Artifact | Likely Cause | Fix |
+|----------|--------------|-----|
+| Horizontal stripes/interlacing | Frame boundary misalignment | Check `process_iso_packets` buffer handling |
+| Diagonal stripes/shearing | Stride mismatch | Adjust stride via UI or check `actual_stride` calculation |
+| Green/magenta tint | Wrong YUV format (YUYV vs UYVY) | Toggle YUV format in UI |
+| Shifted/offset rows | UVC headers treated as pixel data | Check `validate_uvc_header()` |
+| Black frames | Format detection failed | Check MJPEG skip toggle, verify frame size |
+
+**UVC Header Validation:**
+- Headers are 2-12 bytes with EOH bit (0x80) in byte 1
+- Cheap cameras may not follow spec strictly (reserved bits set, length mismatches)
+- `validate_uvc_header()` uses relaxed validation - trusts length if EOH is set
+- If headers are rejected, their bytes get added as pixel data → corruption
+
+**Debug UI controls:**
+- Width/Height/Stride/Offset buttons: Override auto-detected values
+- MJPEG toggle: Skip MJPEG detection, force YUY2
+- YUV toggle: Switch between YUYV and UYVY byte order
+- Capture button: Save raw and RGB frames for offline analysis
+
+**Useful log patterns:**
+```bash
+# Watch frame assembly
+adb logcat -s RustStdoutStderr:* | grep -E "frame|Frame|YUY2|MJPEG|header"
+
+# Check for suspicious packets (headers treated as data)
+adb logcat -s RustStdoutStderr:* | grep "SUSPICIOUS"
+
+# Watch stride/resolution detection
+adb logcat -s RustStdoutStderr:* | grep -E "stride|resolution|width|height"
+```
