@@ -9,7 +9,10 @@ use tauri::AppHandle;
 #[cfg(target_os = "android")]
 use tauri::Emitter;
 
-use crate::{DisplaySettings, FrameBuffer};
+use crate::{DisplaySettings, FrameBuffer, StreamingConfig};
+
+#[cfg(target_os = "android")]
+use crate::YuvFormat;
 
 #[cfg(target_os = "android")]
 use jni::{
@@ -25,7 +28,7 @@ use crate::libusb_android::{
 };
 
 #[cfg(target_os = "android")]
-use yuvutils_rs::{yuyv422_to_rgb, YuvPackedImage, YuvRange, YuvStandardMatrix};
+use yuvutils_rs::{uyvy422_to_rgb, yuyv422_to_rgb, YuvPackedImage, YuvRange, YuvStandardMatrix};
 
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
@@ -33,8 +36,10 @@ pub fn init_usb_handler(
     app_handle: AppHandle,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
     display_settings: Arc<Mutex<DisplaySettings>>,
+    streaming_config: Arc<Mutex<StreamingConfig>>,
     width_index: Arc<Mutex<Option<usize>>>,
     stride_index: Arc<Mutex<Option<usize>>>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     log::info!("Initializing USB handler");
 
@@ -52,8 +57,10 @@ pub fn init_usb_handler(
                     app_handle,
                     frame_buffer,
                     display_settings,
+                    streaming_config,
                     width_index,
                     stride_index,
+                    stop_flag,
                 );
             });
         } else {
@@ -64,8 +71,10 @@ pub fn init_usb_handler(
     #[cfg(not(target_os = "android"))]
     {
         let _ = display_settings; // Suppress unused warning
+        let _ = streaming_config;
         let _ = width_index;
         let _ = stride_index;
+        let _ = stop_flag;
     }
 
     #[cfg(not(target_os = "android"))]
@@ -316,29 +325,72 @@ const FRAMES_TO_CHECK_FORMAT: u32 = 10;
 #[cfg(target_os = "android")]
 const FORMAT_DETECTION_TIMEOUT_SECS: u64 = 10;
 
-/// Run the camera streaming loop
+/// Run the camera streaming loop with restart support
+/// This outer loop handles restart requests (e.g., when user changes video format)
 #[cfg(target_os = "android")]
 fn run_camera_loop(
     fd: i32,
     app_handle: AppHandle,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
     display_settings: Arc<Mutex<DisplaySettings>>,
+    streaming_config: Arc<Mutex<StreamingConfig>>,
     width_index: Arc<Mutex<Option<usize>>>,
     stride_index: Arc<Mutex<Option<usize>>>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     log::info!("Starting camera loop with fd: {}", fd);
 
-    match run_camera_loop_inner(
-        fd,
-        app_handle,
-        frame_buffer,
-        display_settings,
-        width_index,
-        stride_index,
-    ) {
-        Ok(()) => log::info!("Camera loop ended normally"),
-        Err(e) => log::error!("Camera loop error: {}", e),
+    loop {
+        // Check if we should stop (app is closing)
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("Stop flag set, exiting camera loop");
+            break;
+        }
+
+        // Clear any pending restart request before starting
+        {
+            let mut config = streaming_config.lock().unwrap();
+            config.restart_requested = false;
+        }
+
+        match run_camera_loop_inner(
+            fd,
+            app_handle.clone(),
+            frame_buffer.clone(),
+            display_settings.clone(),
+            streaming_config.clone(),
+            width_index.clone(),
+            stride_index.clone(),
+        ) {
+            Ok(StreamResult::Normal) => {
+                log::info!("Camera loop ended normally");
+                break;
+            }
+            Ok(StreamResult::RestartRequested) => {
+                log::info!("Restarting camera loop with new settings...");
+                // Small delay to let things settle
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => {
+                log::error!("Camera loop error: {}", e);
+                break;
+            }
+        }
     }
+
+    // Emit disconnected event when camera loop exits
+    log::info!("Camera loop exited, emitting disconnect event");
+    crate::emit_usb_event(&app_handle, false, None);
+}
+
+/// Result of a streaming session
+#[cfg(target_os = "android")]
+enum StreamResult {
+    /// Streaming ended normally (e.g., device disconnected)
+    Normal,
+    /// Restart was requested (e.g., format change)
+    RestartRequested,
 }
 
 #[cfg(target_os = "android")]
@@ -347,9 +399,10 @@ fn run_camera_loop_inner(
     app_handle: AppHandle,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
     display_settings: Arc<Mutex<DisplaySettings>>,
+    streaming_config: Arc<Mutex<StreamingConfig>>,
     width_index: Arc<Mutex<Option<usize>>>,
     stride_index: Arc<Mutex<Option<usize>>>,
-) -> Result<(), LibusbError> {
+) -> Result<StreamResult, LibusbError> {
     // Initialize libusb context for Android (no device discovery)
     let ctx = LibusbContext::new_android()?;
     log::info!("libusb context created");
@@ -400,89 +453,199 @@ fn run_camera_loop_inner(
         dev.claim_interface(0)?;
     }
 
-    // Try different format indices to find MJPEG format
-    // Format index 1 is not guaranteed to be MJPEG - varies by device
-    for format_index in 1..=MAX_FORMAT_INDEX {
+    // Discover available formats from UVC descriptors and store in streaming config
+    let formats = dev.get_format_descriptors().unwrap_or_default();
+    {
+        let mut config = streaming_config.lock().unwrap();
+        config.available_formats = formats
+            .iter()
+            .map(|f| {
+                let format_type = match f.format_type {
+                    crate::libusb_android::uvc::UvcFormatType::Mjpeg => "MJPEG".to_string(),
+                    crate::libusb_android::uvc::UvcFormatType::Uncompressed => "YUY2".to_string(),
+                    crate::libusb_android::uvc::UvcFormatType::FrameBased => "H264".to_string(),
+                    crate::libusb_android::uvc::UvcFormatType::Unknown(n) => format!("UNK:{}", n),
+                };
+                let resolutions: Vec<String> = f
+                    .frames
+                    .iter()
+                    .map(|fr| format!("{}x{}", fr.width, fr.height))
+                    .collect();
+                crate::DiscoveredFormat {
+                    index: f.format_index,
+                    format_type,
+                    resolutions,
+                }
+            })
+            .collect();
         log::info!(
-            "=== Trying format index {} of {} ===",
-            format_index,
-            MAX_FORMAT_INDEX
+            "Discovered {} video formats: {:?}",
+            config.available_formats.len(),
+            config.available_formats
         );
-
-        // Start UVC streaming with this format index
-        let endpoint = match start_uvc_streaming(&dev, Some(&ep_info), format_index) {
-            Ok(ep) => ep,
-            Err(e) => {
-                log::warn!(
-                    "Failed to start streaming with format {}: {}",
-                    format_index,
-                    e
-                );
-                continue;
-            }
-        };
-        log::info!(
-            "UVC streaming started on endpoint 0x{:02x} with format {}",
-            endpoint,
-            format_index
-        );
-
-        // Choose streaming method based on endpoint type
-        let result = match ep_info.transfer_type {
-            TransferType::Isochronous => {
-                log::info!("Using ISOCHRONOUS transfers for video streaming");
-                stream_frames_isochronous_with_format_detection(
-                    &ctx,
-                    &dev,
-                    &ep_info,
-                    app_handle.clone(),
-                    frame_buffer.clone(),
-                    format_index,
-                )
-            }
-            TransferType::Bulk => {
-                log::info!("Using BULK transfers for video streaming");
-                stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())
-            }
-            _ => {
-                log::error!(
-                    "Unsupported endpoint transfer type: {:?}",
-                    ep_info.transfer_type
-                );
-                Err(LibusbError::NotSupported)
-            }
-        };
-
-        match result {
-            Ok(FormatDetectionResult::MjpegFound) => {
-                log::info!(
-                    "MJPEG format confirmed at index {}, streaming continues",
-                    format_index
-                );
-                return Ok(());
-            }
-            Ok(FormatDetectionResult::NotMjpeg) => {
-                log::info!("Format {} is not MJPEG, trying next format", format_index);
-                // Reset interface before trying next format
-                let _ = dev.set_interface_alt_setting(streaming_interface, 0);
-                continue;
-            }
-            Err(e) => {
-                log::warn!("Streaming error with format {}: {}", format_index, e);
-                // Reset interface before trying next format
-                let _ = dev.set_interface_alt_setting(streaming_interface, 0);
-                continue;
-            }
-        }
     }
 
-    // No MJPEG found - fallback to YUY2 streaming with format index 1
-    log::info!("No MJPEG format found, falling back to YUY2 streaming");
+    // Get user's format selection and MJPEG skip preference
+    let (selected_format, skip_mjpeg) = {
+        let config = streaming_config.lock().unwrap();
+        (config.selected_format_index, config.skip_mjpeg_detection)
+    };
 
+    // Determine which format(s) to try based on user selection
+    if let Some(format_idx) = selected_format {
+        // User explicitly selected a format - use it directly
+        log::info!("Using user-selected format index: {}", format_idx);
+
+        // Check if this is an MJPEG format
+        let is_mjpeg = formats
+            .iter()
+            .find(|f| f.format_index == format_idx)
+            .map(|f| f.format_type == crate::libusb_android::uvc::UvcFormatType::Mjpeg)
+            .unwrap_or(false);
+
+        if is_mjpeg {
+            // Start MJPEG streaming with selected format
+            let endpoint = start_uvc_streaming(&dev, Some(&ep_info), format_idx)?;
+            log::info!(
+                "MJPEG streaming started on endpoint 0x{:02x} with format {}",
+                endpoint,
+                format_idx
+            );
+
+            match ep_info.transfer_type {
+                TransferType::Isochronous => {
+                    stream_frames_isochronous_with_format_detection(
+                        &ctx,
+                        &dev,
+                        &ep_info,
+                        app_handle.clone(),
+                        frame_buffer.clone(),
+                        format_idx,
+                    )?;
+                }
+                TransferType::Bulk => {
+                    stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())?;
+                }
+                _ => {
+                    log::error!("Unsupported transfer type: {:?}", ep_info.transfer_type);
+                    return Err(LibusbError::NotSupported);
+                }
+            }
+            // MJPEG streaming doesn't support restart yet - return Normal
+            return Ok(StreamResult::Normal);
+        } else {
+            // Start YUV streaming with selected format
+            let params = start_uvc_streaming_with_resolution(&dev, Some(&ep_info), format_idx)?;
+            log::info!(
+                "YUV streaming started on endpoint 0x{:02x}, resolution {}x{} with format {}",
+                params.endpoint,
+                params.width,
+                params.height,
+                format_idx
+            );
+
+            return stream_frames_yuy2(
+                &ctx,
+                &dev,
+                &ep_info,
+                app_handle,
+                frame_buffer,
+                display_settings,
+                streaming_config,
+                width_index,
+                stride_index,
+                params.width as u32,
+                params.height as u32,
+            );
+        }
+    } else if skip_mjpeg {
+        log::info!("Skipping MJPEG detection (user preference), going straight to YUV");
+    } else {
+        // Auto-detect: Try different format indices to find MJPEG format
+        // Format index 1 is not guaranteed to be MJPEG - varies by device
+        for format_index in 1..=MAX_FORMAT_INDEX {
+            log::info!(
+                "=== Trying format index {} of {} ===",
+                format_index,
+                MAX_FORMAT_INDEX
+            );
+
+            // Start UVC streaming with this format index
+            let endpoint = match start_uvc_streaming(&dev, Some(&ep_info), format_index) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to start streaming with format {}: {}",
+                        format_index,
+                        e
+                    );
+                    continue;
+                }
+            };
+            log::info!(
+                "UVC streaming started on endpoint 0x{:02x} with format {}",
+                endpoint,
+                format_index
+            );
+
+            // Choose streaming method based on endpoint type
+            let result = match ep_info.transfer_type {
+                TransferType::Isochronous => {
+                    log::info!("Using ISOCHRONOUS transfers for video streaming");
+                    stream_frames_isochronous_with_format_detection(
+                        &ctx,
+                        &dev,
+                        &ep_info,
+                        app_handle.clone(),
+                        frame_buffer.clone(),
+                        format_index,
+                    )
+                }
+                TransferType::Bulk => {
+                    log::info!("Using BULK transfers for video streaming");
+                    stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())
+                }
+                _ => {
+                    log::error!(
+                        "Unsupported endpoint transfer type: {:?}",
+                        ep_info.transfer_type
+                    );
+                    Err(LibusbError::NotSupported)
+                }
+            };
+
+            match result {
+                Ok(FormatDetectionResult::MjpegFound) => {
+                    log::info!(
+                        "MJPEG format confirmed at index {}, streaming continues",
+                        format_index
+                    );
+                    // MJPEG streaming doesn't support restart yet - return Normal
+                    return Ok(StreamResult::Normal);
+                }
+                Ok(FormatDetectionResult::NotMjpeg) => {
+                    log::info!("Format {} is not MJPEG, trying next format", format_index);
+                    // Reset interface before trying next format
+                    let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("Streaming error with format {}: {}", format_index, e);
+                    // Reset interface before trying next format
+                    let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+                    continue;
+                }
+            }
+        }
+
+        log::info!("No MJPEG format found, falling back to YUV streaming");
+    }
+
+    // YUV streaming with format index 1
     // Start streaming with format 1 and get negotiated resolution
     let params = start_uvc_streaming_with_resolution(&dev, Some(&ep_info), 1)?;
     log::info!(
-        "Starting YUY2 streaming on endpoint 0x{:02x}, resolution {}x{}",
+        "Starting YUV streaming on endpoint 0x{:02x}, resolution {}x{}",
         params.endpoint,
         params.width,
         params.height
@@ -495,13 +658,12 @@ fn run_camera_loop_inner(
         app_handle,
         frame_buffer,
         display_settings,
+        streaming_config,
         width_index,
         stride_index,
         params.width as u32,
         params.height as u32,
-    )?;
-
-    Ok(())
+    )
 }
 
 /// Result of format detection during streaming
@@ -596,79 +758,81 @@ fn calculate_yuy2_stride(frame_size: usize, width: u32, height: u32) -> u32 {
     }
 }
 
-/// Convert YUY2 frame to RGB with automatic stride detection
+/// YUV 4:2:2 packed format variant
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum YuvPackedFormat {
+    /// YUYV format: Y0-U-Y1-V byte order (luminance first)
+    #[default]
+    Yuyv,
+    /// UYVY format: U-Y0-V-Y1 byte order (chrominance first)
+    /// This is what macOS reports for many USB endoscopes
+    Uyvy,
+}
+
+/// Convert YUV 4:2:2 packed frame to RGB with automatic stride detection
 ///
 /// This function handles cameras that use row padding for alignment.
-/// Convert YUY2 to RGB with configurable stride and row offset
+/// Supports both YUYV and UYVY byte orders.
 ///
-/// - `stride_override`: If Some, use this as the YUY2 stride instead of auto-detecting
-/// - `row_offset`: Number of bytes to skip at start of frame data (can be negative to add padding)
+/// - `yuv_data`: Raw YUV 4:2:2 packed data
+/// - `width`: Frame width in pixels
+/// - `height`: Frame height in pixels
+/// - `stride_override`: If Some, use this as the YUV stride instead of auto-detecting
+/// - `format`: YUYV or UYVY byte order
 #[cfg(target_os = "android")]
-fn convert_yuy2_to_rgb(
-    yuy2_data: &[u8],
+fn convert_yuv422_to_rgb(
+    yuv_data: &[u8],
     width: u32,
     height: u32,
     stride_override: Option<u32>,
-    row_offset: i32,
+    format: YuvPackedFormat,
 ) -> Result<Vec<u8>, String> {
-    let frame_size = yuy2_data.len();
+    let frame_size = yuv_data.len();
     let expected_stride = width * 2;
-    let expected_size = (expected_stride * height) as usize;
-
-    // Apply row offset - skip bytes at start of frame
-    let data_start = if row_offset >= 0 {
-        row_offset as usize
-    } else {
-        0 // Can't have negative start, would need to pad instead
-    };
-
-    if data_start >= frame_size {
-        return Err(format!(
-            "Row offset {} exceeds frame size {}",
-            row_offset, frame_size
-        ));
-    }
-
-    let adjusted_data = &yuy2_data[data_start..];
-    let adjusted_size = adjusted_data.len();
 
     // Use override stride if provided, otherwise auto-detect
     let actual_stride =
-        stride_override.unwrap_or_else(|| calculate_yuy2_stride(adjusted_size, width, height));
+        stride_override.unwrap_or_else(|| calculate_yuy2_stride(frame_size, width, height));
 
     // Log conversion parameters when they change
     static LAST_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let format_bit = if format == YuvPackedFormat::Uyvy {
+        1u64
+    } else {
+        0u64
+    };
     let params_hash = ((width as u64) << 48)
         | ((height as u64) << 32)
         | ((actual_stride as u64) << 16)
-        | (row_offset.unsigned_abs() as u64);
+        | format_bit;
     let last = LAST_PARAMS.swap(params_hash, std::sync::atomic::Ordering::Relaxed);
     if last != params_hash {
         log::info!(
-            "YUY2 conversion: input={} bytes, width={}, height={}, stride={}, offset={:+}",
-            adjusted_size,
+            "{:?} conversion: input={} bytes, width={}, height={}, stride={}",
+            format,
+            frame_size,
             width,
             height,
-            actual_stride,
-            row_offset
+            actual_stride
         );
     }
 
     // Validate we have enough data
     let min_required = (expected_stride * height) as usize;
-    if adjusted_size < min_required {
+    if frame_size < min_required {
         return Err(format!(
-            "YUY2 data too small after offset: {} bytes, expected at least {} bytes",
-            adjusted_size, min_required
+            "YUV data too small: {} bytes, expected at least {} bytes",
+            frame_size, min_required
         ));
     }
 
     // Calculate how much data we need with the given stride
     let actual_frame_size = (actual_stride * height) as usize;
-    let data_to_use = actual_frame_size.min(adjusted_size);
+    let data_to_use = actual_frame_size.min(frame_size);
 
     let packed_image = YuvPackedImage {
-        yuy: &adjusted_data[..data_to_use],
+        yuy: &yuv_data[..data_to_use],
         yuy_stride: actual_stride,
         width,
         height,
@@ -678,18 +842,49 @@ fn convert_yuy2_to_rgb(
     let rgb_stride = width * 3;
     let mut rgb_buffer = vec![0u8; (rgb_stride * height) as usize];
 
-    // YUYV422 to RGB conversion
-    // BT.601 for standard cameras, Limited range is more common
-    yuyv422_to_rgb(
-        &packed_image,
-        &mut rgb_buffer,
-        rgb_stride,
-        YuvRange::Limited,
-        YuvStandardMatrix::Bt601,
-    )
-    .map_err(|e| format!("YUV conversion error: {:?}", e))?;
+    // Convert based on format - BT.601 for standard cameras, Limited range is common
+    match format {
+        YuvPackedFormat::Yuyv => {
+            yuyv422_to_rgb(
+                &packed_image,
+                &mut rgb_buffer,
+                rgb_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+            )
+            .map_err(|e| format!("YUYV conversion error: {:?}", e))?;
+        }
+        YuvPackedFormat::Uyvy => {
+            uyvy422_to_rgb(
+                &packed_image,
+                &mut rgb_buffer,
+                rgb_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+            )
+            .map_err(|e| format!("UYVY conversion error: {:?}", e))?;
+        }
+    }
 
     Ok(rgb_buffer)
+}
+
+/// Legacy wrapper for backward compatibility
+/// Defaults to YUYV format
+#[cfg(target_os = "android")]
+fn convert_yuy2_to_rgb(
+    yuy2_data: &[u8],
+    width: u32,
+    height: u32,
+    stride_override: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    convert_yuv422_to_rgb(
+        yuy2_data,
+        width,
+        height,
+        stride_override,
+        YuvPackedFormat::Yuyv,
+    )
 }
 
 /// Stream frames using isochronous transfers with format detection
@@ -1033,8 +1228,10 @@ fn stream_frames_isochronous(
     Ok(())
 }
 
-/// Stream YUY2 frames using isochronous transfers with RGB conversion
+/// Stream YUV 4:2:2 frames using isochronous transfers with RGB conversion
+/// Supports both YUYV and UYVY formats based on streaming config
 /// width/height: The negotiated resolution from UVC descriptors
+/// Returns StreamResult to indicate if restart was requested
 #[cfg(target_os = "android")]
 fn stream_frames_yuy2(
     ctx: &LibusbContext,
@@ -1043,11 +1240,12 @@ fn stream_frames_yuy2(
     app_handle: AppHandle,
     shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
     display_settings: Arc<Mutex<DisplaySettings>>,
+    streaming_config: Arc<Mutex<StreamingConfig>>,
     _width_index: Arc<Mutex<Option<usize>>>,
-    _stride_index: Arc<Mutex<Option<usize>>>,
+    stride_index: Arc<Mutex<Option<usize>>>,
     descriptor_width: u32,
     descriptor_height: u32,
-) -> Result<(), LibusbError> {
+) -> Result<StreamResult, LibusbError> {
     use std::time::{Duration, Instant};
     use tauri::Emitter;
 
@@ -1126,21 +1324,58 @@ fn stream_frames_yuy2(
     let min_expected_size = (base_width * base_height * 2) as usize;
 
     loop {
+        // Check if restart was requested (e.g., user changed video format)
+        {
+            let config = streaming_config.lock().unwrap();
+            if config.restart_requested {
+                log::info!("Restart requested, stopping YUY2 streaming");
+                iso_stream.stop();
+                let _ = event_loop_handle.join();
+                return Ok(StreamResult::RestartRequested);
+            }
+        }
+
         match frame_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(frame_data) => {
                 frame_count += 1;
                 let frame_size = frame_data.len();
 
-                // Log first 16 bytes of each frame to help debug alignment issues
-                if frame_count <= 5 && frame_size >= 16 {
+                // Log detailed frame analysis for first few frames
+                if frame_count <= 5 {
+                    let expected_size = (base_width * base_height * 2) as usize;
+                    let calculated_stride = if frame_size > 0 && base_height > 0 {
+                        frame_size as u32 / base_height
+                    } else {
+                        0
+                    };
+                    let min_stride = base_width * 2;
+                    let implied_width = calculated_stride / 2; // YUY2 = 2 bytes per pixel
+
                     log::info!(
-                        "Frame {} ({} bytes): {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                        frame_count, frame_size,
-                        frame_data[0], frame_data[1], frame_data[2], frame_data[3],
-                        frame_data[4], frame_data[5], frame_data[6], frame_data[7],
-                        frame_data[8], frame_data[9], frame_data[10], frame_data[11],
-                        frame_data[12], frame_data[13], frame_data[14], frame_data[15]
+                        "Frame {} analysis: size={} bytes, expected={}, stride_calc={} (implies {}px width), descriptor={}x{}",
+                        frame_count, frame_size, expected_size, calculated_stride, implied_width, base_width, base_height
                     );
+
+                    // Warn if camera is sending more data than expected
+                    if frame_size > expected_size {
+                        let ratio = frame_size as f32 / expected_size as f32;
+                        log::warn!(
+                            "Camera sending {}x more data than descriptor! Actual stride={}, expected={}",
+                            ratio, calculated_stride, min_stride
+                        );
+                    }
+
+                    // Log first 16 bytes
+                    if frame_size >= 16 {
+                        log::info!(
+                            "Frame {} header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            frame_count,
+                            frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                            frame_data[4], frame_data[5], frame_data[6], frame_data[7],
+                            frame_data[8], frame_data[9], frame_data[10], frame_data[11],
+                            frame_data[12], frame_data[13], frame_data[14], frame_data[15]
+                        );
+                    }
                 }
 
                 // Skip incomplete frames - must have at least minimum expected data
@@ -1157,48 +1392,61 @@ fn stream_frames_yuy2(
 
                 // Get current display settings for overrides
                 let settings = display_settings.lock().unwrap();
+                let stride_idx = stride_index.lock().unwrap();
 
-                // Use descriptor resolution (authoritative) or settings override
-                let width = settings.width.unwrap_or(base_width);
+                // Calculate actual dimensions from frame data
+                // Some cameras send more data than their descriptor claims (e.g., 1920px wide
+                // despite advertising 640px). We use the actual frame size to determine the
+                // real width, while trusting the descriptor height.
                 let height = settings.height.unwrap_or(base_height);
 
-                // Calculate stride from actual frame size and descriptor height
-                // This handles cameras that pad rows for alignment
-                let stride = if let Some(s) = settings.stride {
-                    s
+                // Calculate actual stride from frame data
+                let actual_stride = if frame_size > 0 && height > 0 {
+                    // stride = frame_size / height, ensure even for YUY2
+                    let raw_stride = (frame_size as u32) / height;
+                    (raw_stride / 2) * 2 // Round down to even
                 } else {
-                    // stride = frame_size / height (in bytes)
-                    // For YUY2: stride is in bytes, so this gives bytes per row
-                    let calculated_stride = (frame_size as u32) / height;
-                    // Sanity check: stride should be at least width * 2 (YUY2 = 2 bytes/pixel)
-                    let min_stride = width * 2;
-                    if calculated_stride >= min_stride {
-                        calculated_stride
-                    } else {
-                        // Frame doesn't have expected padding, use natural stride
-                        min_stride
-                    }
+                    base_width * 2
                 };
 
-                let row_offset = settings.row_offset;
+                // Derive actual width from stride (YUY2 = 2 bytes per pixel)
+                let actual_width = actual_stride / 2;
+
+                // Use settings override or calculated values
+                let width = settings.width.unwrap_or(actual_width);
+
+                // Calculate stride: use stride_index multiplier if set, otherwise settings.stride or auto
+                let stride = if let Some(si) = *stride_idx {
+                    // Stride index is set - use multiplier
+                    let multiplier = crate::STRIDE_OPTIONS[si];
+                    ((width as f32 * multiplier) as u32 / 2) * 2 // Round to even
+                } else {
+                    settings.stride.unwrap_or(actual_stride)
+                };
+                drop(stride_idx);
+
+                // Log when we detect camera sending different resolution than descriptor
+                static RESOLUTION_LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if actual_width != base_width
+                    && !RESOLUTION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    log::warn!(
+                        "Camera sending {}x{} (stride={}) but descriptor says {}x{}. Using actual dimensions.",
+                        actual_width, height, actual_stride, base_width, base_height
+                    );
+                }
+
                 drop(settings); // Release lock before conversion
 
                 // Log settings changes
                 static LAST_SETTINGS: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
-                let settings_hash = ((width as u64) << 48)
-                    | ((height as u64) << 32)
-                    | ((stride as u64) << 16)
-                    | (row_offset.unsigned_abs() as u64);
+                let settings_hash =
+                    ((width as u64) << 48) | ((height as u64) << 32) | ((stride as u64) << 16);
                 let last = LAST_SETTINGS.swap(settings_hash, std::sync::atomic::Ordering::Relaxed);
                 if last != settings_hash {
-                    log::info!(
-                        "Display settings: {}x{} stride={} offset={:+}",
-                        width,
-                        height,
-                        stride,
-                        row_offset
-                    );
+                    log::info!("Display settings: {}x{} stride={}", width, height, stride);
                     let _ = app_handle.emit(
                         "usb-status",
                         serde_json::json!({
@@ -1211,14 +1459,23 @@ fn stream_frames_yuy2(
                 // Use the calculated stride as override (it's already properly computed above)
                 let stride_override = Some(stride);
 
-                // Convert YUY2 to RGB with stride and offset
+                // Get YUV format from streaming config
+                let yuv_format = {
+                    let config = streaming_config.lock().unwrap();
+                    match config.yuv_format {
+                        YuvFormat::Yuyv => YuvPackedFormat::Yuyv,
+                        YuvFormat::Uyvy => YuvPackedFormat::Uyvy,
+                    }
+                };
+
+                // Convert YUV 4:2:2 to RGB with stride
                 {
-                    match convert_yuy2_to_rgb(
+                    match convert_yuv422_to_rgb(
                         &frame_data,
                         width,
                         height,
                         stride_override,
-                        row_offset,
+                        yuv_format,
                     ) {
                         Ok(rgb_data) => {
                             // Log RGB buffer size once
@@ -1282,7 +1539,7 @@ fn stream_frames_yuy2(
     let _ = event_loop_handle.join();
 
     log::info!("YUY2 streaming ended after {} frames", frame_count);
-    Ok(())
+    Ok(StreamResult::Normal)
 }
 
 /// Start UVC streaming by sending probe/commit control requests
