@@ -27,8 +27,8 @@ export default defineConfig({
   ],
 
   use: {
-    // Base URL: vite dev (5173) in CI, Tauri dev (1420) locally
-    baseURL: process.env.CI ? "http://localhost:5173" : "http://localhost:1420",
+    // Base URL pointing to vite/Tauri dev server (both use 1420)
+    baseURL: "http://localhost:1420",
     // Screenshot on failure for debugging
     screenshot: "only-on-failure",
     trace: "on-first-retry",
@@ -46,7 +46,7 @@ export default defineConfig({
   // Locally, can use tauri dev for full integration testing
   webServer: {
     command: process.env.CI ? "npm run dev" : "npm run tauri:dev",
-    port: process.env.CI ? 5173 : 1420,
+    url: "http://localhost:1420",
     timeout: 120 * 1000,
     reuseExistingServer: !process.env.CI,
     env: {
