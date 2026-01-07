@@ -13,8 +13,9 @@
 //! For video streaming from UVC cameras, we use asynchronous isochronous
 //! transfers which provide guaranteed bandwidth for real-time video data.
 
+use std::collections::BTreeMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// libusb error codes
@@ -775,10 +776,42 @@ pub mod uvc {
         0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
     ];
 
-    /// UVC format GUID for NV12
+    /// UVC format GUID for NV12 (semi-planar YUV420)
     pub const NV12_GUID: [u8; 16] = [
         0x4E, 0x56, 0x31, 0x32, // "NV12"
         0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// UVC format GUID for I420 (planar YUV420, also known as IYUV)
+    pub const I420_GUID: [u8; 16] = [
+        0x49, 0x34, 0x32, 0x30, // "I420"
+        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// UVC format GUID for YV12 (planar YUV420 with V before U)
+    pub const YV12_GUID: [u8; 16] = [
+        0x59, 0x56, 0x31, 0x32, // "YV12"
+        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// UVC format GUID for UYVY (packed YUV422)
+    pub const UYVY_GUID: [u8; 16] = [
+        0x55, 0x59, 0x56, 0x59, // "UYVY"
+        0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    /// UVC format GUID for RGB24 (RGB888, 3 bytes per pixel, R-G-B order)
+    /// FourCC: "RGBT" or similar - this is the standard RGB24 GUID
+    pub const RGB24_GUID: [u8; 16] = [
+        0x7d, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7,
+        0x70,
+    ];
+
+    /// UVC format GUID for BGR24 (BGR888, 3 bytes per pixel, B-G-R order)
+    /// Some cameras report this GUID for BGR format
+    pub const BGR24_GUID: [u8; 16] = [
+        0xe4, 0x36, 0xeb, 0x7d, 0x52, 0x4f, 0x11, 0xce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7,
+        0x70,
     ];
 
     /// Parsed UVC frame descriptor (resolution info)
@@ -806,6 +839,7 @@ pub mod uvc {
     pub enum UvcFormatType {
         Mjpeg,
         Uncompressed,
+        UncompressedRgb, // RGB24/BGR24 - detected via GUID
         FrameBased,
         Unknown(u8),
     }
@@ -854,10 +888,28 @@ pub mod uvc {
                         // Try to identify the format from GUID
                         let format_name = if guid == YUY2_GUID {
                             "YUY2"
+                        } else if guid == UYVY_GUID {
+                            "UYVY"
                         } else if guid == NV12_GUID {
                             "NV12"
+                        } else if guid == I420_GUID {
+                            "I420"
+                        } else if guid == YV12_GUID {
+                            "YV12"
+                        } else if guid == RGB24_GUID {
+                            "RGB24"
+                        } else if guid == BGR24_GUID {
+                            "BGR24"
                         } else {
                             "Unknown"
+                        };
+
+                        // Determine if this is an RGB format
+                        let is_rgb = guid == RGB24_GUID || guid == BGR24_GUID;
+                        let format_type = if is_rgb {
+                            UvcFormatType::UncompressedRgb
+                        } else {
+                            UvcFormatType::Uncompressed
                         };
 
                         log::info!(
@@ -868,7 +920,7 @@ pub mod uvc {
 
                         formats.push(UvcFormatInfo {
                             format_index,
-                            format_type: UvcFormatType::Uncompressed,
+                            format_type,
                             num_frame_descriptors: num_frame_descs,
                             guid: Some(guid),
                             bits_per_pixel: Some(bits_per_pixel),
@@ -1023,6 +1075,12 @@ struct SharedFrameState {
     is_mjpeg: Option<bool>,
     /// Expected frame size for uncompressed video (from descriptor, not probe)
     expected_frame_size: usize,
+    /// Counter for validation warnings (to avoid log spam)
+    validation_warning_count: u32,
+    /// Pending URB payloads waiting to be processed in order (sequence -> payload data)
+    pending_urbs: BTreeMap<u64, UrbPayload>,
+    /// Next expected URB sequence number for in-order processing
+    next_expected_sequence: u64,
 }
 
 // Forward declaration for capture module
@@ -1042,6 +1100,16 @@ struct IsoCallbackContext {
     expected_frame_size: usize,
     /// Optional capture state for recording raw packets (E2E testing)
     capture_state: Option<Arc<CaptureState>>,
+    /// Frame validation level
+    validation_level: crate::ValidationLevel,
+    /// Frame width in pixels (for validation)
+    frame_width: usize,
+    /// Frame height in pixels (for validation)
+    frame_height: usize,
+    /// Transfer index (0 to NUM_TRANSFERS-1) for this transfer
+    transfer_index: usize,
+    /// Global sequence counter shared across all transfers for ordering
+    sequence_counter: Arc<AtomicU64>,
 }
 
 /// Manages isochronous USB transfers for video streaming
@@ -1080,6 +1148,9 @@ impl IsochronousStream {
     /// * `max_packet_size` - Maximum packet size for the endpoint
     /// * `expected_frame_size` - Expected frame size from descriptor (e.g., 614400 for 640x480 YUY2)
     /// * `capture_state` - Optional capture state for recording raw packets (E2E testing)
+    /// * `validation_level` - Frame corruption validation strictness
+    /// * `frame_width` - Frame width in pixels (for validation)
+    /// * `frame_height` - Frame height in pixels (for validation)
     pub unsafe fn new(
         ctx: *mut libusb1_sys::libusb_context,
         handle: *mut libusb1_sys::libusb_device_handle,
@@ -1087,6 +1158,9 @@ impl IsochronousStream {
         max_packet_size: u16,
         expected_frame_size: usize,
         capture_state: Option<Arc<CaptureState>>,
+        validation_level: crate::ValidationLevel,
+        frame_width: usize,
+        frame_height: usize,
     ) -> Result<Self, LibusbError> {
         let (frame_sender, frame_receiver) = std::sync::mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1110,7 +1184,13 @@ impl IsochronousStream {
             synced: false,
             is_mjpeg: None, // Will be detected from first frame data
             expected_frame_size: frame_size,
+            validation_warning_count: 0,
+            pending_urbs: BTreeMap::new(),
+            next_expected_sequence: 0,
         }));
+
+        // Global sequence counter for URB ordering (shared across all transfers)
+        let sequence_counter = Arc::new(AtomicU64::new(0));
 
         let buffer_size = (max_packet_size as usize) * (ISO_PACKETS_PER_TRANSFER as usize);
 
@@ -1133,7 +1213,7 @@ impl IsochronousStream {
             // Allocate buffer for this transfer
             let buffer = vec![0u8; buffer_size];
 
-            // Create callback context
+            // Create callback context with transfer index for URB ordering
             let context = Box::new(IsoCallbackContext {
                 frame_sender: frame_sender.clone(),
                 stop_flag: Arc::clone(&stop_flag),
@@ -1141,6 +1221,11 @@ impl IsochronousStream {
                 max_packet_size,
                 expected_frame_size: frame_size,
                 capture_state: capture_state.clone(),
+                validation_level,
+                frame_width,
+                frame_height,
+                transfer_index: i,
+                sequence_counter: Arc::clone(&sequence_counter),
             });
 
             transfers.push(transfer);
@@ -1324,12 +1409,56 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
     }
 
     let status = TransferStatus::from(xfr.status);
-    log::debug!("Transfer status: {:?}", status);
+    log::debug!(
+        "Transfer status: {:?}, transfer_index: {}",
+        status,
+        context.transfer_index
+    );
 
     match status {
         TransferStatus::Completed => {
-            // Process each isochronous packet
-            process_iso_packets(xfr, context);
+            // Get sequence number for this URB (atomically increment counter)
+            let sequence = context.sequence_counter.fetch_add(1, Ordering::SeqCst);
+
+            // Extract payload from this URB
+            let payload = extract_urb_payloads(xfr, context.max_packet_size);
+
+            log::trace!(
+                "URB completed: transfer_index={}, sequence={}, payload_bytes={}",
+                context.transfer_index,
+                sequence,
+                payload.data.len()
+            );
+
+            // Lock shared state and add payload to pending queue
+            let mut state = match context.shared_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    log::error!("Shared state mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+
+            // Store in pending URBs map
+            state.pending_urbs.insert(sequence, payload);
+
+            // Log if URBs are arriving out of order
+            if sequence != state.next_expected_sequence {
+                static OUT_OF_ORDER_LOG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let log_count = OUT_OF_ORDER_LOG.fetch_add(1, Ordering::Relaxed);
+                if log_count < 50 {
+                    log::debug!(
+                        "URB out of order: got seq={}, expected seq={}, pending={}",
+                        sequence,
+                        state.next_expected_sequence,
+                        state.pending_urbs.len()
+                    );
+                }
+            }
+
+            // Process any URBs that are now in sequence
+            process_pending_urbs_in_order(&mut state, context);
         }
         TransferStatus::TimedOut => {
             log::trace!("Transfer timeout (normal for isochronous)");
@@ -1459,53 +1588,54 @@ fn validate_uvc_header(data: &[u8]) -> Option<usize> {
     Some(header_len)
 }
 
-/// Process individual isochronous packets from a completed transfer
-unsafe fn process_iso_packets(
+/// Extracted payload data from a single URB, ready for ordered processing
+struct UrbPayload {
+    /// Payload bytes extracted from all packets in this URB (headers stripped)
+    data: Vec<u8>,
+    /// Metadata about each packet (for frame boundary detection)
+    packets: Vec<PacketMeta>,
+}
+
+/// Metadata about a single packet within a URB
+struct PacketMeta {
+    /// End of Frame flag from UVC header
+    end_of_frame: bool,
+    /// Frame ID from UVC header (toggles each frame)
+    frame_id: bool,
+    /// Whether this packet had an error flag
+    error: bool,
+    /// Whether this packet had a valid UVC header
+    had_header: bool,
+    /// Number of payload bytes from this packet
+    payload_len: usize,
+}
+
+/// Extract payload data from a completed URB without processing frame logic.
+/// This allows us to buffer URBs for in-order processing.
+///
+/// # Safety
+/// The transfer pointer must be valid.
+unsafe fn extract_urb_payloads(
     xfr: &mut libusb1_sys::libusb_transfer,
-    context: &IsoCallbackContext,
-) {
+    max_packet_size: u16,
+) -> UrbPayload {
     let num_packets = xfr.num_iso_packets as usize;
-    let mut packets_with_data = 0;
-    let mut total_bytes = 0usize;
-
-    // Lock the shared state for the duration of packet processing
-    let mut state = match context.shared_state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            log::error!("Shared state mutex poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-
-    // Log first transfer's packet layout once
-    static LAYOUT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let should_log_layout = !LAYOUT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    let mut data = Vec::with_capacity(num_packets * max_packet_size as usize);
+    let mut packets = Vec::with_capacity(num_packets);
 
     for i in 0..num_packets {
-        // Get packet descriptor
-        // The iso_packet_desc array is at the end of the transfer struct
         let pkt_desc_ptr = xfr.iso_packet_desc.as_ptr().add(i);
         let pkt_desc = &*pkt_desc_ptr;
 
         let pkt_status = TransferStatus::from(pkt_desc.status);
         let actual_length = pkt_desc.actual_length as usize;
 
-        if pkt_status != TransferStatus::Completed {
-            if i == 0 {
-                log::debug!("Packet 0 status: {:?}", pkt_status);
-            }
+        if pkt_status != TransferStatus::Completed || actual_length == 0 {
             continue;
         }
 
-        if actual_length == 0 {
-            continue;
-        }
-
-        packets_with_data += 1;
-        total_bytes += actual_length;
-
-        // Calculate packet buffer offset
-        let offset = i * (context.max_packet_size as usize);
+        // Get packet data
+        let offset = i * (max_packet_size as usize);
         let pkt_data = std::slice::from_raw_parts(xfr.buffer.add(offset), actual_length);
 
         // Record raw packet for E2E testing (before any parsing)
@@ -1524,39 +1654,8 @@ unsafe fn process_iso_packets(
         let is_uvc_header = validated_header.is_some();
         let header_len = validated_header.unwrap_or(0);
 
-        // Log packet layout for debugging (first transfer only)
-        if should_log_layout && packets_with_data <= 20 {
-            let first_bytes: Vec<u8> = pkt_data.iter().take(24).copied().collect();
-            let flags_str = if is_uvc_header {
-                let flags = pkt_data[1];
-                format!(
-                    "hdr=12 EOF={} FID={}",
-                    (flags & 0x02) != 0,
-                    (flags & 0x01) != 0
-                )
-            } else {
-                "no-hdr".to_string()
-            };
-            // Also show what payload bytes we'll actually use
-            let payload_start = if is_uvc_header { header_len } else { 0 };
-            let payload_preview: Vec<u8> = pkt_data
-                .iter()
-                .skip(payload_start)
-                .take(8)
-                .copied()
-                .collect();
-            log::info!(
-                "Pkt[{}]: len={}, {}, payload[{}..]: {:02x?}",
-                i,
-                actual_length,
-                flags_str,
-                payload_start,
-                payload_preview
-            );
-        }
-
-        // Only parse UVC flags if we have a valid header
-        let (end_of_frame, frame_id, error) = if let Some(_hdr_len) = validated_header {
+        // Extract flags from header (if present)
+        let (end_of_frame, frame_id, error) = if is_uvc_header {
             let header_flags = pkt_data[1];
             (
                 (header_flags & 0x02) != 0, // EOF
@@ -1564,23 +1663,58 @@ unsafe fn process_iso_packets(
                 (header_flags & 0x40) != 0, // Error
             )
         } else {
-            // No header - these bytes are payload, not flags
-            // Use last known FID to maintain sync
-            (false, state.last_frame_id.unwrap_or(false), false)
+            (false, false, false)
         };
 
-        // Handle UVC error flag (only if this is actually a header)
-        if error {
-            // For MJPEG: Error likely means corrupted JPEG, need to clear
+        // Extract payload (skip header if present)
+        let payload = if is_uvc_header && header_len <= actual_length {
+            &pkt_data[header_len..]
+        } else {
+            pkt_data
+        };
+
+        // Skip zero-filled payloads
+        let payload_to_add = if payload.len() > 8 && payload[0..8].iter().all(|&b| b == 0) {
+            &[]
+        } else {
+            payload
+        };
+
+        let payload_len = payload_to_add.len();
+        data.extend_from_slice(payload_to_add);
+
+        packets.push(PacketMeta {
+            end_of_frame,
+            frame_id,
+            error,
+            had_header: is_uvc_header,
+            payload_len,
+        });
+    }
+
+    UrbPayload { data, packets }
+}
+
+/// Process a single URB's payload data, appending to frame buffer and handling frame boundaries.
+/// This is called in-order after URBs have been sorted by sequence number.
+fn process_urb_payload_in_order(
+    payload: &UrbPayload,
+    state: &mut SharedFrameState,
+    context: &IsoCallbackContext,
+) {
+    // Process each packet's metadata for frame boundary detection
+    let mut data_offset = 0usize;
+
+    for pkt in &payload.packets {
+        // Handle UVC error flag
+        if pkt.error {
             let is_mjpeg = state.is_mjpeg.unwrap_or(false);
             if is_mjpeg {
-                log::warn!("UVC error in MJPEG packet {} - clearing buffer", i);
+                log::warn!("UVC error in MJPEG packet - clearing buffer");
                 state.frame_buffer.clear();
                 state.synced = false;
-                continue;
             }
-            // For YUY2: Skip this packet but don't clear buffer
-            log::debug!("UVC error flag in YUY2 packet {} - skipping packet", i);
+            data_offset += pkt.payload_len;
             continue;
         }
 
@@ -1597,227 +1731,122 @@ unsafe fn process_iso_packets(
             }
         }
 
-        // FID toggle handling depends on format
         let is_mjpeg = state.is_mjpeg.unwrap_or(false);
 
-        if let Some(last_fid) = state.last_frame_id {
-            if frame_id != last_fid {
-                // FID toggled - this indicates a new frame is starting
-                if is_mjpeg {
-                    // MJPEG: FID toggle is reliable frame boundary
-                    let frame_size = state.frame_buffer.len();
-                    if frame_size > 0 && state.synced {
-                        let has_jpeg_marker = frame_size >= 2
-                            && state.frame_buffer[0] == 0xFF
-                            && state.frame_buffer[1] == 0xD8;
-                        if has_jpeg_marker {
-                            log::info!(
-                                "Complete MJPEG frame: {} bytes (trigger: FID toggle)",
-                                frame_size
-                            );
-                            let frame = std::mem::take(&mut state.frame_buffer);
-                            if let Err(e) = context.frame_sender.send(frame) {
-                                log::warn!("Failed to send frame: {}", e);
+        // FID toggle handling
+        if pkt.had_header {
+            if let Some(last_fid) = state.last_frame_id {
+                if pkt.frame_id != last_fid {
+                    // FID toggled - new frame starting
+                    if is_mjpeg {
+                        let frame_size = state.frame_buffer.len();
+                        if frame_size > 0 && state.synced {
+                            let has_jpeg_marker = frame_size >= 2
+                                && state.frame_buffer[0] == 0xFF
+                                && state.frame_buffer[1] == 0xD8;
+                            if has_jpeg_marker {
+                                log::info!(
+                                    "Complete MJPEG frame: {} bytes (trigger: FID toggle)",
+                                    frame_size
+                                );
+                                let frame = std::mem::take(&mut state.frame_buffer);
+                                let _ = context.frame_sender.send(frame);
                             }
                         }
+                        state.frame_buffer.clear();
                     }
-                    state.frame_buffer.clear();
-                } else {
-                    // YUY2: FID toggle is UNRELIABLE for frame boundaries on cheap cameras
-                    // Many cameras toggle FID mid-frame. Only use FID for logging/calibration,
-                    // NOT for sending frames. Size-based detection is the primary mechanism.
-                    let buffer_size = state.frame_buffer.len();
-                    if buffer_size > 0 && state.synced {
-                        // Log FID-based frame size for calibration (but don't send!)
-                        static FID_FRAME_LOG: std::sync::atomic::AtomicU32 =
-                            std::sync::atomic::AtomicU32::new(0);
-                        let log_count =
-                            FID_FRAME_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if log_count < 20 {
-                            log::info!(
-                                "FID toggle (info only): buffer={} bytes, expected={} bytes, diff={}",
-                                buffer_size,
-                                state.expected_frame_size,
-                                buffer_size as i64 - state.expected_frame_size as i64
-                            );
-                        }
-                    }
-                    // NOTE: Do NOT send frame here! FID toggle is unreliable.
-                    // Size-based detection (below) handles actual frame sending.
+                    // For YUY2: FID toggle is unreliable, don't use for frame boundaries
+                    state.synced = true;
                 }
-                state.synced = true;
             }
+            state.last_frame_id = Some(pkt.frame_id);
         }
-        state.last_frame_id = Some(frame_id);
 
         // Only accumulate data if we're synced
         if !state.synced {
-            // Skip until we see a FID toggle (frame boundary)
+            data_offset += pkt.payload_len;
             continue;
         }
 
-        // Extract payload (skip header if present)
-        // We already determined is_uvc_header earlier
-        let bytes_added = if is_uvc_header {
-            // Log header packets for debugging
-            static HEADER_LOGGED: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let log_count = HEADER_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if log_count < 20 {
-                let preview: Vec<u8> = pkt_data.iter().take(16).copied().collect();
-                log::info!(
-                    "Header packet {}: {} bytes, hdr_len={}, EOF={}, first 16: {:02x?}",
-                    log_count,
-                    actual_length,
-                    header_len,
-                    end_of_frame,
-                    preview
-                );
-            }
+        // Add payload data to frame buffer
+        if pkt.payload_len > 0 {
+            let payload_slice = &payload.data[data_offset..data_offset + pkt.payload_len];
+            state.frame_buffer.extend_from_slice(payload_slice);
+        }
+        data_offset += pkt.payload_len;
 
-            // This packet has a UVC header - skip it to get to payload
-            if header_len <= actual_length {
-                let payload = &pkt_data[header_len..];
-                // Skip zero-filled payloads (incomplete/dropped data)
-                if payload.len() > 8 && payload[0..8].iter().all(|&b| b == 0) {
-                    0
-                } else {
-                    state.frame_buffer.extend_from_slice(payload);
-                    payload.len()
-                }
-            } else {
-                log::warn!(
-                    "Header length {} > packet size {}, skipping",
-                    header_len,
-                    actual_length
-                );
-                0
-            }
-        } else {
-            // No UVC header detected - this might be:
-            // 1. Pure payload continuation (valid)
-            // 2. A header we failed to detect (would corrupt data)
-
-            // DIAGNOSTIC: Check if this looks like a header we missed
-            // If byte 1 has EOH set (0x80) but we still rejected it, something is wrong
-            if actual_length >= 2 && (pkt_data[1] & 0x80) != 0 {
-                static MISSED_HEADER_LOG: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                if MISSED_HEADER_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-                    log::warn!(
-                        "SUSPICIOUS: No header detected, but byte[1]={:02x} (EOH set). \
-                         Len={}, byte[0]={:02x}. First 16: {:02x?}. Treating as payload!",
-                        pkt_data[1],
-                        actual_length,
-                        pkt_data[0],
-                        &pkt_data[..std::cmp::min(16, actual_length)]
-                    );
-                }
-            }
-
-            // Log first few bytes to help debug
-            static PAYLOAD_LOGGED: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let log_count = PAYLOAD_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if log_count < 20 {
-                let preview: Vec<u8> = pkt_data.iter().take(16).copied().collect();
-                log::info!(
-                    "Non-header packet {}: {} bytes, first 16: {:02x?}",
-                    log_count,
-                    actual_length,
-                    preview
-                );
-            }
-
-            // Pure payload data - but skip zero-filled packets (dropped/incomplete transfers)
-            if actual_length > 8 && pkt_data[0..8].iter().all(|&b| b == 0) {
-                // Zero-filled packet - skip it
-                0
-            } else {
-                state.frame_buffer.extend_from_slice(pkt_data);
-                pkt_data.len()
-            }
-        };
-
-        // Suppress unused variable warning
-        let _ = bytes_added;
-
-        // For YUY2/uncompressed: Check if buffer has reached expected frame size
-        // This is the primary frame detection mechanism for uncompressed video
+        // For YUY2: Check if buffer has reached expected frame size
         if !is_mjpeg {
             let buffer_size = state.frame_buffer.len();
             let expected_size = state.expected_frame_size;
             if buffer_size >= expected_size {
-                // Buffer has accumulated a complete frame - send it
                 let overflow = buffer_size - expected_size;
                 if overflow > 0 {
                     log::debug!(
-                        "Complete YUY2 frame: {} bytes ({} overflow bytes preserved for next frame)",
+                        "Complete YUY2 frame: {} bytes ({} overflow bytes preserved)",
                         expected_size,
                         overflow
                     );
                 }
-                // Take exactly the expected frame size
                 let frame: Vec<u8> = state.frame_buffer.drain(..expected_size).collect();
-                // NOTE: Do NOT clear the buffer after drain()! The remaining bytes are
-                // valid payload data for the NEXT frame. Clearing them causes frame
-                // boundaries to misalign, creating an "interlaced" artifact where each
-                // frame contains data from two different actual frames.
-                if let Err(e) = context.frame_sender.send(frame) {
-                    log::warn!("Failed to send frame: {}", e);
+
+                // Validate frame for corruption
+                let validation = crate::frame_validation::validate_yuy2_frame(
+                    &frame,
+                    context.frame_width,
+                    context.frame_height,
+                    context.expected_frame_size,
+                    context.validation_level,
+                );
+
+                if !validation.valid {
+                    state.validation_warning_count += 1;
+                    if state.validation_warning_count <= 10
+                        || state.validation_warning_count % 100 == 0
+                    {
+                        log::warn!(
+                            "Frame validation failed (#{}) - {}. avg_row_diff={:?}, size_ratio={:.2}, aligned={}",
+                            state.validation_warning_count,
+                            validation.failure_reason.as_deref().unwrap_or("unknown"),
+                            validation.avg_row_diff,
+                            validation.size_ratio,
+                            validation.stride_aligned
+                        );
+                    }
                 }
+
+                let _ = context.frame_sender.send(frame);
             }
         }
 
-        // For MJPEG: EOF is reliable, send immediately
-        if is_mjpeg && end_of_frame && !state.frame_buffer.is_empty() {
+        // For MJPEG: EOF is reliable
+        if is_mjpeg && pkt.end_of_frame && !state.frame_buffer.is_empty() {
             let frame_size = state.frame_buffer.len();
-
-            // Check for JPEG SOI marker (0xFFD8)
             let has_jpeg_marker =
                 frame_size >= 2 && state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8;
 
             if has_jpeg_marker {
                 log::info!("Complete MJPEG frame: {} bytes (trigger: EOF)", frame_size);
                 let frame = std::mem::take(&mut state.frame_buffer);
-                if let Err(e) = context.frame_sender.send(frame) {
-                    log::warn!("Failed to send frame: {}", e);
-                }
-            } else {
-                // Scan for SOI marker in case it's offset
-                let mut soi_offset: Option<usize> = None;
-                for j in 0..frame_size.saturating_sub(1).min(100) {
-                    if state.frame_buffer[j] == 0xFF && state.frame_buffer[j + 1] == 0xD8 {
-                        soi_offset = Some(j);
-                        break;
-                    }
-                }
-
-                if let Some(offset) = soi_offset {
-                    log::info!(
-                        "Found JPEG SOI at offset {} in {} byte frame",
-                        offset,
-                        frame_size
-                    );
-                    let jpeg_frame: Vec<u8> = state.frame_buffer[offset..].to_vec();
-                    if let Err(e) = context.frame_sender.send(jpeg_frame) {
-                        log::warn!("Failed to send frame: {}", e);
-                    }
-                }
+                let _ = context.frame_sender.send(frame);
             }
             state.frame_buffer.clear();
         }
     }
+}
 
-    // Log summary for debugging
-    if packets_with_data > 0 || total_bytes > 0 {
-        log::debug!(
-            "Transfer processed: {}/{} packets with data, {} total bytes, buffer now {} bytes",
-            packets_with_data,
-            num_packets,
-            total_bytes,
-            state.frame_buffer.len()
+/// Process pending URBs in sequence order.
+/// Called after adding a new URB to pending_urbs to process any that are now in order.
+fn process_pending_urbs_in_order(state: &mut SharedFrameState, context: &IsoCallbackContext) {
+    // Process all URBs that are now in sequence
+    while let Some(payload) = state.pending_urbs.remove(&state.next_expected_sequence) {
+        log::trace!(
+            "Processing URB seq={} in order ({} bytes)",
+            state.next_expected_sequence,
+            payload.data.len()
         );
+        process_urb_payload_in_order(&payload, state, context);
+        state.next_expected_sequence += 1;
     }
 }
 

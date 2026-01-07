@@ -26,9 +26,9 @@ let widthSetting = $state<string>("W:Auto");
 let heightSetting = $state<string>("H:Auto");
 let strideSetting = $state<string>("S:Auto");
 
-// Streaming configuration (MJPEG skip, YUV format, video format)
+// Streaming configuration (MJPEG skip, pixel format, video format)
 let mjpegSetting = $state<string>("MJPEG:Try");
-let yuvFormatSetting = $state<string>("YUV:YUYV");
+let pixelFormatSetting = $state<string>("FMT:YUYV");
 let videoFormatSetting = $state<string>("FMT:Auto");
 
 // Streaming status for detailed feedback
@@ -301,11 +301,11 @@ async function toggleMjpeg() {
   }
 }
 
-async function cycleYuvFormat() {
+async function cyclePixelFormat() {
   try {
-    yuvFormatSetting = await invoke<string>("cycle_yuv_format");
+    pixelFormatSetting = await invoke<string>("cycle_pixel_format");
   } catch (e) {
-    errorMessage = `Failed to change YUV format: ${e}`;
+    errorMessage = `Failed to change pixel format: ${e}`;
   }
 }
 
@@ -397,7 +397,7 @@ function getStatusColor(): string {
       <button class="debug-btn" onclick={cycleStride}>{strideSetting}</button>
       <button class="debug-btn format" onclick={cycleVideoFormat}>{videoFormatSetting}</button>
       <button class="debug-btn format" onclick={toggleMjpeg}>{mjpegSetting}</button>
-      <button class="debug-btn format" onclick={cycleYuvFormat}>{yuvFormatSetting}</button>
+      <button class="debug-btn format" onclick={cyclePixelFormat}>{pixelFormatSetting}</button>
       <button class="debug-btn capture" onclick={captureFrame}>Capture</button>
       {#if currentResolution}
         <button class="debug-btn detected">{currentResolution}</button>

@@ -3,6 +3,7 @@
 //! This module contains the core Tauri application logic and USB camera handling.
 
 mod capture;
+mod frame_validation;
 pub mod replay;
 mod usb;
 
@@ -11,6 +12,8 @@ pub mod test_utils;
 
 #[cfg(target_os = "android")]
 mod libusb_android;
+
+pub use frame_validation::ValidationLevel;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -54,15 +57,28 @@ pub struct DisplaySettings {
     pub stride: Option<u32>,
 }
 
-/// YUV 4:2:2 packed format variant
+/// Pixel format variants for video frames
+/// Includes both YUV and RGB formats
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-pub enum YuvFormat {
-    /// YUYV format: Y0-U-Y1-V byte order (luminance first)
+pub enum PixelFormat {
+    /// YUYV format: Y0-U-Y1-V byte order (packed YUV422, luminance first)
     #[default]
     Yuyv,
-    /// UYVY format: U-Y0-V-Y1 byte order (chrominance first)
+    /// UYVY format: U-Y0-V-Y1 byte order (packed YUV422, chrominance first)
     /// This is what macOS reports for many USB endoscopes
     Uyvy,
+    /// NV12 format: Y plane followed by interleaved UV plane (semi-planar YUV420)
+    /// Uses 1.5 bytes per pixel (12 bits)
+    Nv12,
+    /// I420 format: Y plane, then U plane, then V plane (planar YUV420)
+    /// Uses 1.5 bytes per pixel (12 bits)
+    I420,
+    /// RGB888 format: R-G-B byte order (3 bytes per pixel)
+    /// Direct pass-through, no conversion needed
+    Rgb888,
+    /// BGR888 format: B-G-R byte order (3 bytes per pixel)
+    /// Requires R↔B swap for display
+    Bgr888,
 }
 
 /// Streaming configuration options
@@ -70,8 +86,8 @@ pub enum YuvFormat {
 pub struct StreamingConfig {
     /// Skip MJPEG format detection and go straight to YUV
     pub skip_mjpeg_detection: bool,
-    /// YUV pixel format (YUYV or UYVY)
-    pub yuv_format: YuvFormat,
+    /// Pixel format for frame conversion (YUV variants or RGB)
+    pub pixel_format: PixelFormat,
     /// Selected format index (None = auto-detect, Some(n) = use format n)
     pub selected_format_index: Option<u8>,
     /// Available formats discovered from camera (`format_index`, `type_name`, resolutions)
@@ -129,6 +145,8 @@ pub struct AppState {
     pub capture_state: Arc<capture::CaptureState>,
     /// Flag to signal USB streaming should stop (for graceful shutdown)
     pub usb_stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Frame validation level (cached from env var at startup)
+    pub validation_level: ValidationLevel,
 }
 
 /// USB device connection status
@@ -509,18 +527,31 @@ fn toggle_skip_mjpeg(state: State<'_, AppState>) -> String {
     }
 }
 
-/// Cycle through YUV format options (YUYV / UYVY)
+/// Cycle through pixel format options (YUYV / UYVY / NV12 / I420 / RGB888 / BGR888)
 #[tauri::command]
-fn cycle_yuv_format(state: State<'_, AppState>) -> String {
+fn cycle_pixel_format(state: State<'_, AppState>) -> String {
     let mut config = state.streaming_config.lock().unwrap();
-    config.yuv_format = match config.yuv_format {
-        YuvFormat::Yuyv => YuvFormat::Uyvy,
-        YuvFormat::Uyvy => YuvFormat::Yuyv,
+    config.pixel_format = match config.pixel_format {
+        PixelFormat::Yuyv => PixelFormat::Uyvy,
+        PixelFormat::Uyvy => PixelFormat::Nv12,
+        PixelFormat::Nv12 => PixelFormat::I420,
+        PixelFormat::I420 => PixelFormat::Rgb888,
+        PixelFormat::Rgb888 => PixelFormat::Bgr888,
+        PixelFormat::Bgr888 => PixelFormat::Yuyv,
     };
-    log::info!("YUV format: {:?}", config.yuv_format);
-    match config.yuv_format {
-        YuvFormat::Yuyv => "YUV:YUYV".to_string(),
-        YuvFormat::Uyvy => "YUV:UYVY".to_string(),
+    log::info!("Pixel format: {:?}", config.pixel_format);
+    format_pixel_display(&config.pixel_format)
+}
+
+/// Format pixel format for display
+fn format_pixel_display(format: &PixelFormat) -> String {
+    match format {
+        PixelFormat::Yuyv => "FMT:YUYV".to_string(),
+        PixelFormat::Uyvy => "FMT:UYVY".to_string(),
+        PixelFormat::Nv12 => "FMT:NV12".to_string(),
+        PixelFormat::I420 => "FMT:I420".to_string(),
+        PixelFormat::Rgb888 => "FMT:RGB24".to_string(),
+        PixelFormat::Bgr888 => "FMT:BGR24".to_string(),
     }
 }
 
@@ -533,11 +564,8 @@ fn get_streaming_config(state: State<'_, AppState>) -> (String, String) {
     } else {
         "MJPEG:Try".to_string()
     };
-    let yuv = match config.yuv_format {
-        YuvFormat::Yuyv => "YUV:YUYV".to_string(),
-        YuvFormat::Uyvy => "YUV:UYVY".to_string(),
-    };
-    (mjpeg, yuv)
+    let pixel = format_pixel_display(&config.pixel_format);
+    (mjpeg, pixel)
 }
 
 /// Cycle through available video formats
@@ -736,6 +764,12 @@ pub fn run() {
     let capture_state = Arc::new(capture::CaptureState::new());
     let usb_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Read frame validation level from environment (default: strict)
+    let validation_level = std::env::var("CLEANSCOPE_FRAME_VALIDATION")
+        .map(|s| ValidationLevel::from_env_str(&s))
+        .unwrap_or_default();
+    log::info!("Frame validation level: {:?}", validation_level);
+
     // Clone Arcs for the setup closure (used in Android USB handler)
     #[allow(unused_variables)]
     let display_settings_clone = Arc::clone(&display_settings);
@@ -760,6 +794,7 @@ pub fn run() {
             offset_index,
             capture_state,
             usb_stop_flag,
+            validation_level,
         })
         .invoke_handler(tauri::generate_handler![
             get_build_info,
@@ -777,7 +812,7 @@ pub fn run() {
             stop_packet_capture,
             get_capture_status,
             toggle_skip_mjpeg,
-            cycle_yuv_format,
+            cycle_pixel_format,
             get_streaming_config,
             cycle_video_format,
             get_available_formats,
@@ -805,6 +840,7 @@ pub fn run() {
                         width_index_usb,
                         stride_index_usb,
                         usb_stop_flag_usb,
+                        validation_level,
                     );
                 });
             }
