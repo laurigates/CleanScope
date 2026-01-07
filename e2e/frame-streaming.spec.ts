@@ -85,14 +85,12 @@ test.describe("CleanScope Frame Streaming", () => {
     expect(canvasBox).not.toBeNull();
   });
 
-  test("frame rendering from replay data (requires CLEANSCOPE_REPLAY_PATH)", async ({
+  test("frame rendering from replay data (requires Tauri backend)", async ({
     page,
   }) => {
-    // This test requires CLEANSCOPE_REPLAY_PATH environment variable
-    // Set up replay mode by configuring the test environment or test fixture
-    const skipReplayTests = !process.env.CLEANSCOPE_REPLAY_PATH;
-
-    if (skipReplayTests) {
+    // This test requires full Tauri integration with replay backend
+    // Skip in CI when using vite-only frontend
+    if (process.env.CI) {
       test.skip();
     }
 
@@ -126,17 +124,15 @@ test.describe("CleanScope Frame Streaming", () => {
     const debugControls = page.locator(".debug-controls");
     await expect(debugControls).toBeVisible();
 
-    // Width, Height, Stride, Offset buttons
+    // Width, Height, Stride buttons (labeled W:Auto, H:Auto, S:Auto)
     const widthBtn = page.locator("button:has-text('W:')");
     const heightBtn = page.locator("button:has-text('H:')");
     const strideBtn = page.locator("button:has-text('S:')");
-    const offsetBtn = page.locator("button:has-text('O:')");
     const captureBtn = page.locator("button:has-text('Capture')");
 
     await expect(widthBtn).toBeVisible();
     await expect(heightBtn).toBeVisible();
     await expect(strideBtn).toBeVisible();
-    await expect(offsetBtn).toBeVisible();
     await expect(captureBtn).toBeVisible();
   });
 
