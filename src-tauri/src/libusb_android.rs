@@ -1360,15 +1360,59 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
 ///
 /// Per USB Video Class spec, payload headers have this structure:
 /// - Byte 0: Header length (includes this byte)
+/// Round a frame size to the nearest common YUY2 frame size.
+/// YUY2 uses 2 bytes per pixel, so frame_size = width * height * 2.
+/// Common resolutions: 640x480, 1280x720, 1920x1080, 320x240, 800x600
+fn round_to_yuy2_frame_size(actual_size: usize) -> usize {
+    // Common YUY2 frame sizes
+    const FRAME_SIZES: &[(usize, &str)] = &[
+        (320 * 240 * 2, "320x240"),
+        (640 * 480 * 2, "640x480"),
+        (800 * 600 * 2, "800x600"),
+        (1280 * 720 * 2, "1280x720"),
+        (1920 * 1080 * 2, "1920x1080"),
+        (1280 * 960 * 2, "1280x960"),
+        (1600 * 1200 * 2, "1600x1200"),
+        // Also include non-standard sizes that cameras might use
+        (960 * 480 * 2, "960x480"),   // 3:1 aspect
+        (1920 * 480 * 2, "1920x480"), // Wide sensor
+    ];
+
+    // Find the closest standard size
+    let mut best_match = actual_size;
+    let mut best_diff = usize::MAX;
+
+    for &(size, name) in FRAME_SIZES {
+        let diff = if size > actual_size {
+            size - actual_size
+        } else {
+            actual_size - size
+        };
+
+        // Only match if within 5% tolerance
+        if diff < best_diff && diff < size / 20 {
+            best_diff = diff;
+            best_match = size;
+            log::debug!("Frame size {} matches {} ({})", actual_size, size, name);
+        }
+    }
+
+    // If no close match, just use the actual size (rounded to be even)
+    if best_match == actual_size {
+        (actual_size / 2) * 2
+    } else {
+        best_match
+    }
+}
+
 /// - Byte 1: BFH flags (bit 7 = EOH must be 1)
 /// - Bytes 2-5: PTS (4 bytes, optional, present if bit 2 set)
 /// - Bytes 6-11: SCR (6 bytes, optional, present if bit 3 set)
 ///
-/// Valid lengths based on flags:
-/// - PTS=0, SCR=0: length = 2
-/// - PTS=1, SCR=0: length = 6
-/// - PTS=0, SCR=1: length = 8
-/// - PTS=1, SCR=1: length = 12
+/// This function uses RELAXED validation - many cheap cameras don't strictly
+/// follow the spec (they may set reserved bits, or declare 12-byte headers
+/// without setting the PTS/SCR flags). If EOH is set and the length is in
+/// the valid range (2-12), we trust the declared length.
 ///
 /// Returns `Some(header_len)` if valid, `None` if this is not a UVC header.
 #[inline]
@@ -1381,31 +1425,35 @@ fn validate_uvc_header(data: &[u8]) -> Option<usize> {
     let header_flags = data[1];
 
     // EOH (End of Header) bit MUST be set for valid headers
+    // This is the most reliable indicator
     if (header_flags & 0x80) == 0 {
         return None;
     }
 
-    // Extract PTS/SCR flags
+    // Basic sanity check on length:
+    // - Must be at least 2 (minimum header)
+    // - Must be at most 12 (maximum with PTS + SCR)
+    // - Must fit within packet
+    if header_len < 2 || header_len > 12 || header_len > data.len() {
+        return None;
+    }
+
+    // RELAXED VALIDATION:
+    // Previously we rejected if reserved bits were set or if length didn't match flags.
+    // Many cheap cameras set reserved bits or have inconsistent flags.
+    // If EOH is set and length is reasonable, we trust the length byte.
+
+    // Optional: Log trace when length doesn't match flags (for debugging)
     let pts_flag = (header_flags & 0x04) != 0;
     let scr_flag = (header_flags & 0x08) != 0;
-    let reserved_bit = (header_flags & 0x10) != 0;
-
-    // Reserved bit should be 0 (helps reject false positives from video data)
-    if reserved_bit {
-        return None;
-    }
-
-    // Calculate expected length: base (2) + PTS (4 if present) + SCR (6 if present)
     let expected_len = 2 + if pts_flag { 4 } else { 0 } + if scr_flag { 6 } else { 0 };
 
-    // Validate declared length matches expected
     if header_len != expected_len {
-        return None;
-    }
-
-    // Ensure header fits within packet
-    if header_len > data.len() {
-        return None;
+        log::trace!(
+            "UVC header length mismatch: declared={}, expected from flags={}",
+            header_len,
+            expected_len
+        );
     }
 
     Some(header_len)
@@ -1574,9 +1622,29 @@ unsafe fn process_iso_packets(
                         }
                     }
                     state.frame_buffer.clear();
+                } else {
+                    // YUY2: FID toggle is UNRELIABLE for frame boundaries on cheap cameras
+                    // Many cameras toggle FID mid-frame. Only use FID for logging/calibration,
+                    // NOT for sending frames. Size-based detection is the primary mechanism.
+                    let buffer_size = state.frame_buffer.len();
+                    if buffer_size > 0 && state.synced {
+                        // Log FID-based frame size for calibration (but don't send!)
+                        static FID_FRAME_LOG: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let log_count =
+                            FID_FRAME_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if log_count < 20 {
+                            log::info!(
+                                "FID toggle (info only): buffer={} bytes, expected={} bytes, diff={}",
+                                buffer_size,
+                                state.expected_frame_size,
+                                buffer_size as i64 - state.expected_frame_size as i64
+                            );
+                        }
+                    }
+                    // NOTE: Do NOT send frame here! FID toggle is unreliable.
+                    // Size-based detection (below) handles actual frame sending.
                 }
-                // For YUY2: Don't use FID toggle - this camera toggles it mid-frame
-                // We rely on size-based detection instead
                 state.synced = true;
             }
         }
@@ -1629,7 +1697,24 @@ unsafe fn process_iso_packets(
             // No UVC header detected - this might be:
             // 1. Pure payload continuation (valid)
             // 2. A header we failed to detect (would corrupt data)
-            //
+
+            // DIAGNOSTIC: Check if this looks like a header we missed
+            // If byte 1 has EOH set (0x80) but we still rejected it, something is wrong
+            if actual_length >= 2 && (pkt_data[1] & 0x80) != 0 {
+                static MISSED_HEADER_LOG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if MISSED_HEADER_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                    log::warn!(
+                        "SUSPICIOUS: No header detected, but byte[1]={:02x} (EOH set). \
+                         Len={}, byte[0]={:02x}. First 16: {:02x?}. Treating as payload!",
+                        pkt_data[1],
+                        actual_length,
+                        pkt_data[0],
+                        &pkt_data[..std::cmp::min(16, actual_length)]
+                    );
+                }
+            }
+
             // Log first few bytes to help debug
             static PAYLOAD_LOGGED: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
@@ -1667,16 +1752,17 @@ unsafe fn process_iso_packets(
                 let overflow = buffer_size - expected_size;
                 if overflow > 0 {
                     log::debug!(
-                        "Complete YUY2 frame: {} bytes ({} overflow bytes discarded)",
+                        "Complete YUY2 frame: {} bytes ({} overflow bytes preserved for next frame)",
                         expected_size,
                         overflow
                     );
                 }
                 // Take exactly the expected frame size
                 let frame: Vec<u8> = state.frame_buffer.drain(..expected_size).collect();
-                // IMPORTANT: Clear any overflow bytes - these are UVC headers that weren't
-                // properly detected and would corrupt the next frame if left in the buffer
-                state.frame_buffer.clear();
+                // NOTE: Do NOT clear the buffer after drain()! The remaining bytes are
+                // valid payload data for the NEXT frame. Clearing them causes frame
+                // boundaries to misalign, creating an "interlaced" artifact where each
+                // frame contains data from two different actual frames.
                 if let Err(e) = context.frame_sender.send(frame) {
                     log::warn!("Failed to send frame: {}", e);
                 }
@@ -1782,24 +1868,26 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_length_mismatch_too_large() {
+    fn test_allow_length_mismatch_large() {
         // Says 12 bytes but only PTS flag set (should be 6)
+        // With relaxed validation, we trust the declared length
         let data = [0x0C, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB];
-        assert_eq!(validate_uvc_header(&data), None);
+        assert_eq!(validate_uvc_header(&data), Some(12));
     }
 
     #[test]
-    fn test_reject_length_mismatch_too_small() {
+    fn test_allow_length_mismatch_small() {
         // Says 2 bytes but PTS flag set (should be 6)
+        // With relaxed validation, we trust the declared length
         let data = [0x02, 0x84, 0xAB, 0xCD, 0xEF, 0x12];
-        assert_eq!(validate_uvc_header(&data), None);
+        assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
     #[test]
-    fn test_reject_reserved_bit_set() {
-        // Reserved bit (0x10) set - should reject
+    fn test_allow_reserved_bit_set() {
+        // Reserved bit (0x10) set - with relaxed validation, we accept this
         let data = [0x02, 0x90, 0xAB, 0xCD]; // 0x90 = EOH + reserved
-        assert_eq!(validate_uvc_header(&data), None);
+        assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
     #[test]

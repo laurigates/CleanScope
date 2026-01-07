@@ -52,8 +52,43 @@ pub struct DisplaySettings {
     pub height: Option<u32>,
     /// Stride override in bytes (None = width * 2 for YUY2)
     pub stride: Option<u32>,
-    /// Row offset - skip this many bytes at start of frame
-    pub row_offset: i32,
+}
+
+/// YUV 4:2:2 packed format variant
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum YuvFormat {
+    /// YUYV format: Y0-U-Y1-V byte order (luminance first)
+    #[default]
+    Yuyv,
+    /// UYVY format: U-Y0-V-Y1 byte order (chrominance first)
+    /// This is what macOS reports for many USB endoscopes
+    Uyvy,
+}
+
+/// Streaming configuration options
+#[derive(Debug, Clone, Default)]
+pub struct StreamingConfig {
+    /// Skip MJPEG format detection and go straight to YUV
+    pub skip_mjpeg_detection: bool,
+    /// YUV pixel format (YUYV or UYVY)
+    pub yuv_format: YuvFormat,
+    /// Selected format index (None = auto-detect, Some(n) = use format n)
+    pub selected_format_index: Option<u8>,
+    /// Available formats discovered from camera (`format_index`, `type_name`, resolutions)
+    pub available_formats: Vec<DiscoveredFormat>,
+    /// Flag to signal streaming should restart with new settings
+    pub restart_requested: bool,
+}
+
+/// A discovered camera format for UI display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredFormat {
+    /// UVC format index (1-based)
+    pub index: u8,
+    /// Human-readable format type (e.g., "MJPEG", "YUY2")
+    pub format_type: String,
+    /// Available resolutions as `WxH` strings
+    pub resolutions: Vec<String>,
 }
 
 /// Available width options for cycling
@@ -74,19 +109,14 @@ pub const STRIDE_OPTIONS: &[f32] = &[
     3.0,   // 50% extra
 ];
 
-/// Available row offset options (bytes to skip at start of frame)
-/// These help find the correct frame alignment for cameras with embedded headers
-pub const OFFSET_OPTIONS: &[i32] = &[
-    0, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, // Skip bytes at start
-    -2, -4, -8, // Negative values (for testing)
-];
-
 /// Application state managed by Tauri
 pub struct AppState {
     /// Shared frame buffer protected by mutex
     pub frame_buffer: Arc<Mutex<FrameBuffer>>,
     /// Display settings for resolution/stride overrides
     pub display_settings: Arc<Mutex<DisplaySettings>>,
+    /// Streaming configuration (MJPEG skip, YUV format)
+    pub streaming_config: Arc<Mutex<StreamingConfig>>,
     /// Current width option index (None = auto)
     pub width_index: Arc<Mutex<Option<usize>>>,
     /// Current height option index (None = auto)
@@ -97,6 +127,8 @@ pub struct AppState {
     pub offset_index: Arc<Mutex<usize>>,
     /// Packet capture state for debugging
     pub capture_state: Arc<capture::CaptureState>,
+    /// Flag to signal USB streaming should stop (for graceful shutdown)
+    pub usb_stop_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// USB device connection status
@@ -444,19 +476,6 @@ fn cycle_stride(state: State<'_, AppState>) -> String {
     }
 }
 
-/// Cycle through row offset options
-#[tauri::command]
-fn cycle_offset(state: State<'_, AppState>) -> String {
-    let mut index = state.offset_index.lock().unwrap();
-    let mut settings = state.display_settings.lock().unwrap();
-
-    let new_index = (*index + 1) % OFFSET_OPTIONS.len();
-    *index = new_index;
-    settings.row_offset = OFFSET_OPTIONS[new_index];
-
-    format!("O:{:+}", OFFSET_OPTIONS[new_index])
-}
-
 /// Get current display settings as a summary string
 #[tauri::command]
 fn get_display_settings(state: State<'_, AppState>) -> String {
@@ -473,7 +492,125 @@ fn get_display_settings(state: State<'_, AppState>) -> String {
         .stride
         .map(|v| v.to_string())
         .unwrap_or_else(|| "Auto".to_string());
-    format!("{}x{} stride:{} offset:{:+}", w, h, s, settings.row_offset)
+    format!("{}x{} stride:{}", w, h, s)
+}
+
+/// Toggle MJPEG detection skip
+/// When enabled, skips MJPEG format probing and goes straight to YUV streaming
+#[tauri::command]
+fn toggle_skip_mjpeg(state: State<'_, AppState>) -> String {
+    let mut config = state.streaming_config.lock().unwrap();
+    config.skip_mjpeg_detection = !config.skip_mjpeg_detection;
+    log::info!("MJPEG skip: {}", config.skip_mjpeg_detection);
+    if config.skip_mjpeg_detection {
+        "MJPEG:Skip".to_string()
+    } else {
+        "MJPEG:Try".to_string()
+    }
+}
+
+/// Cycle through YUV format options (YUYV / UYVY)
+#[tauri::command]
+fn cycle_yuv_format(state: State<'_, AppState>) -> String {
+    let mut config = state.streaming_config.lock().unwrap();
+    config.yuv_format = match config.yuv_format {
+        YuvFormat::Yuyv => YuvFormat::Uyvy,
+        YuvFormat::Uyvy => YuvFormat::Yuyv,
+    };
+    log::info!("YUV format: {:?}", config.yuv_format);
+    match config.yuv_format {
+        YuvFormat::Yuyv => "YUV:YUYV".to_string(),
+        YuvFormat::Uyvy => "YUV:UYVY".to_string(),
+    }
+}
+
+/// Get current streaming configuration
+#[tauri::command]
+fn get_streaming_config(state: State<'_, AppState>) -> (String, String) {
+    let config = state.streaming_config.lock().unwrap();
+    let mjpeg = if config.skip_mjpeg_detection {
+        "MJPEG:Skip".to_string()
+    } else {
+        "MJPEG:Try".to_string()
+    };
+    let yuv = match config.yuv_format {
+        YuvFormat::Yuyv => "YUV:YUYV".to_string(),
+        YuvFormat::Uyvy => "YUV:UYVY".to_string(),
+    };
+    (mjpeg, yuv)
+}
+
+/// Cycle through available video formats
+/// Returns the new format setting as a display string
+#[tauri::command]
+fn cycle_video_format(state: State<'_, AppState>) -> String {
+    let mut config = state.streaming_config.lock().unwrap();
+
+    if config.available_formats.is_empty() {
+        // No formats discovered yet
+        return "FMT:Auto".to_string();
+    }
+
+    // Cycle: None (Auto) -> format 0 -> format 1 -> ... -> None (Auto)
+    let new_index = match config.selected_format_index {
+        None => Some(0usize),
+        Some(current) => {
+            // Find current position in available_formats
+            let current_pos = config
+                .available_formats
+                .iter()
+                .position(|f| f.index == current);
+            match current_pos {
+                Some(pos) if pos + 1 < config.available_formats.len() => Some(pos + 1),
+                _ => None, // Wrap back to Auto
+            }
+        }
+    };
+
+    config.selected_format_index = new_index.map(|i| config.available_formats[i].index);
+
+    // Signal streaming to restart with new format
+    config.restart_requested = true;
+
+    let result = match new_index {
+        None => "FMT:Auto".to_string(),
+        Some(i) => {
+            let fmt = &config.available_formats[i];
+            format!("FMT:{}:{}", fmt.index, fmt.format_type)
+        }
+    };
+
+    log::info!(
+        "Video format changed: {:?} -> {} (restart requested)",
+        config.selected_format_index,
+        result
+    );
+    result
+}
+
+/// Get available video formats discovered from camera
+#[tauri::command]
+fn get_available_formats(state: State<'_, AppState>) -> Vec<DiscoveredFormat> {
+    let config = state.streaming_config.lock().unwrap();
+    config.available_formats.clone()
+}
+
+/// Get current video format setting
+#[tauri::command]
+fn get_video_format(state: State<'_, AppState>) -> String {
+    let config = state.streaming_config.lock().unwrap();
+
+    match config.selected_format_index {
+        None => "FMT:Auto".to_string(),
+        Some(idx) => {
+            // Find format info
+            if let Some(fmt) = config.available_formats.iter().find(|f| f.index == idx) {
+                format!("FMT:{}:{}", fmt.index, fmt.format_type)
+            } else {
+                format!("FMT:{}", idx)
+            }
+        }
+    }
 }
 
 /// Start capturing USB packets for debugging
@@ -548,7 +685,6 @@ pub fn get_current_display_settings(state: &AppState) -> DisplaySettings {
         width: settings.width,
         height: settings.height,
         stride,
-        row_offset: settings.row_offset,
     }
 }
 
@@ -592,30 +728,38 @@ pub fn run() {
     // Create shared state for camera frames and display settings
     let frame_buffer = Arc::new(Mutex::new(FrameBuffer::default()));
     let display_settings = Arc::new(Mutex::new(DisplaySettings::default()));
+    let streaming_config = Arc::new(Mutex::new(StreamingConfig::default()));
     let width_index = Arc::new(Mutex::new(None));
     let height_index = Arc::new(Mutex::new(None));
     let stride_index = Arc::new(Mutex::new(None));
     let offset_index = Arc::new(Mutex::new(0usize));
     let capture_state = Arc::new(capture::CaptureState::new());
+    let usb_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Clone Arcs for the setup closure (used in Android USB handler)
     #[allow(unused_variables)]
     let display_settings_clone = Arc::clone(&display_settings);
     #[allow(unused_variables)]
+    let streaming_config_clone = Arc::clone(&streaming_config);
+    #[allow(unused_variables)]
     let width_index_clone = Arc::clone(&width_index);
     #[allow(unused_variables)]
     let stride_index_clone = Arc::clone(&stride_index);
+    #[allow(unused_variables)]
+    let usb_stop_flag_clone = Arc::clone(&usb_stop_flag);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             frame_buffer: Arc::clone(&frame_buffer),
             display_settings,
+            streaming_config,
             width_index,
             height_index,
             stride_index,
             offset_index,
             capture_state,
+            usb_stop_flag,
         })
         .invoke_handler(tauri::generate_handler![
             get_build_info,
@@ -628,11 +772,16 @@ pub fn run() {
             cycle_width,
             cycle_height,
             cycle_stride,
-            cycle_offset,
             get_display_settings,
             start_packet_capture,
             stop_packet_capture,
             get_capture_status,
+            toggle_skip_mjpeg,
+            cycle_yuv_format,
+            get_streaming_config,
+            cycle_video_format,
+            get_available_formats,
+            get_video_format,
         ])
         .setup(move |_app| {
             log::info!("Tauri app setup complete");
@@ -643,15 +792,19 @@ pub fn run() {
                 let app_handle = _app.handle().clone();
                 let frame_buffer_clone = Arc::clone(&frame_buffer);
                 let display_settings_usb = Arc::clone(&display_settings_clone);
+                let streaming_config_usb = Arc::clone(&streaming_config_clone);
                 let width_index_usb = Arc::clone(&width_index_clone);
                 let stride_index_usb = Arc::clone(&stride_index_clone);
+                let usb_stop_flag_usb = Arc::clone(&usb_stop_flag_clone);
                 std::thread::spawn(move || {
                     usb::init_usb_handler(
                         app_handle,
                         frame_buffer_clone,
                         display_settings_usb,
+                        streaming_config_usb,
                         width_index_usb,
                         stride_index_usb,
+                        usb_stop_flag_usb,
                     );
                 });
             }

@@ -21,11 +21,15 @@ let captureResult = $state<{
   height: number;
 } | null>(null);
 
-// Display settings for debugging (width, height, stride, offset)
+// Display settings for debugging (width, height, stride)
 let widthSetting = $state<string>("W:Auto");
 let heightSetting = $state<string>("H:Auto");
 let strideSetting = $state<string>("S:Auto");
-let offsetSetting = $state<string>("O:+0");
+
+// Streaming configuration (MJPEG skip, YUV format, video format)
+let mjpegSetting = $state<string>("MJPEG:Try");
+let yuvFormatSetting = $state<string>("YUV:YUYV");
+let videoFormatSetting = $state<string>("FMT:Auto");
 
 // Streaming status for detailed feedback
 let streamingStatus = $state<string>("Waiting for device...");
@@ -178,6 +182,13 @@ onMount(async () => {
   } catch (e) {
     console.log("Could not get build info:", e);
   }
+
+  // Get initial video format setting
+  try {
+    videoFormatSetting = await invoke<string>("get_video_format");
+  } catch (e) {
+    console.log("Could not get video format:", e);
+  }
 });
 
 onDestroy(() => {
@@ -282,11 +293,27 @@ async function cycleStride() {
   }
 }
 
-async function cycleOffset() {
+async function toggleMjpeg() {
   try {
-    offsetSetting = await invoke<string>("cycle_offset");
+    mjpegSetting = await invoke<string>("toggle_skip_mjpeg");
   } catch (e) {
-    errorMessage = `Failed to change offset: ${e}`;
+    errorMessage = `Failed to toggle MJPEG: ${e}`;
+  }
+}
+
+async function cycleYuvFormat() {
+  try {
+    yuvFormatSetting = await invoke<string>("cycle_yuv_format");
+  } catch (e) {
+    errorMessage = `Failed to change YUV format: ${e}`;
+  }
+}
+
+async function cycleVideoFormat() {
+  try {
+    videoFormatSetting = await invoke<string>("cycle_video_format");
+  } catch (e) {
+    errorMessage = `Failed to change video format: ${e}`;
   }
 }
 
@@ -368,7 +395,9 @@ function getStatusColor(): string {
       <button class="debug-btn" onclick={cycleWidth}>{widthSetting}</button>
       <button class="debug-btn" onclick={cycleHeight}>{heightSetting}</button>
       <button class="debug-btn" onclick={cycleStride}>{strideSetting}</button>
-      <button class="debug-btn" onclick={cycleOffset}>{offsetSetting}</button>
+      <button class="debug-btn format" onclick={cycleVideoFormat}>{videoFormatSetting}</button>
+      <button class="debug-btn format" onclick={toggleMjpeg}>{mjpegSetting}</button>
+      <button class="debug-btn format" onclick={cycleYuvFormat}>{yuvFormatSetting}</button>
       <button class="debug-btn capture" onclick={captureFrame}>Capture</button>
       {#if currentResolution}
         <button class="debug-btn detected">{currentResolution}</button>
@@ -594,6 +623,14 @@ function getStatusColor(): string {
 
   .debug-btn.detected:hover {
     background: #10b981;
+  }
+
+  .debug-btn.format {
+    background: #0891b2;
+  }
+
+  .debug-btn.format:hover {
+    background: #06b6d4;
   }
 
   .debug-btn.capture {
