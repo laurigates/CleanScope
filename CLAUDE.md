@@ -45,6 +45,31 @@ just emulator-create   # Create AVD named "cleanscope"
 
 **Note:** USB OTG is not supported in emulators. Use a physical device for endoscope testing.
 
+## Environment Variables
+
+### CLEANSCOPE_FRAME_VALIDATION
+
+Controls frame corruption detection strictness. Read at app startup.
+
+| Value | Behavior |
+|-------|----------|
+| `strict` (default) | Row similarity + size + alignment checks. Detects banding and shearing. |
+| `moderate` | Size checks only (10% tolerance) |
+| `minimal` | Only massive size mismatches (2x tolerance) |
+| `off` | No validation, best performance |
+
+**Usage:**
+```bash
+# Set before launching
+CLEANSCOPE_FRAME_VALIDATION=moderate just android-dev
+
+# Or export for the session
+export CLEANSCOPE_FRAME_VALIDATION=off
+just android-dev
+```
+
+**Note:** Corrupted frames are always displayed (not dropped). Validation only logs warnings with diagnostic metrics to help debug camera issues.
+
 ## ADB over WiFi (USB Endoscope Testing)
 
 Most Android phones have a single USB-C port, which is needed for the endoscope. Use ADB over WiFi to deploy and debug while the endoscope is connected.
@@ -110,6 +135,7 @@ This method survives reboots after initial pairing.
 - `lib.rs` - Tauri commands, app setup, event emission, display settings
 - `usb.rs` - UVC negotiation, YUV conversion, frame streaming
 - `libusb_android.rs` - Low-level USB/isochronous transfers, UVC header parsing, frame assembly
+- `frame_validation.rs` - Frame corruption detection (row similarity, size, stride checks)
 
 **Android USB Flow:**
 1. USB camera plugged in → Android triggers `USB_DEVICE_ATTACHED` intent
@@ -123,22 +149,22 @@ This method survives reboots after initial pairing.
 ## Video Pipeline
 
 ```
-USB Camera (UVC) → Isochronous USB Transfers → Frame Assembly → YUV→RGB → Frontend Canvas
-     ↓                      ↓                        ↓              ↓           ↓
- Advertises            libusb_android.rs      process_iso_packets  usb.rs    App.svelte
- 640x480 YUY2          (1024-byte packets)    (strip headers,     (yuvutils)  (ImageData)
-                                               accumulate)
+Camera → UVC Negotiation → Isochronous USB → Frame Assembly → Validation → YUV→RGB → Canvas
+  (1)         (2)              (3)              (4)             (5)          (6)       (7)
 ```
+
+**Full technical reference:** See [`docs/VIDEO_PIPELINE.md`](docs/VIDEO_PIPELINE.md) for complete documentation of all parameters, data structures, and processing stages.
 
 **Key files in pipeline:**
 | Stage | File | Function |
 |-------|------|----------|
-| UVC negotiation | `usb.rs` | `start_uvc_streaming()` |
-| Isochronous transfers | `libusb_android.rs` | `IsochronousStream`, `iso_transfer_callback` |
-| UVC header parsing | `libusb_android.rs` | `validate_uvc_header()` |
-| Frame assembly | `libusb_android.rs` | `process_iso_packets()` |
-| YUV→RGB conversion | `usb.rs` | `convert_yuv422_to_rgb()`, `stream_frames_yuy2()` |
-| Display | `src/App.svelte` | `renderFrame()` |
+| 1. Device discovery | `usb.rs` | `init_usb_handler()`, `get_format_descriptors()` |
+| 2. UVC negotiation | `usb.rs` | `start_uvc_streaming_with_resolution()` |
+| 3. Isochronous transfers | `libusb_android.rs` | `IsochronousStream`, `iso_transfer_callback` |
+| 4. Frame assembly | `libusb_android.rs` | `process_iso_packets()`, `validate_uvc_header()` |
+| 5. Frame validation | `frame_validation.rs` | `validate_yuy2_frame()` |
+| 6. YUV→RGB conversion | `usb.rs` | `convert_yuv422_to_rgb()`, `stream_frames_yuy2()` |
+| 7. Display | `src/App.svelte` | `renderFrame()` |
 
 ## Key Modification Points
 
@@ -208,4 +234,7 @@ adb logcat -s RustStdoutStderr:* | grep "SUSPICIOUS"
 
 # Watch stride/resolution detection
 adb logcat -s RustStdoutStderr:* | grep -E "stride|resolution|width|height"
+
+# Watch frame validation warnings (see env var section for levels)
+adb logcat -s RustStdoutStderr:* | grep -E "validation|row_diff|size_ratio"
 ```

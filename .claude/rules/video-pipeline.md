@@ -3,10 +3,13 @@
 ## Pipeline Overview
 
 ```
-Camera → USB Isochronous → UVC Headers → Frame Assembly → YUV→RGB → Canvas
+Camera → USB Isochronous → UVC Headers → Frame Assembly → Frame Validation → YUV→RGB → Canvas
+  (1)         (2)              (3)            (4)              (5)            (6)        (7)
 ```
 
 Each stage can introduce artifacts. Debug systematically from left to right.
+
+**Full documentation:** See `docs/VIDEO_PIPELINE.md` for complete technical reference.
 
 ## Critical Implementation Details
 
@@ -44,9 +47,35 @@ Each stage can introduce artifacts. Debug systematically from left to right.
 4. **Try stride adjustment:** Use UI buttons to find correct value
 5. **Try YUV format toggle:** Switch YUYV ↔ UYVY if colors are wrong
 
+## Frame Validation (libusb_android.rs + frame_validation.rs)
+
+**What it does:**
+- Validates each assembled YUY2 frame for corruption artifacts
+- Configurable via `CLEANSCOPE_FRAME_VALIDATION` env var (strict/moderate/minimal/off)
+- Logs warnings (rate-limited) but **never drops frames** - user sees everything
+
+**Validation checks by level:**
+| Level | Size Check | Stride Alignment | Row Similarity |
+|-------|-----------|------------------|----------------|
+| Strict | ±10% | Yes | Yes (threshold: 40) |
+| Moderate | ±10% | Yes | No |
+| Minimal | ±100% | No | No |
+| Off | No | No | No |
+
+**Key metrics:**
+- `avg_row_diff` > 40 → banding/corruption detected
+- `size_ratio` outside 0.9-1.1 → frame size issue
+- `stride_aligned` = false → padding mismatch
+
+**Code path:**
+```
+process_iso_packets() → drain frame → validate_yuy2_frame() → log if invalid → send frame
+```
+
 ## Common Pitfalls
 
 - Clearing frame buffer after drain() → interlacing
 - Strict header validation → rejected headers become pixel data
 - Ignoring stride_index in streaming code → UI button does nothing
 - Not setting buffer.width/height → frontend uses wrong dimensions
+- High validation warnings → check frame boundary detection, not conversion
