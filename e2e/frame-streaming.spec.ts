@@ -1,6 +1,11 @@
 import { test, expect, Page } from "@playwright/test";
 import * as path from "path";
 import * as fs from "fs";
+import { fileURLToPath } from "url";
+
+// ESM compatibility for __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
  * E2E tests for CleanScope frame streaming and display.
