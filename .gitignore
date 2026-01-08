@@ -48,6 +48,10 @@ npm-debug.log*
 # Test coverage
 coverage/
 
+# Playwright E2E test artifacts
+test-results/
+playwright-report/
+
 # Cache
 .cache/
 

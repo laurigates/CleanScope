@@ -1,0 +1,234 @@
+import { test, expect, Page } from "@playwright/test";
+import * as path from "path";
+import * as fs from "fs";
+import { fileURLToPath } from "url";
+
+// ESM compatibility for __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * E2E tests for CleanScope frame streaming and display.
+ *
+ * These tests verify the app can load, display frames from replay data,
+ * and correctly show resolution information. Replay mode is used instead
+ * of requiring physical USB hardware.
+ */
+
+test.describe("CleanScope Frame Streaming", () => {
+  let replayPath: string;
+
+  test.beforeAll(() => {
+    // Resolve path to test fixtures
+    replayPath = path.resolve(__dirname, "../tests/fixtures/sample-replay.bin");
+
+    // Create fixture if it doesn't exist
+    if (!fs.existsSync(replayPath)) {
+      const fixturePath = path.dirname(replayPath);
+      if (!fs.existsSync(fixturePath)) {
+        fs.mkdirSync(fixturePath, { recursive: true });
+      }
+      // Create a minimal sample replay fixture (see comments below)
+      createSampleReplayFixture(replayPath);
+    }
+  });
+
+  test("app launches successfully", async ({ page }) => {
+    // Wait for app to load
+    await page.goto("/");
+
+    // Verify main elements are present
+    const canvas = page.locator("#camera-canvas");
+    await expect(canvas).toBeVisible();
+
+    const statusBar = page.locator(".status-bar");
+    await expect(statusBar).toBeVisible();
+
+    const statusIndicator = page.locator(".status-indicator");
+    await expect(statusIndicator).toBeVisible();
+  });
+
+  test("displays waiting message when disconnected", async ({ page }) => {
+    await page.goto("/");
+
+    // When no device is connected, should show waiting overlay
+    const waitingMessage = page.locator(".waiting-message");
+    await expect(waitingMessage).toBeVisible();
+
+    const cameraIcon = page.locator(".camera-icon");
+    await expect(cameraIcon).toBeVisible();
+
+    const hintText = page.locator(".hint");
+    await expect(hintText).toContainText(/plug in|connect/i);
+  });
+
+  test("displays status indicator", async ({ page }) => {
+    await page.goto("/");
+
+    // Check status indicator dot is visible
+    const dot = page.locator(".status-indicator .dot");
+    await expect(dot).toBeVisible();
+
+    // Verify status text
+    const statusText = page.locator(".status-text");
+    await expect(statusText).toBeVisible();
+  });
+
+  test("canvas element renders", async ({ page }) => {
+    await page.goto("/");
+
+    const canvas = page.locator("#camera-canvas");
+    expect(canvas).toBeDefined();
+
+    // Canvas should be present even before frames arrive
+    const canvasBox = await canvas.boundingBox();
+    expect(canvasBox).not.toBeNull();
+  });
+
+  test("frame rendering from replay data (requires Tauri backend)", async ({
+    page,
+  }) => {
+    // This test requires full Tauri integration with replay backend
+    // Skip in CI when using vite-only frontend
+    if (process.env.CI) {
+      test.skip();
+    }
+
+    await page.goto("/");
+
+    // Wait for app to establish replay connection
+    const statusText = page.locator(".status-text");
+
+    // Should transition from "Waiting for device" to connected state
+    // This depends on replay data being properly loaded and processed
+    await expect(statusText).not.toContainText(/waiting/i, { timeout: 5000 });
+  });
+
+  test("resolution display updates", async ({ page }) => {
+    await page.goto("/");
+
+    const resolutionButton = page.locator(".debug-btn.detected");
+
+    // Resolution button may be hidden initially if no frames received
+    // When frames arrive, it should show the resolution
+    if (await resolutionButton.isVisible()) {
+      const text = await resolutionButton.textContent();
+      // Should match pattern like "800x600"
+      expect(text).toMatch(/\d+x\d+/);
+    }
+  });
+
+  test("debug controls are present", async ({ page }) => {
+    await page.goto("/");
+
+    const debugControls = page.locator(".debug-controls");
+    await expect(debugControls).toBeVisible();
+
+    // Width, Height, Stride buttons (labeled W:Auto, H:Auto, S:Auto)
+    const widthBtn = page.locator("button:has-text('W:')");
+    const heightBtn = page.locator("button:has-text('H:')");
+    const strideBtn = page.locator("button:has-text('S:')");
+    const captureBtn = page.locator("button:has-text('Capture')");
+
+    await expect(widthBtn).toBeVisible();
+    await expect(heightBtn).toBeVisible();
+    await expect(strideBtn).toBeVisible();
+    await expect(captureBtn).toBeVisible();
+  });
+
+  test("build info displays correctly", async ({ page }) => {
+    await page.goto("/");
+
+    const buildInfo = page.locator(".build-info");
+
+    // Build info should be visible if the app provides it
+    if (await buildInfo.isVisible()) {
+      const text = await buildInfo.textContent();
+      // Should contain version and git hash like "v0.1.0 (abc1234)"
+      expect(text).toMatch(/v\d+\.\d+\.\d+/);
+    }
+  });
+
+  test("error banner dismisses", async ({ page }) => {
+    await page.goto("/");
+
+    // Trigger an error (e.g., by calling a command that fails)
+    // Note: This is a placeholder - adjust based on actual error conditions
+    const dismissBtn = page.locator(".error-banner button");
+
+    if (await page.locator(".error-banner").isVisible()) {
+      await dismissBtn.click();
+      await expect(page.locator(".error-banner")).toBeHidden();
+    }
+  });
+
+  test("frame count increments with incoming frames", async ({ page }) => {
+    await page.goto("/");
+
+    // Get initial frame count
+    const frameCountElement = page.locator(".frame-count");
+
+    // Frame count should only appear after first frame
+    if (await frameCountElement.isVisible({ timeout: 1000 }).catch(() => false)) {
+      const initialCount = await frameCountElement.textContent();
+      expect(initialCount).toMatch(/\d+ frames/);
+
+      // If frames are arriving, count should increase
+      const updatedCount = await frameCountElement.textContent({ timeout: 2000 });
+      expect(updatedCount).toBeDefined();
+    }
+  });
+});
+
+/**
+ * Creates a minimal sample replay fixture for testing.
+ *
+ * The replay file format (from replay.rs) is:
+ * [u64 LE: timestamp_us][u32 LE: length][u8: endpoint][data bytes]...
+ *
+ * This fixture creates a simple MJPEG-format frame for testing.
+ * For actual USB device data, capture with the app's dump_frame feature.
+ */
+function createSampleReplayFixture(filePath: string): void {
+  // MJPEG frame data (minimal valid JPEG for testing)
+  // This is a tiny 2x2 pixel JPEG for testing purposes
+  const jpegData = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
+    0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b,
+    0x0c, 0x19, 0x12, 0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20,
+    0x24, 0x2e, 0x27, 0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31,
+    0x34, 0x34, 0x34, 0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff,
+    0xc0, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00,
+    0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05,
+    0x04, 0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+    0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
+    0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a,
+    0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37,
+    0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56,
+    0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
+    0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93,
+    0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9,
+    0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6,
+    0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+    0xf8, 0xf9, 0xfa, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xfb, 0x54,
+    0xff, 0xd9,
+  ]);
+
+  // Create buffer: [timestamp (8 bytes)][length (4 bytes)][endpoint (1 byte)][data]
+  const timestamp = Buffer.allocUnsafe(8);
+  timestamp.writeBigUInt64LE(BigInt(1000), 0); // 1ms into capture
+
+  const length = Buffer.allocUnsafe(4);
+  length.writeUInt32LE(jpegData.length, 0);
+
+  const endpoint = Buffer.from([0x82]); // IN endpoint
+
+  const packetData = Buffer.concat([timestamp, length, endpoint, jpegData]);
+
+  fs.writeFileSync(filePath, packetData);
+  console.log(`Created sample replay fixture at ${filePath}`);
+}

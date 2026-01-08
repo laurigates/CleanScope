@@ -59,9 +59,16 @@ libusb1-sys = { version = "0.7", features = ["vendored"] }
 # libc for raw pointer types used in libusb FFI
 libc = "0.2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "generate_mjpeg_fixture"
+path = "tests/fixtures/generate_mjpeg_fixture.rs"
 
 [lints.clippy]
 # Warn on common issues, allow pedantic for early development

@@ -2,7 +2,12 @@
 //!
 //! This module contains the core Tauri application logic and USB camera handling.
 
+mod capture;
+pub mod replay;
 mod usb;
+
+pub mod frame_assembler;
+pub mod test_utils;
 
 #[cfg(target_os = "android")]
 mod libusb_android;
@@ -118,6 +123,10 @@ pub struct AppState {
     pub height_index: Arc<Mutex<Option<usize>>>,
     /// Current stride option index (None = auto)
     pub stride_index: Arc<Mutex<Option<usize>>>,
+    /// Current offset option index
+    pub offset_index: Arc<Mutex<usize>>,
+    /// Packet capture state for debugging
+    pub capture_state: Arc<capture::CaptureState>,
     /// Flag to signal USB streaming should stop (for graceful shutdown)
     pub usb_stop_flag: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -604,6 +613,58 @@ fn get_video_format(state: State<'_, AppState>) -> String {
     }
 }
 
+/// Start capturing USB packets for debugging
+///
+/// Begins capturing raw USB packets during streaming. The packets are stored
+/// in memory until `stop_packet_capture` is called.
+#[tauri::command]
+fn start_packet_capture(state: State<'_, AppState>) -> Result<String, String> {
+    state.capture_state.start()?;
+    Ok("Packet capture started".to_string())
+}
+
+/// Stop capturing USB packets and save to files
+///
+/// Stops the capture, writes the captured packets to the app cache directory,
+/// and returns information about the captured data.
+#[tauri::command]
+fn stop_packet_capture(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<capture::CaptureResult, String> {
+    // Get status before stopping (for duration)
+    let status = state.capture_state.status();
+
+    // Stop capture and get packets
+    let packets = state.capture_state.stop();
+
+    if packets.is_empty() {
+        return Err("No packets captured".to_string());
+    }
+
+    // Get app cache directory
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Could not get cache dir: {}", e))?;
+
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("Could not create cache dir: {}", e))?;
+
+    // Write capture files
+    capture::write_capture_files(&cache_dir, &packets, status.duration_ms)
+}
+
+/// Get the current packet capture status
+///
+/// Returns information about whether capture is active and how many packets
+/// have been captured so far.
+#[tauri::command]
+fn get_capture_status(state: State<'_, AppState>) -> capture::CaptureStatus {
+    state.capture_state.status()
+}
+
 /// Get the current display settings for use in streaming
 #[allow(clippy::missing_panics_doc)]
 pub fn get_current_display_settings(state: &AppState) -> DisplaySettings {
@@ -671,6 +732,8 @@ pub fn run() {
     let width_index = Arc::new(Mutex::new(None));
     let height_index = Arc::new(Mutex::new(None));
     let stride_index = Arc::new(Mutex::new(None));
+    let offset_index = Arc::new(Mutex::new(0usize));
+    let capture_state = Arc::new(capture::CaptureState::new());
     let usb_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Clone Arcs for the setup closure (used in Android USB handler)
@@ -694,6 +757,8 @@ pub fn run() {
             width_index,
             height_index,
             stride_index,
+            offset_index,
+            capture_state,
             usb_stop_flag,
         })
         .invoke_handler(tauri::generate_handler![
@@ -708,6 +773,9 @@ pub fn run() {
             cycle_height,
             cycle_stride,
             get_display_settings,
+            start_packet_capture,
+            stop_packet_capture,
+            get_capture_status,
             toggle_skip_mjpeg,
             cycle_yuv_format,
             get_streaming_config,
