@@ -161,7 +161,7 @@ impl FrameAssembler {
 
         // Detect format from first substantial data
         if self.is_mjpeg.is_none() && self.frame_buffer.len() >= 2 {
-            let is_jpeg = self.frame_buffer[0] == 0xFF && self.frame_buffer[1] == 0xD8;
+            let is_jpeg = is_jpeg_data(&self.frame_buffer);
             self.is_mjpeg = Some(is_jpeg);
             if is_jpeg {
                 log::info!("Detected MJPEG format from JPEG SOI marker");
@@ -217,8 +217,7 @@ impl FrameAssembler {
     fn handle_mjpeg_fid_toggle(&mut self) -> ProcessResult {
         let frame_size = self.frame_buffer.len();
         if frame_size > 0 && self.synced {
-            let has_jpeg_marker =
-                frame_size >= 2 && self.frame_buffer[0] == 0xFF && self.frame_buffer[1] == 0xD8;
+            let has_jpeg_marker = is_jpeg_data(&self.frame_buffer);
             if has_jpeg_marker {
                 log::info!(
                     "Complete MJPEG frame: {} bytes (trigger: FID toggle)",
@@ -303,8 +302,7 @@ impl FrameAssembler {
         let frame_size = self.frame_buffer.len();
 
         // Check for JPEG SOI marker (0xFFD8)
-        let has_jpeg_marker =
-            frame_size >= 2 && self.frame_buffer[0] == 0xFF && self.frame_buffer[1] == 0xD8;
+        let has_jpeg_marker = is_jpeg_data(&self.frame_buffer);
 
         if has_jpeg_marker {
             log::info!("Complete MJPEG frame: {} bytes (trigger: EOF)", frame_size);
@@ -314,7 +312,7 @@ impl FrameAssembler {
 
         // Scan for SOI marker in case it's offset
         for j in 0..frame_size.saturating_sub(1).min(100) {
-            if self.frame_buffer[j] == 0xFF && self.frame_buffer[j + 1] == 0xD8 {
+            if is_jpeg_data(&self.frame_buffer[j..]) {
                 log::info!(
                     "Found JPEG SOI at offset {} in {} byte frame",
                     j,
@@ -360,6 +358,15 @@ pub fn validate_uvc_header(data: &[u8]) -> Option<usize> {
     }
 
     Some(header_len)
+}
+
+/// Check if data starts with JPEG SOI marker (0xFFD8)
+///
+/// JPEG images always begin with the Start Of Image marker: 0xFF 0xD8.
+/// This is used to distinguish MJPEG frames from uncompressed formats like YUY2.
+#[inline]
+pub fn is_jpeg_data(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8
 }
 
 /// Round a byte count to the nearest standard YUY2 frame size
@@ -489,6 +496,27 @@ mod tests {
         // This WILL be detected as a valid 8-byte header (EOH is set, length is valid)
         // This is expected behavior - callers must use context (format detection)
         assert_eq!(validate_uvc_header(&data), Some(8));
+    }
+
+    // =========================================================================
+    // JPEG Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_jpeg_data_valid() {
+        // Valid JPEG SOI marker
+        assert!(is_jpeg_data(&[0xFF, 0xD8]));
+        assert!(is_jpeg_data(&[0xFF, 0xD8, 0xFF, 0xE0])); // JPEG with JFIF marker
+    }
+
+    #[test]
+    fn test_is_jpeg_data_invalid() {
+        // Not JPEG
+        assert!(!is_jpeg_data(&[])); // Empty
+        assert!(!is_jpeg_data(&[0xFF])); // Too short
+        assert!(!is_jpeg_data(&[0xFF, 0xD9])); // EOI marker, not SOI
+        assert!(!is_jpeg_data(&[0x00, 0x00])); // YUY2 data
+        assert!(!is_jpeg_data(&[0x80, 0x80])); // Random data
     }
 
     // =========================================================================

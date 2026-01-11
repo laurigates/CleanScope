@@ -6,6 +6,7 @@ mod capture;
 mod frame_validation;
 pub mod replay;
 mod usb;
+pub mod yuv_conversion;
 
 pub mod frame_assembler;
 pub mod test_utils;
@@ -15,6 +16,7 @@ mod libusb_android;
 
 pub use frame_validation::ValidationLevel;
 
+use frame_assembler::is_jpeg_data;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -32,6 +34,8 @@ pub struct FrameBuffer {
     pub width: u32,
     /// Frame height in pixels
     pub height: u32,
+    /// Whether to capture raw frame data (disabled by default to save ~54MB/s at 30fps 720p)
+    pub capture_raw_frames: bool,
 }
 
 impl Default for FrameBuffer {
@@ -42,6 +46,7 @@ impl Default for FrameBuffer {
             timestamp: Instant::now(),
             width: 0,
             height: 0,
+            capture_raw_frames: false,
         }
     }
 }
@@ -55,6 +60,24 @@ pub struct DisplaySettings {
     pub height: Option<u32>,
     /// Stride override in bytes (None = width * 2 for YUY2)
     pub stride: Option<u32>,
+}
+
+/// Consolidated display configuration
+///
+/// Groups `DisplaySettings` with the index values used for cycling through
+/// predefined width/height/stride options. This reduces the number of separate
+/// `Arc<Mutex<>>` fields in `AppState` and ensures related display state is
+/// updated atomically.
+#[derive(Debug, Clone, Default)]
+pub struct DisplayConfig {
+    /// Current display settings (width, height, stride overrides)
+    pub settings: DisplaySettings,
+    /// Current width option index (None = auto)
+    pub width_index: Option<usize>,
+    /// Current height option index (None = auto)
+    pub height_index: Option<usize>,
+    /// Current stride option index (None = auto)
+    pub stride_index: Option<usize>,
 }
 
 /// Pixel format variants for video frames
@@ -129,23 +152,15 @@ pub const STRIDE_OPTIONS: &[f32] = &[
 pub struct AppState {
     /// Shared frame buffer protected by mutex
     pub frame_buffer: Arc<Mutex<FrameBuffer>>,
-    /// Display settings for resolution/stride overrides
-    pub display_settings: Arc<Mutex<DisplaySettings>>,
+    /// Consolidated display configuration (settings + cycling indexes)
+    pub display: Arc<Mutex<DisplayConfig>>,
     /// Streaming configuration (MJPEG skip, YUV format)
     pub streaming_config: Arc<Mutex<StreamingConfig>>,
-    /// Current width option index (None = auto)
-    pub width_index: Arc<Mutex<Option<usize>>>,
-    /// Current height option index (None = auto)
-    pub height_index: Arc<Mutex<Option<usize>>>,
-    /// Current stride option index (None = auto)
-    pub stride_index: Arc<Mutex<Option<usize>>>,
-    /// Current offset option index
-    pub offset_index: Arc<Mutex<usize>>,
     /// Packet capture state for debugging
     pub capture_state: Arc<capture::CaptureState>,
     /// Flag to signal USB streaming should stop (for graceful shutdown)
     pub usb_stop_flag: Arc<std::sync::atomic::AtomicBool>,
-    /// Frame validation level (cached from env var at startup)
+    /// Frame validation level (cached from env var at startup, immutable)
     pub validation_level: ValidationLevel,
 }
 
@@ -277,11 +292,12 @@ struct CapturedFrame {
 ///
 /// Saves both the processed frame (RGB/JPEG) and the raw frame (YUY2) if available.
 /// Returns information about the captured frames including file paths.
+/// Automatically disables raw frame capture after dumping to save memory bandwidth.
 #[tauri::command]
 fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<CapturedFrame, String> {
     use std::io::Write;
 
-    let buffer = state
+    let mut buffer = state
         .frame_buffer
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -314,33 +330,31 @@ fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Captu
         &buffer.frame
     };
 
-    let (format_hint, raw_extension) =
-        if analysis_data.len() >= 2 && analysis_data[0] == 0xFF && analysis_data[1] == 0xD8 {
-            ("MJPEG (JPEG SOI marker)", "jpg")
+    let (format_hint, raw_extension) = if is_jpeg_data(analysis_data) {
+        ("MJPEG (JPEG SOI marker)", "jpg")
+    } else {
+        // Check if it looks like YUY2 (alternating Y/U/Y/V pattern)
+        // YUY2 typically has Y values (0-255) with U/V around 128 for gray
+        let possible_yuy2 = analysis_data.len() >= 4
+            && analysis_data
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .take(100)
+                .all(|&b| b > 100 && b < 156);
+        if possible_yuy2 {
+            ("YUY2/YUYV (UV values near 128)", "yuy2")
         } else {
-            // Check if it looks like YUY2 (alternating Y/U/Y/V pattern)
-            // YUY2 typically has Y values (0-255) with U/V around 128 for gray
-            let possible_yuy2 = analysis_data.len() >= 4
-                && analysis_data
-                    .iter()
-                    .skip(1)
-                    .step_by(2)
-                    .take(100)
-                    .all(|&b| b > 100 && b < 156);
-            if possible_yuy2 {
-                ("YUY2/YUYV (UV values near 128)", "yuy2")
-            } else {
-                ("Raw video data", "raw")
-            }
-        };
+            ("Raw video data", "raw")
+        }
+    };
 
     // Save processed frame (RGB or JPEG)
-    let processed_ext =
-        if buffer.frame.len() >= 2 && buffer.frame[0] == 0xFF && buffer.frame[1] == 0xD8 {
-            "jpg"
-        } else {
-            "rgb"
-        };
+    let processed_ext = if is_jpeg_data(&buffer.frame) {
+        "jpg"
+    } else {
+        "rgb"
+    };
     let processed_filename = format!(
         "frame_{}_{}x{}.{}",
         timestamp, buffer.width, buffer.height, processed_ext
@@ -394,15 +408,26 @@ fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Captu
 
     log::info!("Header: {}", header_hex);
 
+    // Capture values before clearing
+    let frame_size = buffer.frame.len();
+    let raw_size = buffer.raw_frame.len();
+    let width = buffer.width;
+    let height = buffer.height;
+
+    // Disable raw capture and clear raw frame buffer to save memory
+    buffer.capture_raw_frames = false;
+    buffer.raw_frame.clear();
+    log::info!("Raw frame capture disabled after dump");
+
     Ok(CapturedFrame {
         path: processed_filepath.to_string_lossy().to_string(),
         raw_path,
-        size: buffer.frame.len(),
-        raw_size: buffer.raw_frame.len(),
+        size: frame_size,
+        raw_size,
         header_hex,
         format_hint: format_hint.to_string(),
-        width: buffer.width,
-        height: buffer.height,
+        width,
+        height,
     })
 }
 
@@ -419,7 +444,7 @@ fn get_frame_info(state: State<'_, AppState>) -> Result<FrameInfo, String> {
     }
 
     // Detect format based on JPEG signature
-    let format = if buffer.frame.len() >= 2 && buffer.frame[0] == 0xFF && buffer.frame[1] == 0xD8 {
+    let format = if is_jpeg_data(&buffer.frame) {
         "jpeg".to_string()
     } else {
         "rgb".to_string()
@@ -432,105 +457,141 @@ fn get_frame_info(state: State<'_, AppState>) -> Result<FrameInfo, String> {
     })
 }
 
-/// Cycle through width options
-#[tauri::command]
-fn cycle_width(state: State<'_, AppState>) -> String {
-    let mut index = state.width_index.lock().unwrap();
-    let mut settings = state.display_settings.lock().unwrap();
-
-    // Cycle: None -> 0 -> 1 -> ... -> N-1 -> None
-    let new_index = match *index {
+/// Cycle through options: None -> 0 -> 1 -> ... -> N-1 -> None
+fn cycle_index(current: &mut Option<usize>, max_len: usize) -> Option<usize> {
+    let new_index = match *current {
         None => Some(0),
-        Some(i) if i + 1 < WIDTH_OPTIONS.len() => Some(i + 1),
+        Some(i) if i + 1 < max_len => Some(i + 1),
         Some(_) => None,
     };
+    *current = new_index;
+    new_index
+}
 
-    *index = new_index;
-    settings.width = new_index.map(|i| WIDTH_OPTIONS[i]);
+/// Cycle through width options
+#[tauri::command]
+fn cycle_width(state: State<'_, AppState>) -> Result<String, String> {
+    let mut display = state
+        .display
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
-    match new_index {
+    let new_index = cycle_index(&mut display.width_index, WIDTH_OPTIONS.len());
+    display.settings.width = new_index.map(|i| WIDTH_OPTIONS[i]);
+
+    Ok(match new_index {
         None => "W:Auto".to_string(),
         Some(i) => format!("W:{}", WIDTH_OPTIONS[i]),
-    }
+    })
 }
 
 /// Cycle through height options
 #[tauri::command]
-fn cycle_height(state: State<'_, AppState>) -> String {
-    let mut index = state.height_index.lock().unwrap();
-    let mut settings = state.display_settings.lock().unwrap();
+fn cycle_height(state: State<'_, AppState>) -> Result<String, String> {
+    let mut display = state
+        .display
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
-    let new_index = match *index {
-        None => Some(0),
-        Some(i) if i + 1 < HEIGHT_OPTIONS.len() => Some(i + 1),
-        Some(_) => None,
-    };
+    let new_index = cycle_index(&mut display.height_index, HEIGHT_OPTIONS.len());
+    display.settings.height = new_index.map(|i| HEIGHT_OPTIONS[i]);
 
-    *index = new_index;
-    settings.height = new_index.map(|i| HEIGHT_OPTIONS[i]);
-
-    match new_index {
+    Ok(match new_index {
         None => "H:Auto".to_string(),
         Some(i) => format!("H:{}", HEIGHT_OPTIONS[i]),
-    }
+    })
 }
 
 /// Cycle through stride options
 #[tauri::command]
-fn cycle_stride(state: State<'_, AppState>) -> String {
-    let mut index = state.stride_index.lock().unwrap();
+fn cycle_stride(state: State<'_, AppState>) -> Result<String, String> {
+    let mut display = state
+        .display
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
-    let new_index = match *index {
-        None => Some(0),
-        Some(i) if i + 1 < STRIDE_OPTIONS.len() => Some(i + 1),
-        Some(_) => None,
-    };
+    let new_index = cycle_index(&mut display.stride_index, STRIDE_OPTIONS.len());
 
-    *index = new_index;
-
-    match new_index {
+    Ok(match new_index {
         None => "S:Auto".to_string(),
         Some(i) => format!("S:x{:.3}", STRIDE_OPTIONS[i]),
-    }
+    })
 }
 
 /// Get current display settings as a summary string
 #[tauri::command]
-fn get_display_settings(state: State<'_, AppState>) -> String {
-    let settings = state.display_settings.lock().unwrap();
-    let w = settings
+fn get_display_settings(state: State<'_, AppState>) -> Result<String, String> {
+    let display = state
+        .display
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    let w = display
+        .settings
         .width
         .map(|v| v.to_string())
         .unwrap_or_else(|| "Auto".to_string());
-    let h = settings
+    let h = display
+        .settings
         .height
         .map(|v| v.to_string())
         .unwrap_or_else(|| "Auto".to_string());
-    let s = settings
+    let s = display
+        .settings
         .stride
         .map(|v| v.to_string())
         .unwrap_or_else(|| "Auto".to_string());
-    format!("{}x{} stride:{}", w, h, s)
+    Ok(format!("{}x{} stride:{}", w, h, s))
 }
 
 /// Toggle MJPEG detection skip
 /// When enabled, skips MJPEG format probing and goes straight to YUV streaming
 #[tauri::command]
-fn toggle_skip_mjpeg(state: State<'_, AppState>) -> String {
-    let mut config = state.streaming_config.lock().unwrap();
+fn toggle_skip_mjpeg(state: State<'_, AppState>) -> Result<String, String> {
+    let mut config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
     config.skip_mjpeg_detection = !config.skip_mjpeg_detection;
     log::info!("MJPEG skip: {}", config.skip_mjpeg_detection);
-    if config.skip_mjpeg_detection {
+    Ok(if config.skip_mjpeg_detection {
         "MJPEG:Skip".to_string()
     } else {
         "MJPEG:Try".to_string()
-    }
+    })
+}
+
+/// Enable raw frame capture for one frame
+/// This enables capturing the next raw frame data for debugging/analysis.
+/// After the frame is captured, call `dump_frame` to save it.
+/// Automatically disables after `dump_frame` is called.
+#[tauri::command]
+fn enable_raw_capture(state: State<'_, AppState>) -> Result<String, String> {
+    let mut buffer = state
+        .frame_buffer
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    buffer.capture_raw_frames = true;
+    log::info!("Raw frame capture enabled");
+    Ok("Raw capture enabled".to_string())
+}
+
+/// Check if raw frame capture is enabled
+#[tauri::command]
+fn is_raw_capture_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    let buffer = state
+        .frame_buffer
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    Ok(buffer.capture_raw_frames)
 }
 
 /// Cycle through pixel format options (YUYV / UYVY / NV12 / I420 / RGB888 / BGR888)
 #[tauri::command]
-fn cycle_pixel_format(state: State<'_, AppState>) -> String {
-    let mut config = state.streaming_config.lock().unwrap();
+fn cycle_pixel_format(state: State<'_, AppState>) -> Result<String, String> {
+    let mut config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
     config.pixel_format = match config.pixel_format {
         PixelFormat::Yuyv => PixelFormat::Uyvy,
         PixelFormat::Uyvy => PixelFormat::Nv12,
@@ -540,7 +601,7 @@ fn cycle_pixel_format(state: State<'_, AppState>) -> String {
         PixelFormat::Bgr888 => PixelFormat::Yuyv,
     };
     log::info!("Pixel format: {:?}", config.pixel_format);
-    format_pixel_display(&config.pixel_format)
+    Ok(format_pixel_display(&config.pixel_format))
 }
 
 /// Format pixel format for display
@@ -557,26 +618,32 @@ fn format_pixel_display(format: &PixelFormat) -> String {
 
 /// Get current streaming configuration
 #[tauri::command]
-fn get_streaming_config(state: State<'_, AppState>) -> (String, String) {
-    let config = state.streaming_config.lock().unwrap();
+fn get_streaming_config(state: State<'_, AppState>) -> Result<(String, String), String> {
+    let config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
     let mjpeg = if config.skip_mjpeg_detection {
         "MJPEG:Skip".to_string()
     } else {
         "MJPEG:Try".to_string()
     };
     let pixel = format_pixel_display(&config.pixel_format);
-    (mjpeg, pixel)
+    Ok((mjpeg, pixel))
 }
 
 /// Cycle through available video formats
 /// Returns the new format setting as a display string
 #[tauri::command]
-fn cycle_video_format(state: State<'_, AppState>) -> String {
-    let mut config = state.streaming_config.lock().unwrap();
+fn cycle_video_format(state: State<'_, AppState>) -> Result<String, String> {
+    let mut config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
     if config.available_formats.is_empty() {
         // No formats discovered yet
-        return "FMT:Auto".to_string();
+        return Ok("FMT:Auto".to_string());
     }
 
     // Cycle: None (Auto) -> format 0 -> format 1 -> ... -> None (Auto)
@@ -613,22 +680,28 @@ fn cycle_video_format(state: State<'_, AppState>) -> String {
         config.selected_format_index,
         result
     );
-    result
+    Ok(result)
 }
 
 /// Get available video formats discovered from camera
 #[tauri::command]
-fn get_available_formats(state: State<'_, AppState>) -> Vec<DiscoveredFormat> {
-    let config = state.streaming_config.lock().unwrap();
-    config.available_formats.clone()
+fn get_available_formats(state: State<'_, AppState>) -> Result<Vec<DiscoveredFormat>, String> {
+    let config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    Ok(config.available_formats.clone())
 }
 
 /// Get current video format setting
 #[tauri::command]
-fn get_video_format(state: State<'_, AppState>) -> String {
-    let config = state.streaming_config.lock().unwrap();
+fn get_video_format(state: State<'_, AppState>) -> Result<String, String> {
+    let config = state
+        .streaming_config
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
-    match config.selected_format_index {
+    Ok(match config.selected_format_index {
         None => "FMT:Auto".to_string(),
         Some(idx) => {
             // Find format info
@@ -638,7 +711,7 @@ fn get_video_format(state: State<'_, AppState>) -> String {
                 format!("FMT:{}", idx)
             }
         }
-    }
+    })
 }
 
 /// Start capturing USB packets for debugging
@@ -694,26 +767,33 @@ fn get_capture_status(state: State<'_, AppState>) -> capture::CaptureStatus {
 }
 
 /// Get the current display settings for use in streaming
-#[allow(clippy::missing_panics_doc)]
-pub fn get_current_display_settings(state: &AppState) -> DisplaySettings {
-    let settings = state.display_settings.lock().unwrap();
-    let stride_index = state.stride_index.lock().unwrap();
-    let _width_index = state.width_index.lock().unwrap();
+///
+/// Computes the effective `DisplaySettings` from the consolidated `DisplayConfig`,
+/// applying stride multiplier if a stride index is set.
+///
+/// # Errors
+///
+/// Returns an error if the mutex lock is poisoned.
+pub fn get_current_display_settings(state: &AppState) -> Result<DisplaySettings, String> {
+    let display = state
+        .display
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
 
     // Calculate stride if stride multiplier is set
-    let stride = if let Some(si) = *stride_index {
+    let stride = if let Some(si) = display.stride_index {
         let multiplier = STRIDE_OPTIONS[si];
-        let width = settings.width.unwrap_or(1280);
+        let width = display.settings.width.unwrap_or(1280);
         Some((width as f32 * multiplier) as u32)
     } else {
-        settings.stride
+        display.settings.stride
     };
 
-    DisplaySettings {
-        width: settings.width,
-        height: settings.height,
+    Ok(DisplaySettings {
+        width: display.settings.width,
+        height: display.settings.height,
         stride,
-    }
+    })
 }
 
 /// Emit a USB device event to the frontend
@@ -755,12 +835,8 @@ pub fn run() {
 
     // Create shared state for camera frames and display settings
     let frame_buffer = Arc::new(Mutex::new(FrameBuffer::default()));
-    let display_settings = Arc::new(Mutex::new(DisplaySettings::default()));
+    let display = Arc::new(Mutex::new(DisplayConfig::default()));
     let streaming_config = Arc::new(Mutex::new(StreamingConfig::default()));
-    let width_index = Arc::new(Mutex::new(None));
-    let height_index = Arc::new(Mutex::new(None));
-    let stride_index = Arc::new(Mutex::new(None));
-    let offset_index = Arc::new(Mutex::new(0usize));
     let capture_state = Arc::new(capture::CaptureState::new());
     let usb_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -772,13 +848,9 @@ pub fn run() {
 
     // Clone Arcs for the setup closure (used in Android USB handler)
     #[allow(unused_variables)]
-    let display_settings_clone = Arc::clone(&display_settings);
+    let display_clone = Arc::clone(&display);
     #[allow(unused_variables)]
     let streaming_config_clone = Arc::clone(&streaming_config);
-    #[allow(unused_variables)]
-    let width_index_clone = Arc::clone(&width_index);
-    #[allow(unused_variables)]
-    let stride_index_clone = Arc::clone(&stride_index);
     #[allow(unused_variables)]
     let usb_stop_flag_clone = Arc::clone(&usb_stop_flag);
 
@@ -786,12 +858,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             frame_buffer: Arc::clone(&frame_buffer),
-            display_settings,
+            display,
             streaming_config,
-            width_index,
-            height_index,
-            stride_index,
-            offset_index,
             capture_state,
             usb_stop_flag,
             validation_level,
@@ -812,6 +880,8 @@ pub fn run() {
             stop_packet_capture,
             get_capture_status,
             toggle_skip_mjpeg,
+            enable_raw_capture,
+            is_raw_capture_enabled,
             cycle_pixel_format,
             get_streaming_config,
             cycle_video_format,
@@ -824,24 +894,16 @@ pub fn run() {
             // On Android, we'll initialize the USB handling here
             #[cfg(target_os = "android")]
             {
-                let app_handle = _app.handle().clone();
-                let frame_buffer_clone = Arc::clone(&frame_buffer);
-                let display_settings_usb = Arc::clone(&display_settings_clone);
-                let streaming_config_usb = Arc::clone(&streaming_config_clone);
-                let width_index_usb = Arc::clone(&width_index_clone);
-                let stride_index_usb = Arc::clone(&stride_index_clone);
-                let usb_stop_flag_usb = Arc::clone(&usb_stop_flag_clone);
+                let ctx = usb::StreamingContext {
+                    app_handle: _app.handle().clone(),
+                    frame_buffer: Arc::clone(&frame_buffer),
+                    display: Arc::clone(&display_clone),
+                    streaming_config: Arc::clone(&streaming_config_clone),
+                    stop_flag: Arc::clone(&usb_stop_flag_clone),
+                    validation_level,
+                };
                 std::thread::spawn(move || {
-                    usb::init_usb_handler(
-                        app_handle,
-                        frame_buffer_clone,
-                        display_settings_usb,
-                        streaming_config_usb,
-                        width_index_usb,
-                        stride_index_usb,
-                        usb_stop_flag_usb,
-                        validation_level,
-                    );
+                    usb::init_usb_handler(ctx);
                 });
             }
 
@@ -849,4 +911,574 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    /// Create a test `AppState` for unit testing
+    fn create_test_state() -> AppState {
+        AppState {
+            frame_buffer: Arc::new(Mutex::new(FrameBuffer::default())),
+            display: Arc::new(Mutex::new(DisplayConfig::default())),
+            streaming_config: Arc::new(Mutex::new(StreamingConfig::default())),
+            capture_state: Arc::new(capture::CaptureState::new()),
+            usb_stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_level: ValidationLevel::default(),
+        }
+    }
+
+    // ========================================================================
+    // Tests for pure helper functions
+    // ========================================================================
+
+    #[test]
+    fn test_cycle_index_starts_at_zero() {
+        let mut index = None;
+        let result = cycle_index(&mut index, 5);
+        assert_eq!(result, Some(0));
+        assert_eq!(index, Some(0));
+    }
+
+    #[test]
+    fn test_cycle_index_increments() {
+        let mut index = Some(0);
+        let result = cycle_index(&mut index, 5);
+        assert_eq!(result, Some(1));
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn test_cycle_index_wraps_to_none() {
+        let mut index = Some(4); // Last valid index for len=5
+        let result = cycle_index(&mut index, 5);
+        assert_eq!(result, None);
+        assert_eq!(index, None);
+    }
+
+    #[test]
+    fn test_cycle_index_full_cycle() {
+        let mut index = None;
+        let max_len = 3;
+
+        // None -> 0 -> 1 -> 2 -> None
+        assert_eq!(cycle_index(&mut index, max_len), Some(0));
+        assert_eq!(cycle_index(&mut index, max_len), Some(1));
+        assert_eq!(cycle_index(&mut index, max_len), Some(2));
+        assert_eq!(cycle_index(&mut index, max_len), None);
+        // Should wrap back to 0
+        assert_eq!(cycle_index(&mut index, max_len), Some(0));
+    }
+
+    #[test]
+    fn test_format_pixel_display_all_formats() {
+        assert_eq!(format_pixel_display(&PixelFormat::Yuyv), "FMT:YUYV");
+        assert_eq!(format_pixel_display(&PixelFormat::Uyvy), "FMT:UYVY");
+        assert_eq!(format_pixel_display(&PixelFormat::Nv12), "FMT:NV12");
+        assert_eq!(format_pixel_display(&PixelFormat::I420), "FMT:I420");
+        assert_eq!(format_pixel_display(&PixelFormat::Rgb888), "FMT:RGB24");
+        assert_eq!(format_pixel_display(&PixelFormat::Bgr888), "FMT:BGR24");
+    }
+
+    // ========================================================================
+    // Tests for display cycling commands (testing state transitions)
+    // ========================================================================
+
+    /// Helper to simulate `cycle_width` command logic on test state
+    fn test_cycle_width(state: &AppState) -> Result<String, String> {
+        let mut display = state
+            .display
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+        let new_index = cycle_index(&mut display.width_index, WIDTH_OPTIONS.len());
+        display.settings.width = new_index.map(|i| WIDTH_OPTIONS[i]);
+
+        Ok(match new_index {
+            None => "W:Auto".to_string(),
+            Some(i) => format!("W:{}", WIDTH_OPTIONS[i]),
+        })
+    }
+
+    /// Helper to simulate `cycle_height` command logic on test state
+    fn test_cycle_height(state: &AppState) -> Result<String, String> {
+        let mut display = state
+            .display
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+        let new_index = cycle_index(&mut display.height_index, HEIGHT_OPTIONS.len());
+        display.settings.height = new_index.map(|i| HEIGHT_OPTIONS[i]);
+
+        Ok(match new_index {
+            None => "H:Auto".to_string(),
+            Some(i) => format!("H:{}", HEIGHT_OPTIONS[i]),
+        })
+    }
+
+    /// Helper to simulate `cycle_stride` command logic on test state
+    fn test_cycle_stride(state: &AppState) -> Result<String, String> {
+        let mut display = state
+            .display
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+        let new_index = cycle_index(&mut display.stride_index, STRIDE_OPTIONS.len());
+
+        Ok(match new_index {
+            None => "S:Auto".to_string(),
+            Some(i) => format!("S:x{:.3}", STRIDE_OPTIONS[i]),
+        })
+    }
+
+    #[test]
+    fn test_cycle_width_starts_with_first_option() {
+        let state = create_test_state();
+        let result = test_cycle_width(&state).unwrap();
+        // First option is 1280
+        assert_eq!(result, "W:1280");
+    }
+
+    #[test]
+    fn test_cycle_width_cycles_through_all_options() {
+        let state = create_test_state();
+
+        // Collect all results through one full cycle
+        let mut results = Vec::new();
+        for _ in 0..=WIDTH_OPTIONS.len() {
+            results.push(test_cycle_width(&state).unwrap());
+        }
+
+        // First should be W:1280 (first option)
+        assert_eq!(results[0], "W:1280");
+
+        // Last in the array should be W:Auto (wraps back)
+        assert_eq!(results[WIDTH_OPTIONS.len()], "W:Auto");
+
+        // Verify all WIDTH_OPTIONS appear
+        for (i, &width) in WIDTH_OPTIONS.iter().enumerate() {
+            assert_eq!(results[i], format!("W:{}", width));
+        }
+    }
+
+    #[test]
+    fn test_cycle_width_updates_display_settings() {
+        let state = create_test_state();
+
+        // Initially should be None (Auto)
+        {
+            let display = state.display.lock().unwrap();
+            assert_eq!(display.settings.width, None);
+        }
+
+        // After first cycle, should be first option
+        test_cycle_width(&state).unwrap();
+        {
+            let display = state.display.lock().unwrap();
+            assert_eq!(display.settings.width, Some(WIDTH_OPTIONS[0]));
+        }
+    }
+
+    #[test]
+    fn test_cycle_height_starts_with_first_option() {
+        let state = create_test_state();
+        let result = test_cycle_height(&state).unwrap();
+        // First option is 720
+        assert_eq!(result, "H:720");
+    }
+
+    #[test]
+    fn test_cycle_height_cycles_through_all_options() {
+        let state = create_test_state();
+
+        // Cycle through all options plus one to get back to Auto
+        for _ in 0..HEIGHT_OPTIONS.len() {
+            test_cycle_height(&state).unwrap();
+        }
+
+        // Next call should return Auto
+        let result = test_cycle_height(&state).unwrap();
+        assert_eq!(result, "H:Auto");
+    }
+
+    #[test]
+    fn test_cycle_stride_starts_with_first_option() {
+        let state = create_test_state();
+        let result = test_cycle_stride(&state).unwrap();
+        // First option is 2.0
+        assert_eq!(result, "S:x2.000");
+    }
+
+    #[test]
+    fn test_cycle_stride_cycles_through_all_options() {
+        let state = create_test_state();
+
+        // Collect all results
+        let mut results = Vec::new();
+        for _ in 0..=STRIDE_OPTIONS.len() {
+            results.push(test_cycle_stride(&state).unwrap());
+        }
+
+        // Verify format matches expected pattern (S:x{multiplier})
+        assert!(results[0].starts_with("S:x"));
+        assert_eq!(results[STRIDE_OPTIONS.len()], "S:Auto");
+    }
+
+    // ========================================================================
+    // Tests for streaming config commands
+    // ========================================================================
+
+    /// Helper to simulate `toggle_skip_mjpeg` command logic on test state
+    fn test_toggle_skip_mjpeg(state: &AppState) -> Result<String, String> {
+        let mut config = state
+            .streaming_config
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        config.skip_mjpeg_detection = !config.skip_mjpeg_detection;
+        Ok(if config.skip_mjpeg_detection {
+            "MJPEG:Skip".to_string()
+        } else {
+            "MJPEG:Try".to_string()
+        })
+    }
+
+    /// Helper to simulate `cycle_pixel_format` command logic on test state
+    fn test_cycle_pixel_format(state: &AppState) -> Result<String, String> {
+        let mut config = state
+            .streaming_config
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        config.pixel_format = match config.pixel_format {
+            PixelFormat::Yuyv => PixelFormat::Uyvy,
+            PixelFormat::Uyvy => PixelFormat::Nv12,
+            PixelFormat::Nv12 => PixelFormat::I420,
+            PixelFormat::I420 => PixelFormat::Rgb888,
+            PixelFormat::Rgb888 => PixelFormat::Bgr888,
+            PixelFormat::Bgr888 => PixelFormat::Yuyv,
+        };
+        Ok(format_pixel_display(&config.pixel_format))
+    }
+
+    #[test]
+    fn test_toggle_skip_mjpeg_toggles_state() {
+        let state = create_test_state();
+
+        // Initially false, first toggle should make it true (Skip)
+        let first = test_toggle_skip_mjpeg(&state).unwrap();
+        assert_eq!(first, "MJPEG:Skip");
+
+        // Toggle again should make it false (Try)
+        let second = test_toggle_skip_mjpeg(&state).unwrap();
+        assert_eq!(second, "MJPEG:Try");
+
+        // Verify they are different
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_toggle_skip_mjpeg_updates_config() {
+        let state = create_test_state();
+
+        // Initially false
+        {
+            let config = state.streaming_config.lock().unwrap();
+            assert!(!config.skip_mjpeg_detection);
+        }
+
+        // After toggle, should be true
+        test_toggle_skip_mjpeg(&state).unwrap();
+        {
+            let config = state.streaming_config.lock().unwrap();
+            assert!(config.skip_mjpeg_detection);
+        }
+    }
+
+    #[test]
+    fn test_cycle_pixel_format_cycles_through_all_formats() {
+        let state = create_test_state();
+
+        // Default is YUYV, so first cycle goes to UYVY
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            results.push(test_cycle_pixel_format(&state).unwrap());
+        }
+
+        // Should cycle through all 6 formats
+        assert_eq!(results[0], "FMT:UYVY"); // YUYV -> UYVY
+        assert_eq!(results[1], "FMT:NV12"); // UYVY -> NV12
+        assert_eq!(results[2], "FMT:I420"); // NV12 -> I420
+        assert_eq!(results[3], "FMT:RGB24"); // I420 -> RGB888
+        assert_eq!(results[4], "FMT:BGR24"); // RGB888 -> BGR888
+        assert_eq!(results[5], "FMT:YUYV"); // BGR888 -> YUYV (wraps)
+    }
+
+    #[test]
+    fn test_cycle_pixel_format_all_unique_in_cycle() {
+        let state = create_test_state();
+
+        let formats: Vec<String> = (0..6)
+            .map(|_| test_cycle_pixel_format(&state).unwrap())
+            .collect();
+
+        // All 6 should be different (cycling through 6 formats)
+        let unique: std::collections::HashSet<_> = formats.iter().collect();
+        assert_eq!(unique.len(), 6);
+    }
+
+    // ========================================================================
+    // Tests for frame info retrieval
+    // ========================================================================
+
+    /// Helper to simulate `get_frame_info` command logic on test state
+    fn test_get_frame_info(state: &AppState) -> Result<FrameInfo, String> {
+        let buffer = state
+            .frame_buffer
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+
+        if buffer.frame.is_empty() {
+            return Err("No frame available".to_string());
+        }
+
+        let format = if is_jpeg_data(&buffer.frame) {
+            "jpeg".to_string()
+        } else {
+            "rgb".to_string()
+        };
+
+        Ok(FrameInfo {
+            width: buffer.width,
+            height: buffer.height,
+            format,
+        })
+    }
+
+    #[test]
+    fn test_get_frame_info_returns_error_when_empty() {
+        let state = create_test_state();
+        let result = test_get_frame_info(&state);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "No frame available");
+    }
+
+    #[test]
+    fn test_get_frame_info_returns_rgb_metadata() {
+        let state = create_test_state();
+
+        // Set up RGB frame data (not JPEG - no 0xFFD8 marker)
+        {
+            let mut buffer = state.frame_buffer.lock().unwrap();
+            buffer.width = 640;
+            buffer.height = 480;
+            buffer.frame = vec![0u8; 640 * 480 * 3]; // RGB24 data
+        }
+
+        let info = test_get_frame_info(&state).unwrap();
+        assert_eq!(info.width, 640);
+        assert_eq!(info.height, 480);
+        assert_eq!(info.format, "rgb");
+    }
+
+    #[test]
+    fn test_get_frame_info_detects_jpeg_format() {
+        let state = create_test_state();
+
+        // Set up JPEG frame data with SOI marker (0xFFD8)
+        {
+            let mut buffer = state.frame_buffer.lock().unwrap();
+            buffer.width = 1280;
+            buffer.height = 720;
+            // Minimal JPEG header: SOI marker + some data
+            buffer.frame = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        }
+
+        let info = test_get_frame_info(&state).unwrap();
+        assert_eq!(info.width, 1280);
+        assert_eq!(info.height, 720);
+        assert_eq!(info.format, "jpeg");
+    }
+
+    // ========================================================================
+    // Tests for get_current_display_settings (public helper function)
+    // ========================================================================
+
+    #[test]
+    fn test_get_current_display_settings_default() {
+        let state = create_test_state();
+        let settings = get_current_display_settings(&state).unwrap();
+
+        // All should be None/Auto by default
+        assert_eq!(settings.width, None);
+        assert_eq!(settings.height, None);
+        assert_eq!(settings.stride, None);
+    }
+
+    #[test]
+    fn test_get_current_display_settings_with_width() {
+        let state = create_test_state();
+
+        // Set width via cycling
+        test_cycle_width(&state).unwrap();
+
+        let settings = get_current_display_settings(&state).unwrap();
+        assert_eq!(settings.width, Some(WIDTH_OPTIONS[0]));
+    }
+
+    #[test]
+    fn test_get_current_display_settings_stride_calculation() {
+        let state = create_test_state();
+
+        // Set width first (needed for stride calculation)
+        test_cycle_width(&state).unwrap(); // width = 1280
+
+        // Set stride multiplier
+        test_cycle_stride(&state).unwrap(); // stride = x2.0
+
+        let settings = get_current_display_settings(&state).unwrap();
+        // Stride should be width * 2.0 = 1280 * 2.0 = 2560
+        assert_eq!(settings.stride, Some(2560));
+    }
+
+    #[test]
+    fn test_get_current_display_settings_stride_uses_default_width() {
+        let state = create_test_state();
+
+        // Set stride multiplier without setting width explicitly
+        test_cycle_stride(&state).unwrap(); // stride = x2.0
+
+        let settings = get_current_display_settings(&state).unwrap();
+        // Should use default width 1280: 1280 * 2.0 = 2560
+        assert_eq!(settings.stride, Some(2560));
+    }
+
+    // ========================================================================
+    // Tests for streaming config retrieval
+    // ========================================================================
+
+    /// Helper to simulate `get_streaming_config` command logic on test state
+    fn test_get_streaming_config(state: &AppState) -> Result<(String, String), String> {
+        let config = state
+            .streaming_config
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        let mjpeg = if config.skip_mjpeg_detection {
+            "MJPEG:Skip".to_string()
+        } else {
+            "MJPEG:Try".to_string()
+        };
+        let pixel = format_pixel_display(&config.pixel_format);
+        Ok((mjpeg, pixel))
+    }
+
+    #[test]
+    fn test_get_streaming_config_default() {
+        let state = create_test_state();
+        let (mjpeg, pixel) = test_get_streaming_config(&state).unwrap();
+
+        // Default: try MJPEG detection, YUYV format
+        assert_eq!(mjpeg, "MJPEG:Try");
+        assert_eq!(pixel, "FMT:YUYV");
+    }
+
+    #[test]
+    fn test_get_streaming_config_after_changes() {
+        let state = create_test_state();
+
+        // Toggle MJPEG and cycle format
+        test_toggle_skip_mjpeg(&state).unwrap();
+        test_cycle_pixel_format(&state).unwrap();
+
+        let (mjpeg, pixel) = test_get_streaming_config(&state).unwrap();
+        assert_eq!(mjpeg, "MJPEG:Skip");
+        assert_eq!(pixel, "FMT:UYVY");
+    }
+
+    // ========================================================================
+    // Tests for display settings retrieval
+    // ========================================================================
+
+    /// Helper to simulate `get_display_settings` command logic on test state
+    fn test_get_display_settings(state: &AppState) -> Result<String, String> {
+        let display = state
+            .display
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        let w = display
+            .settings
+            .width
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "Auto".to_string());
+        let h = display
+            .settings
+            .height
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "Auto".to_string());
+        let s = display
+            .settings
+            .stride
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "Auto".to_string());
+        Ok(format!("{}x{} stride:{}", w, h, s))
+    }
+
+    #[test]
+    fn test_get_display_settings_default() {
+        let state = create_test_state();
+        let result = test_get_display_settings(&state).unwrap();
+        assert_eq!(result, "AutoxAuto stride:Auto");
+    }
+
+    #[test]
+    fn test_get_display_settings_after_cycling() {
+        let state = create_test_state();
+
+        // Set width and height
+        test_cycle_width(&state).unwrap(); // 1280
+        test_cycle_height(&state).unwrap(); // 720
+
+        let result = test_get_display_settings(&state).unwrap();
+        assert_eq!(result, "1280x720 stride:Auto");
+    }
+
+    // ========================================================================
+    // Tests for raw capture state
+    // ========================================================================
+
+    /// Helper to simulate `enable_raw_capture` command logic on test state
+    fn test_enable_raw_capture(state: &AppState) -> Result<String, String> {
+        let mut buffer = state
+            .frame_buffer
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        buffer.capture_raw_frames = true;
+        Ok("Raw capture enabled".to_string())
+    }
+
+    /// Helper to simulate `is_raw_capture_enabled` command logic on test state
+    fn test_is_raw_capture_enabled(state: &AppState) -> Result<bool, String> {
+        let buffer = state
+            .frame_buffer
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        Ok(buffer.capture_raw_frames)
+    }
+
+    #[test]
+    fn test_raw_capture_initially_disabled() {
+        let state = create_test_state();
+        let enabled = test_is_raw_capture_enabled(&state).unwrap();
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn test_enable_raw_capture_enables_flag() {
+        let state = create_test_state();
+
+        let result = test_enable_raw_capture(&state).unwrap();
+        assert_eq!(result, "Raw capture enabled");
+
+        let enabled = test_is_raw_capture_enabled(&state).unwrap();
+        assert!(enabled);
+    }
 }

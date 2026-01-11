@@ -18,6 +18,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::frame_assembler::{is_jpeg_data, validate_uvc_header};
+
 /// libusb error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -1421,7 +1423,7 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
             let sequence = context.sequence_counter.fetch_add(1, Ordering::SeqCst);
 
             // Extract payload from this URB
-            let payload = extract_urb_payloads(xfr, context.max_packet_size);
+            let payload = extract_urb_payloads(xfr, context.max_packet_size, context);
 
             log::trace!(
                 "URB completed: transfer_index={}, sequence={}, payload_bytes={}",
@@ -1485,109 +1487,6 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
     }
 }
 
-/// Validates a potential UVC payload header and returns the header length if valid.
-///
-/// Per USB Video Class spec, payload headers have this structure:
-/// - Byte 0: Header length (includes this byte)
-/// Round a frame size to the nearest common YUY2 frame size.
-/// YUY2 uses 2 bytes per pixel, so frame_size = width * height * 2.
-/// Common resolutions: 640x480, 1280x720, 1920x1080, 320x240, 800x600
-fn round_to_yuy2_frame_size(actual_size: usize) -> usize {
-    // Common YUY2 frame sizes
-    const FRAME_SIZES: &[(usize, &str)] = &[
-        (320 * 240 * 2, "320x240"),
-        (640 * 480 * 2, "640x480"),
-        (800 * 600 * 2, "800x600"),
-        (1280 * 720 * 2, "1280x720"),
-        (1920 * 1080 * 2, "1920x1080"),
-        (1280 * 960 * 2, "1280x960"),
-        (1600 * 1200 * 2, "1600x1200"),
-        // Also include non-standard sizes that cameras might use
-        (960 * 480 * 2, "960x480"),   // 3:1 aspect
-        (1920 * 480 * 2, "1920x480"), // Wide sensor
-    ];
-
-    // Find the closest standard size
-    let mut best_match = actual_size;
-    let mut best_diff = usize::MAX;
-
-    for &(size, name) in FRAME_SIZES {
-        let diff = if size > actual_size {
-            size - actual_size
-        } else {
-            actual_size - size
-        };
-
-        // Only match if within 5% tolerance
-        if diff < best_diff && diff < size / 20 {
-            best_diff = diff;
-            best_match = size;
-            log::debug!("Frame size {} matches {} ({})", actual_size, size, name);
-        }
-    }
-
-    // If no close match, just use the actual size (rounded to be even)
-    if best_match == actual_size {
-        (actual_size / 2) * 2
-    } else {
-        best_match
-    }
-}
-
-/// - Byte 1: BFH flags (bit 7 = EOH must be 1)
-/// - Bytes 2-5: PTS (4 bytes, optional, present if bit 2 set)
-/// - Bytes 6-11: SCR (6 bytes, optional, present if bit 3 set)
-///
-/// This function uses RELAXED validation - many cheap cameras don't strictly
-/// follow the spec (they may set reserved bits, or declare 12-byte headers
-/// without setting the PTS/SCR flags). If EOH is set and the length is in
-/// the valid range (2-12), we trust the declared length.
-///
-/// Returns `Some(header_len)` if valid, `None` if this is not a UVC header.
-#[inline]
-fn validate_uvc_header(data: &[u8]) -> Option<usize> {
-    if data.len() < 2 {
-        return None;
-    }
-
-    let header_len = data[0] as usize;
-    let header_flags = data[1];
-
-    // EOH (End of Header) bit MUST be set for valid headers
-    // This is the most reliable indicator
-    if (header_flags & 0x80) == 0 {
-        return None;
-    }
-
-    // Basic sanity check on length:
-    // - Must be at least 2 (minimum header)
-    // - Must be at most 12 (maximum with PTS + SCR)
-    // - Must fit within packet
-    if header_len < 2 || header_len > 12 || header_len > data.len() {
-        return None;
-    }
-
-    // RELAXED VALIDATION:
-    // Previously we rejected if reserved bits were set or if length didn't match flags.
-    // Many cheap cameras set reserved bits or have inconsistent flags.
-    // If EOH is set and length is reasonable, we trust the length byte.
-
-    // Optional: Log trace when length doesn't match flags (for debugging)
-    let pts_flag = (header_flags & 0x04) != 0;
-    let scr_flag = (header_flags & 0x08) != 0;
-    let expected_len = 2 + if pts_flag { 4 } else { 0 } + if scr_flag { 6 } else { 0 };
-
-    if header_len != expected_len {
-        log::trace!(
-            "UVC header length mismatch: declared={}, expected from flags={}",
-            header_len,
-            expected_len
-        );
-    }
-
-    Some(header_len)
-}
-
 /// Extracted payload data from a single URB, ready for ordered processing
 struct UrbPayload {
     /// Payload bytes extracted from all packets in this URB (headers stripped)
@@ -1618,6 +1517,7 @@ struct PacketMeta {
 unsafe fn extract_urb_payloads(
     xfr: &mut libusb1_sys::libusb_transfer,
     max_packet_size: u16,
+    context: &IsoCallbackContext,
 ) -> UrbPayload {
     let num_packets = xfr.num_iso_packets as usize;
     let mut data = Vec::with_capacity(num_packets * max_packet_size as usize);
@@ -1720,7 +1620,7 @@ fn process_urb_payload_in_order(
 
         // Detect format from first substantial data
         if state.is_mjpeg.is_none() && state.frame_buffer.len() >= 2 {
-            let is_jpeg = state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8;
+            let is_jpeg = is_jpeg_data(&state.frame_buffer);
             state.is_mjpeg = Some(is_jpeg);
             if is_jpeg {
                 log::info!("Detected MJPEG format from JPEG SOI marker");
@@ -1821,9 +1721,7 @@ fn process_urb_payload_in_order(
 
         // For MJPEG: EOF is reliable
         if is_mjpeg && pkt.end_of_frame && !state.frame_buffer.is_empty() {
-            let frame_size = state.frame_buffer.len();
-            let has_jpeg_marker =
-                frame_size >= 2 && state.frame_buffer[0] == 0xFF && state.frame_buffer[1] == 0xD8;
+            let has_jpeg_marker = is_jpeg_data(&state.frame_buffer);
 
             if has_jpeg_marker {
                 log::info!("Complete MJPEG frame: {} bytes (trigger: EOF)", frame_size);
@@ -1943,15 +1841,15 @@ mod tests {
     fn test_yuy2_false_positive_protection() {
         // YUY2 data that might look like a header:
         // Y=2 (could be header_len=2), U=128 (has EOH bit set)
-        // But this should be rejected because 0x80 has no extra flags
-        // and length matches, so it would actually be accepted as valid 2-byte header.
-        // The key protection is the reserved bit check and length/flag consistency.
+        // This will actually be accepted as a valid 2-byte header because
+        // the relaxed validation only checks EOH bit and length range.
         let data = [0x02, 0x80, 0xAB, 0xCD];
         // This is actually a valid 2-byte header pattern
         assert_eq!(validate_uvc_header(&data), Some(2));
 
-        // But with reserved bit set (0x90), it's rejected
+        // With reserved bit set (0x90), relaxed validation still accepts it
+        // because it only requires EOH bit and valid length range
         let data_with_reserved = [0x02, 0x90, 0xAB, 0xCD];
-        assert_eq!(validate_uvc_header(&data_with_reserved), None);
+        assert_eq!(validate_uvc_header(&data_with_reserved), Some(2));
     }
 }

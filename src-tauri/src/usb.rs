@@ -9,10 +9,32 @@ use tauri::AppHandle;
 #[cfg(target_os = "android")]
 use tauri::Emitter;
 
-use crate::{DisplaySettings, FrameBuffer, StreamingConfig};
+#[cfg(target_os = "android")]
+use crate::frame_assembler::is_jpeg_data;
+use crate::{DisplayConfig, FrameBuffer, StreamingConfig, ValidationLevel};
 
 #[cfg(target_os = "android")]
 use crate::PixelFormat;
+
+/// Context for USB streaming operations
+///
+/// Groups all parameters needed for USB camera streaming into a single struct,
+/// simplifying function signatures throughout the streaming pipeline.
+#[derive(Clone)]
+pub struct StreamingContext {
+    /// Tauri app handle for emitting events
+    pub app_handle: AppHandle,
+    /// Shared buffer for storing processed frames
+    pub frame_buffer: Arc<Mutex<FrameBuffer>>,
+    /// Consolidated display configuration (settings + cycling indexes)
+    pub display: Arc<Mutex<DisplayConfig>>,
+    /// Streaming configuration (format selection, pixel format)
+    pub streaming_config: Arc<Mutex<StreamingConfig>>,
+    /// Flag to signal USB streaming should stop
+    pub stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Frame validation level
+    pub validation_level: ValidationLevel,
+}
 
 #[cfg(target_os = "android")]
 use jni::{
@@ -27,25 +49,16 @@ use crate::libusb_android::{
     SendableContextPtr, TransferType,
 };
 
+// YUV conversion functions are in the yuv_conversion module (platform-independent)
 #[cfg(target_os = "android")]
-use yuvutils_rs::{
-    uyvy422_to_rgb, yuv420_to_rgb, yuv_nv12_to_rgb, yuyv422_to_rgb, YuvBiPlanarImage,
-    YuvConversionMode, YuvPackedImage, YuvPlanarImage, YuvRange, YuvStandardMatrix,
+use crate::yuv_conversion::{
+    convert_bgr888_to_rgb, convert_i420_to_rgb, convert_nv12_to_rgb, convert_yuv422_to_rgb,
+    pass_through_rgb888, YuvPackedFormat,
 };
 
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
-#[allow(clippy::too_many_arguments)]
-pub fn init_usb_handler(
-    app_handle: AppHandle,
-    frame_buffer: Arc<Mutex<FrameBuffer>>,
-    display_settings: Arc<Mutex<DisplaySettings>>,
-    streaming_config: Arc<Mutex<StreamingConfig>>,
-    width_index: Arc<Mutex<Option<usize>>>,
-    stride_index: Arc<Mutex<Option<usize>>>,
-    stop_flag: Arc<std::sync::atomic::AtomicBool>,
-    validation_level: crate::ValidationLevel,
-) {
+pub fn init_usb_handler(ctx: StreamingContext) {
     log::info!("Initializing USB handler");
 
     #[cfg(target_os = "android")]
@@ -53,21 +66,15 @@ pub fn init_usb_handler(
         // On Android, we need to get the USB file descriptor via JNI
         if let Some(fd) = get_usb_file_descriptor() {
             log::info!("USB device found with fd: {}", fd);
-            crate::emit_usb_event(&app_handle, true, Some(format!("USB Camera (fd: {})", fd)));
+            crate::emit_usb_event(
+                &ctx.app_handle,
+                true,
+                Some(format!("USB Camera (fd: {})", fd)),
+            );
 
             // Start the camera streaming loop in a new thread
             std::thread::spawn(move || {
-                run_camera_loop(
-                    fd,
-                    app_handle,
-                    frame_buffer,
-                    display_settings,
-                    streaming_config,
-                    width_index,
-                    stride_index,
-                    stop_flag,
-                    validation_level,
-                );
+                run_camera_loop(fd, ctx);
             });
         } else {
             log::info!("No USB device found on startup");
@@ -76,19 +83,8 @@ pub fn init_usb_handler(
 
     #[cfg(not(target_os = "android"))]
     {
-        let _ = display_settings; // Suppress unused warning
-        let _ = streaming_config;
-        let _ = width_index;
-        let _ = stride_index;
-        let _ = stop_flag;
-        let _ = validation_level;
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
+        let _ = ctx; // Suppress unused warning
         log::info!("USB handling not available on this platform");
-        let _ = app_handle; // Suppress unused warning
-        let _ = frame_buffer; // Suppress unused warning
     }
 }
 
@@ -332,45 +328,193 @@ const FRAMES_TO_CHECK_FORMAT: u32 = 10;
 #[cfg(target_os = "android")]
 const FORMAT_DETECTION_TIMEOUT_SECS: u64 = 10;
 
+/// Discover available video formats from UVC descriptors and store them in streaming config.
+///
+/// Returns the discovered format descriptors for further processing.
+#[cfg(target_os = "android")]
+fn discover_and_store_formats(
+    dev: &LibusbDeviceHandle,
+    streaming_config: &Arc<Mutex<StreamingConfig>>,
+) -> Vec<uvc::FormatDescriptor> {
+    let formats = dev.get_format_descriptors().unwrap_or_default();
+    {
+        let mut config = streaming_config.lock().unwrap();
+        config.available_formats = formats
+            .iter()
+            .map(|f| {
+                let format_type = match f.format_type {
+                    uvc::UvcFormatType::Mjpeg => "MJPEG".to_string(),
+                    uvc::UvcFormatType::Uncompressed => "YUY2".to_string(),
+                    uvc::UvcFormatType::UncompressedRgb => "RGB24".to_string(),
+                    uvc::UvcFormatType::FrameBased => "H264".to_string(),
+                    uvc::UvcFormatType::Unknown(n) => format!("UNK:{}", n),
+                };
+                let resolutions: Vec<String> = f
+                    .frames
+                    .iter()
+                    .map(|fr| format!("{}x{}", fr.width, fr.height))
+                    .collect();
+                crate::DiscoveredFormat {
+                    index: f.format_index,
+                    format_type,
+                    resolutions,
+                }
+            })
+            .collect();
+        log::info!(
+            "Discovered {} video formats: {:?}",
+            config.available_formats.len(),
+            config.available_formats
+        );
+    }
+    formats
+}
+
+/// Result of MJPEG streaming attempt
+#[cfg(target_os = "android")]
+enum MjpegStreamingResult {
+    /// MJPEG streaming completed successfully
+    Success(StreamResult),
+    /// Format was not MJPEG, should try next format
+    NotMjpeg,
+    /// Streaming failed with an error
+    Error(LibusbError),
+}
+
+/// Attempt MJPEG streaming with the specified format index.
+///
+/// Returns `Ok(Some(result))` if MJPEG worked, `Ok(None)` if format is not MJPEG,
+/// or `Err` if streaming failed.
+#[cfg(target_os = "android")]
+fn try_mjpeg_streaming(
+    usb_ctx: &LibusbContext,
+    dev: &LibusbDeviceHandle,
+    ep_info: &EndpointInfo,
+    stream_ctx: &StreamingContext,
+    format_index: u8,
+    streaming_interface: i32,
+) -> MjpegStreamingResult {
+    // Start UVC streaming with this format index
+    let endpoint = match start_uvc_streaming(dev, Some(ep_info), format_index) {
+        Ok(ep) => ep,
+        Err(e) => {
+            log::warn!(
+                "Failed to start streaming with format {}: {}",
+                format_index,
+                e
+            );
+            return MjpegStreamingResult::Error(e);
+        }
+    };
+    log::info!(
+        "UVC streaming started on endpoint 0x{:02x} with format {}",
+        endpoint,
+        format_index
+    );
+
+    // Choose streaming method based on endpoint type
+    let result = match ep_info.transfer_type {
+        TransferType::Isochronous => {
+            log::info!("Using ISOCHRONOUS transfers for video streaming");
+            stream_frames_isochronous_with_format_detection(
+                usb_ctx,
+                dev,
+                ep_info,
+                stream_ctx.app_handle.clone(),
+                stream_ctx.frame_buffer.clone(),
+                format_index,
+            )
+        }
+        TransferType::Bulk => {
+            log::info!("Using BULK transfers for video streaming");
+            stream_frames(
+                dev,
+                endpoint,
+                stream_ctx.app_handle.clone(),
+                stream_ctx.frame_buffer.clone(),
+            )
+        }
+        _ => {
+            log::error!(
+                "Unsupported endpoint transfer type: {:?}",
+                ep_info.transfer_type
+            );
+            Err(LibusbError::NotSupported)
+        }
+    };
+
+    match result {
+        Ok(FormatDetectionResult::MjpegFound) => {
+            log::info!(
+                "MJPEG format confirmed at index {}, streaming continues",
+                format_index
+            );
+            MjpegStreamingResult::Success(StreamResult::Normal)
+        }
+        Ok(FormatDetectionResult::NotMjpeg) => {
+            log::info!("Format {} is not MJPEG, trying next format", format_index);
+            // Reset interface before trying next format
+            let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+            MjpegStreamingResult::NotMjpeg
+        }
+        Err(e) => {
+            log::warn!("Streaming error with format {}: {}", format_index, e);
+            // Reset interface before trying next format
+            let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+            MjpegStreamingResult::Error(e)
+        }
+    }
+}
+
+/// Start YUV fallback streaming when MJPEG is not available.
+///
+/// Uses format index 1 by default and streams with RGB conversion.
+#[cfg(target_os = "android")]
+fn start_yuy2_fallback(
+    usb_ctx: &LibusbContext,
+    dev: &LibusbDeviceHandle,
+    ep_info: &EndpointInfo,
+    stream_ctx: &StreamingContext,
+) -> Result<StreamResult, LibusbError> {
+    // Start streaming with format 1 and get negotiated resolution
+    let params = start_uvc_streaming_with_resolution(dev, Some(ep_info), 1)?;
+    log::info!(
+        "Starting YUV streaming on endpoint 0x{:02x}, resolution {}x{}",
+        params.endpoint,
+        params.width,
+        params.height
+    );
+
+    stream_frames_yuy2(
+        usb_ctx,
+        dev,
+        ep_info,
+        stream_ctx,
+        params.width as u32,
+        params.height as u32,
+    )
+}
+
 /// Run the camera streaming loop with restart support
 /// This outer loop handles restart requests (e.g., when user changes video format)
 #[cfg(target_os = "android")]
-fn run_camera_loop(
-    fd: i32,
-    app_handle: AppHandle,
-    frame_buffer: Arc<Mutex<FrameBuffer>>,
-    display_settings: Arc<Mutex<DisplaySettings>>,
-    streaming_config: Arc<Mutex<StreamingConfig>>,
-    width_index: Arc<Mutex<Option<usize>>>,
-    stride_index: Arc<Mutex<Option<usize>>>,
-    stop_flag: Arc<std::sync::atomic::AtomicBool>,
-    validation_level: crate::ValidationLevel,
-) {
+fn run_camera_loop(fd: i32, ctx: StreamingContext) {
     log::info!("Starting camera loop with fd: {}", fd);
 
     loop {
         // Check if we should stop (app is closing)
-        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        if ctx.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("Stop flag set, exiting camera loop");
             break;
         }
 
         // Clear any pending restart request before starting
         {
-            let mut config = streaming_config.lock().unwrap();
+            let mut config = ctx.streaming_config.lock().unwrap();
             config.restart_requested = false;
         }
 
-        match run_camera_loop_inner(
-            fd,
-            app_handle.clone(),
-            frame_buffer.clone(),
-            display_settings.clone(),
-            streaming_config.clone(),
-            width_index.clone(),
-            stride_index.clone(),
-            validation_level,
-        ) {
+        match run_camera_loop_inner(fd, &ctx) {
             Ok(StreamResult::Normal) => {
                 log::info!("Camera loop ended normally");
                 break;
@@ -390,7 +534,7 @@ fn run_camera_loop(
 
     // Emit disconnected event when camera loop exits
     log::info!("Camera loop exited, emitting disconnect event");
-    crate::emit_usb_event(&app_handle, false, None);
+    crate::emit_usb_event(&ctx.app_handle, false, None);
 }
 
 /// Result of a streaming session
@@ -405,20 +549,14 @@ enum StreamResult {
 #[cfg(target_os = "android")]
 fn run_camera_loop_inner(
     fd: i32,
-    app_handle: AppHandle,
-    frame_buffer: Arc<Mutex<FrameBuffer>>,
-    display_settings: Arc<Mutex<DisplaySettings>>,
-    streaming_config: Arc<Mutex<StreamingConfig>>,
-    width_index: Arc<Mutex<Option<usize>>>,
-    stride_index: Arc<Mutex<Option<usize>>>,
-    validation_level: crate::ValidationLevel,
+    stream_ctx: &StreamingContext,
 ) -> Result<StreamResult, LibusbError> {
     // Initialize libusb context for Android (no device discovery)
-    let ctx = LibusbContext::new_android()?;
+    let usb_ctx = LibusbContext::new_android()?;
     log::info!("libusb context created");
 
     // Wrap the Android file descriptor as a libusb device handle
-    let dev = ctx.wrap_fd(fd)?;
+    let dev = usb_ctx.wrap_fd(fd)?;
     log::info!("Android FD wrapped successfully");
 
     // Get device descriptor to verify we have a video device
@@ -464,43 +602,11 @@ fn run_camera_loop_inner(
     }
 
     // Discover available formats from UVC descriptors and store in streaming config
-    let formats = dev.get_format_descriptors().unwrap_or_default();
-    {
-        let mut config = streaming_config.lock().unwrap();
-        config.available_formats = formats
-            .iter()
-            .map(|f| {
-                let format_type = match f.format_type {
-                    crate::libusb_android::uvc::UvcFormatType::Mjpeg => "MJPEG".to_string(),
-                    crate::libusb_android::uvc::UvcFormatType::Uncompressed => "YUY2".to_string(),
-                    crate::libusb_android::uvc::UvcFormatType::UncompressedRgb => {
-                        "RGB24".to_string()
-                    }
-                    crate::libusb_android::uvc::UvcFormatType::FrameBased => "H264".to_string(),
-                    crate::libusb_android::uvc::UvcFormatType::Unknown(n) => format!("UNK:{}", n),
-                };
-                let resolutions: Vec<String> = f
-                    .frames
-                    .iter()
-                    .map(|fr| format!("{}x{}", fr.width, fr.height))
-                    .collect();
-                crate::DiscoveredFormat {
-                    index: f.format_index,
-                    format_type,
-                    resolutions,
-                }
-            })
-            .collect();
-        log::info!(
-            "Discovered {} video formats: {:?}",
-            config.available_formats.len(),
-            config.available_formats
-        );
-    }
+    let formats = discover_and_store_formats(&dev, &stream_ctx.streaming_config);
 
     // Get user's format selection and MJPEG skip preference
     let (selected_format, skip_mjpeg) = {
-        let config = streaming_config.lock().unwrap();
+        let config = stream_ctx.streaming_config.lock().unwrap();
         (config.selected_format_index, config.skip_mjpeg_detection)
     };
 
@@ -513,7 +619,7 @@ fn run_camera_loop_inner(
         let is_mjpeg = formats
             .iter()
             .find(|f| f.format_index == format_idx)
-            .map(|f| f.format_type == crate::libusb_android::uvc::UvcFormatType::Mjpeg)
+            .map(|f| f.format_type == uvc::UvcFormatType::Mjpeg)
             .unwrap_or(false);
 
         if is_mjpeg {
@@ -528,16 +634,21 @@ fn run_camera_loop_inner(
             match ep_info.transfer_type {
                 TransferType::Isochronous => {
                     stream_frames_isochronous_with_format_detection(
-                        &ctx,
+                        &usb_ctx,
                         &dev,
                         &ep_info,
-                        app_handle.clone(),
-                        frame_buffer.clone(),
+                        stream_ctx.app_handle.clone(),
+                        stream_ctx.frame_buffer.clone(),
                         format_idx,
                     )?;
                 }
                 TransferType::Bulk => {
-                    stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())?;
+                    stream_frames(
+                        &dev,
+                        endpoint,
+                        stream_ctx.app_handle.clone(),
+                        stream_ctx.frame_buffer.clone(),
+                    )?;
                 }
                 _ => {
                     log::error!("Unsupported transfer type: {:?}", ep_info.transfer_type);
@@ -558,18 +669,12 @@ fn run_camera_loop_inner(
             );
 
             return stream_frames_yuy2(
-                &ctx,
+                &usb_ctx,
                 &dev,
                 &ep_info,
-                app_handle,
-                frame_buffer,
-                display_settings,
-                streaming_config,
-                width_index,
-                stride_index,
+                stream_ctx,
                 params.width as u32,
                 params.height as u32,
-                validation_level,
             );
         }
     } else if skip_mjpeg {
@@ -584,69 +689,18 @@ fn run_camera_loop_inner(
                 MAX_FORMAT_INDEX
             );
 
-            // Start UVC streaming with this format index
-            let endpoint = match start_uvc_streaming(&dev, Some(&ep_info), format_index) {
-                Ok(ep) => ep,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to start streaming with format {}: {}",
-                        format_index,
-                        e
-                    );
-                    continue;
+            match try_mjpeg_streaming(
+                &usb_ctx,
+                &dev,
+                &ep_info,
+                stream_ctx,
+                format_index,
+                streaming_interface,
+            ) {
+                MjpegStreamingResult::Success(result) => {
+                    return Ok(result);
                 }
-            };
-            log::info!(
-                "UVC streaming started on endpoint 0x{:02x} with format {}",
-                endpoint,
-                format_index
-            );
-
-            // Choose streaming method based on endpoint type
-            let result = match ep_info.transfer_type {
-                TransferType::Isochronous => {
-                    log::info!("Using ISOCHRONOUS transfers for video streaming");
-                    stream_frames_isochronous_with_format_detection(
-                        &ctx,
-                        &dev,
-                        &ep_info,
-                        app_handle.clone(),
-                        frame_buffer.clone(),
-                        format_index,
-                    )
-                }
-                TransferType::Bulk => {
-                    log::info!("Using BULK transfers for video streaming");
-                    stream_frames(&dev, endpoint, app_handle.clone(), frame_buffer.clone())
-                }
-                _ => {
-                    log::error!(
-                        "Unsupported endpoint transfer type: {:?}",
-                        ep_info.transfer_type
-                    );
-                    Err(LibusbError::NotSupported)
-                }
-            };
-
-            match result {
-                Ok(FormatDetectionResult::MjpegFound) => {
-                    log::info!(
-                        "MJPEG format confirmed at index {}, streaming continues",
-                        format_index
-                    );
-                    // MJPEG streaming doesn't support restart yet - return Normal
-                    return Ok(StreamResult::Normal);
-                }
-                Ok(FormatDetectionResult::NotMjpeg) => {
-                    log::info!("Format {} is not MJPEG, trying next format", format_index);
-                    // Reset interface before trying next format
-                    let _ = dev.set_interface_alt_setting(streaming_interface, 0);
-                    continue;
-                }
-                Err(e) => {
-                    log::warn!("Streaming error with format {}: {}", format_index, e);
-                    // Reset interface before trying next format
-                    let _ = dev.set_interface_alt_setting(streaming_interface, 0);
+                MjpegStreamingResult::NotMjpeg | MjpegStreamingResult::Error(_) => {
                     continue;
                 }
             }
@@ -656,29 +710,7 @@ fn run_camera_loop_inner(
     }
 
     // YUV streaming with format index 1
-    // Start streaming with format 1 and get negotiated resolution
-    let params = start_uvc_streaming_with_resolution(&dev, Some(&ep_info), 1)?;
-    log::info!(
-        "Starting YUV streaming on endpoint 0x{:02x}, resolution {}x{}",
-        params.endpoint,
-        params.width,
-        params.height
-    );
-
-    stream_frames_yuy2(
-        &ctx,
-        &dev,
-        &ep_info,
-        app_handle,
-        frame_buffer,
-        display_settings,
-        streaming_config,
-        width_index,
-        stride_index,
-        params.width as u32,
-        params.height as u32,
-        validation_level,
-    )
+    start_yuy2_fallback(&usb_ctx, &dev, &ep_info, stream_ctx)
 }
 
 /// Result of format detection during streaming
@@ -720,381 +752,6 @@ fn detect_yuy2_resolution(frame_size: usize) -> Option<(u32, u32)> {
             None
         }
     }
-}
-
-/// Calculate actual YUY2 stride from frame size and height
-///
-/// Some cameras use row padding for alignment (e.g., 64-byte alignment).
-/// This function detects the actual stride from the frame size.
-#[cfg(target_os = "android")]
-fn calculate_yuy2_stride(frame_size: usize, width: u32, height: u32) -> u32 {
-    let expected_stride = width * 2; // Standard: 2 bytes per pixel
-    let expected_size = (expected_stride * height) as usize;
-
-    // If frame matches expected size exactly, use standard stride
-    if frame_size == expected_size {
-        return expected_stride;
-    }
-
-    // Calculate actual stride from frame size
-    // actual_stride = frame_size / height (rounded)
-    let actual_stride = (frame_size as u32) / height;
-
-    // Validate the calculated stride is reasonable:
-    // - Must be at least width * 2 (minimum for YUY2)
-    // - Should not be more than 20% larger (typical alignment padding is small)
-    let max_reasonable_stride = expected_stride * 12 / 10; // 120% of expected
-
-    if actual_stride >= expected_stride && actual_stride <= max_reasonable_stride {
-        log::info!(
-            "Detected YUY2 stride: {} bytes/row (expected {}, frame_size={}, height={})",
-            actual_stride,
-            expected_stride,
-            frame_size,
-            height
-        );
-        actual_stride
-    } else if actual_stride > max_reasonable_stride {
-        // Frame is much larger than expected - might be a different resolution
-        log::warn!(
-            "Calculated stride {} is too large (expected ~{}), using expected stride",
-            actual_stride,
-            expected_stride
-        );
-        expected_stride
-    } else {
-        // Frame is smaller than expected - use expected stride and truncate
-        log::warn!(
-            "Calculated stride {} is too small (expected {}), using expected stride",
-            actual_stride,
-            expected_stride
-        );
-        expected_stride
-    }
-}
-
-/// YUV 4:2:2 packed format variant
-#[cfg(target_os = "android")]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum YuvPackedFormat {
-    /// YUYV format: Y0-U-Y1-V byte order (luminance first)
-    #[default]
-    Yuyv,
-    /// UYVY format: U-Y0-V-Y1 byte order (chrominance first)
-    /// This is what macOS reports for many USB endoscopes
-    Uyvy,
-}
-
-/// Convert YUV 4:2:2 packed frame to RGB with automatic stride detection
-///
-/// This function handles cameras that use row padding for alignment.
-/// Supports both YUYV and UYVY byte orders.
-///
-/// - `yuv_data`: Raw YUV 4:2:2 packed data
-/// - `width`: Frame width in pixels
-/// - `height`: Frame height in pixels
-/// - `stride_override`: If Some, use this as the YUV stride instead of auto-detecting
-/// - `format`: YUYV or UYVY byte order
-#[cfg(target_os = "android")]
-fn convert_yuv422_to_rgb(
-    yuv_data: &[u8],
-    width: u32,
-    height: u32,
-    stride_override: Option<u32>,
-    format: YuvPackedFormat,
-) -> Result<Vec<u8>, String> {
-    let frame_size = yuv_data.len();
-    let expected_stride = width * 2;
-
-    // Use override stride if provided, otherwise auto-detect
-    let actual_stride =
-        stride_override.unwrap_or_else(|| calculate_yuy2_stride(frame_size, width, height));
-
-    // Log conversion parameters when they change
-    static LAST_PARAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let format_bit = if format == YuvPackedFormat::Uyvy {
-        1u64
-    } else {
-        0u64
-    };
-    let params_hash = ((width as u64) << 48)
-        | ((height as u64) << 32)
-        | ((actual_stride as u64) << 16)
-        | format_bit;
-    let last = LAST_PARAMS.swap(params_hash, std::sync::atomic::Ordering::Relaxed);
-    if last != params_hash {
-        log::info!(
-            "{:?} conversion: input={} bytes, width={}, height={}, stride={}",
-            format,
-            frame_size,
-            width,
-            height,
-            actual_stride
-        );
-    }
-
-    // Validate we have enough data
-    let min_required = (expected_stride * height) as usize;
-    if frame_size < min_required {
-        return Err(format!(
-            "YUV data too small: {} bytes, expected at least {} bytes",
-            frame_size, min_required
-        ));
-    }
-
-    // Calculate how much data we need with the given stride
-    let actual_frame_size = (actual_stride * height) as usize;
-    let data_to_use = actual_frame_size.min(frame_size);
-
-    let packed_image = YuvPackedImage {
-        yuy: &yuv_data[..data_to_use],
-        yuy_stride: actual_stride,
-        width,
-        height,
-    };
-
-    // RGB output: 3 bytes per pixel
-    let rgb_stride = width * 3;
-    let mut rgb_buffer = vec![0u8; (rgb_stride * height) as usize];
-
-    // Convert based on format - BT.601 for standard cameras, Limited range is common
-    match format {
-        YuvPackedFormat::Yuyv => {
-            yuyv422_to_rgb(
-                &packed_image,
-                &mut rgb_buffer,
-                rgb_stride,
-                YuvRange::Limited,
-                YuvStandardMatrix::Bt601,
-            )
-            .map_err(|e| format!("YUYV conversion error: {:?}", e))?;
-        }
-        YuvPackedFormat::Uyvy => {
-            uyvy422_to_rgb(
-                &packed_image,
-                &mut rgb_buffer,
-                rgb_stride,
-                YuvRange::Limited,
-                YuvStandardMatrix::Bt601,
-            )
-            .map_err(|e| format!("UYVY conversion error: {:?}", e))?;
-        }
-    }
-
-    Ok(rgb_buffer)
-}
-
-/// Legacy wrapper for backward compatibility
-/// Defaults to YUYV format
-#[cfg(target_os = "android")]
-fn convert_yuy2_to_rgb(
-    yuy2_data: &[u8],
-    width: u32,
-    height: u32,
-    stride_override: Option<u32>,
-) -> Result<Vec<u8>, String> {
-    convert_yuv422_to_rgb(
-        yuy2_data,
-        width,
-        height,
-        stride_override,
-        YuvPackedFormat::Yuyv,
-    )
-}
-
-/// Convert I420 (planar YUV420) frame to RGB
-///
-/// I420 layout: Y plane (width*height), U plane (width/2 * height/2), V plane (width/2 * height/2)
-/// Total size: width * height * 1.5 bytes
-#[cfg(target_os = "android")]
-fn convert_i420_to_rgb(yuv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let y_size = (width * height) as usize;
-    let uv_size = y_size / 4; // Each U and V plane is 1/4 the size of Y
-    let expected_size = y_size + uv_size * 2;
-
-    if yuv_data.len() < expected_size {
-        return Err(format!(
-            "I420 data too small: {} bytes, expected {} bytes for {}x{}",
-            yuv_data.len(),
-            expected_size,
-            width,
-            height
-        ));
-    }
-
-    // Split into Y, U, V planes
-    let y_plane = &yuv_data[0..y_size];
-    let u_plane = &yuv_data[y_size..y_size + uv_size];
-    let v_plane = &yuv_data[y_size + uv_size..y_size + uv_size * 2];
-
-    let planar_image = YuvPlanarImage {
-        y_plane,
-        y_stride: width,
-        u_plane,
-        u_stride: width / 2,
-        v_plane,
-        v_stride: width / 2,
-        width,
-        height,
-    };
-
-    // RGB output: 3 bytes per pixel
-    let rgb_stride = width * 3;
-    let mut rgb_buffer = vec![0u8; (rgb_stride * height) as usize];
-
-    yuv420_to_rgb(
-        &planar_image,
-        &mut rgb_buffer,
-        rgb_stride,
-        YuvRange::Limited,
-        YuvStandardMatrix::Bt601,
-    )
-    .map_err(|e| format!("I420 conversion error: {:?}", e))?;
-
-    // Log first conversion
-    static I420_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !I420_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "I420 conversion: {}x{}, Y={}bytes, U={}bytes, V={}bytes -> RGB={}bytes",
-            width,
-            height,
-            y_size,
-            uv_size,
-            uv_size,
-            rgb_buffer.len()
-        );
-    }
-
-    Ok(rgb_buffer)
-}
-
-/// Convert NV12 (semi-planar YUV420) frame to RGB
-///
-/// NV12 layout: Y plane (width*height), interleaved UV plane (width * height/2)
-/// Total size: width * height * 1.5 bytes
-#[cfg(target_os = "android")]
-fn convert_nv12_to_rgb(yuv_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let y_size = (width * height) as usize;
-    let uv_size = y_size / 2; // UV plane is half the size of Y (interleaved)
-    let expected_size = y_size + uv_size;
-
-    if yuv_data.len() < expected_size {
-        return Err(format!(
-            "NV12 data too small: {} bytes, expected {} bytes for {}x{}",
-            yuv_data.len(),
-            expected_size,
-            width,
-            height
-        ));
-    }
-
-    // Split into Y and UV planes
-    let y_plane = &yuv_data[0..y_size];
-    let uv_plane = &yuv_data[y_size..y_size + uv_size];
-
-    let bi_planar_image = YuvBiPlanarImage {
-        y_plane,
-        y_stride: width,
-        uv_plane,
-        uv_stride: width, // UV stride is same as width for NV12
-        width,
-        height,
-    };
-
-    // RGB output: 3 bytes per pixel
-    let rgb_stride = width * 3;
-    let mut rgb_buffer = vec![0u8; (rgb_stride * height) as usize];
-
-    yuv_nv12_to_rgb(
-        &bi_planar_image,
-        &mut rgb_buffer,
-        rgb_stride,
-        YuvRange::Limited,
-        YuvStandardMatrix::Bt601,
-        YuvConversionMode::Balanced,
-    )
-    .map_err(|e| format!("NV12 conversion error: {:?}", e))?;
-
-    // Log first conversion
-    static NV12_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !NV12_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "NV12 conversion: {}x{}, Y={}bytes, UV={}bytes -> RGB={}bytes",
-            width,
-            height,
-            y_size,
-            uv_size,
-            rgb_buffer.len()
-        );
-    }
-
-    Ok(rgb_buffer)
-}
-
-/// Pass through RGB888 data directly (no conversion needed)
-/// RGB888 is already in the correct format for display (3 bytes per pixel, R-G-B order)
-#[cfg(target_os = "android")]
-fn pass_through_rgb888(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let expected = (width * height * 3) as usize;
-    if data.len() < expected {
-        return Err(format!(
-            "RGB888 data too small: {} bytes, expected {} for {}x{}",
-            data.len(),
-            expected,
-            width,
-            height
-        ));
-    }
-
-    // Log once
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "RGB888 pass-through: {}x{}, {} bytes (no conversion)",
-            width,
-            height,
-            expected
-        );
-    }
-
-    Ok(data[..expected].to_vec())
-}
-
-/// Convert BGR888 to RGB888 by swapping R and B channels
-/// BGR888 is B-G-R byte order, we need R-G-B for display
-#[cfg(target_os = "android")]
-fn convert_bgr888_to_rgb(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let expected = (width * height * 3) as usize;
-    if data.len() < expected {
-        return Err(format!(
-            "BGR888 data too small: {} bytes, expected {} for {}x{}",
-            data.len(),
-            expected,
-            width,
-            height
-        ));
-    }
-
-    // Log once
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "BGR888 -> RGB888 conversion: {}x{}, {} bytes",
-            width,
-            height,
-            expected
-        );
-    }
-
-    // Swap B and R channels: BGR -> RGB
-    let mut rgb = Vec::with_capacity(expected);
-    for chunk in data[..expected].chunks_exact(3) {
-        rgb.push(chunk[2]); // R (was at position 2 in BGR)
-        rgb.push(chunk[1]); // G (stays in middle)
-        rgb.push(chunk[0]); // B (was at position 0 in BGR)
-    }
-
-    Ok(rgb)
 }
 
 /// Stream frames using isochronous transfers with format detection
@@ -1202,8 +859,7 @@ fn stream_frames_isochronous_with_format_detection(
                 frames_checked += 1;
 
                 // Check for JPEG SOI marker (0xFFD8)
-                let is_jpeg =
-                    frame_data.len() >= 2 && frame_data[0] == 0xFF && frame_data[1] == 0xD8;
+                let is_jpeg = is_jpeg_data(&frame_data);
 
                 if is_jpeg {
                     jpeg_frames += 1;
@@ -1448,31 +1104,127 @@ fn stream_frames_isochronous(
     Ok(())
 }
 
+/// Calculated frame dimensions from raw frame data
+#[cfg(target_os = "android")]
+struct FrameDimensions {
+    width: u32,
+    height: u32,
+    stride: u32,
+    /// The actual width derived from frame data (before any overrides)
+    actual_width: u32,
+    /// The actual stride derived from frame data (before any overrides)
+    actual_stride: u32,
+}
+
+/// Calculate frame dimensions from raw frame data and display settings
+///
+/// Handles stride/width/height calculation based on actual frame data size,
+/// descriptor values, display settings overrides, and stride index multipliers.
+/// Some cameras send more data than their descriptor claims (e.g., 1920px wide
+/// despite advertising 640px). This function uses the actual frame size to
+/// determine the real dimensions while respecting user overrides.
+#[cfg(target_os = "android")]
+fn calculate_frame_dimensions(
+    frame_size: usize,
+    base_width: u32,
+    base_height: u32,
+    settings: &DisplaySettings,
+    stride_idx: &Option<usize>,
+) -> FrameDimensions {
+    // Use height from settings override or descriptor
+    let height = settings.height.unwrap_or(base_height);
+
+    // Calculate actual stride from frame data
+    // stride = frame_size / height, ensure even for YUY2
+    let actual_stride = if frame_size > 0 && height > 0 {
+        let raw_stride = (frame_size as u32) / height;
+        (raw_stride / 2) * 2 // Round down to even
+    } else {
+        base_width * 2
+    };
+
+    // Derive actual width from stride (YUY2 = 2 bytes per pixel)
+    let actual_width = actual_stride / 2;
+
+    // Use settings override or calculated values
+    let width = settings.width.unwrap_or(actual_width);
+
+    // Calculate stride: use stride_index multiplier if set, otherwise settings.stride or auto
+    let stride = if let Some(si) = *stride_idx {
+        // Stride index is set - use multiplier
+        let multiplier = crate::STRIDE_OPTIONS[si];
+        ((width as f32 * multiplier) as u32 / 2) * 2 // Round to even
+    } else {
+        settings.stride.unwrap_or(actual_stride)
+    };
+
+    FrameDimensions {
+        width,
+        height,
+        stride,
+        actual_width,
+        actual_stride,
+    }
+}
+
+/// Convert frame data to RGB based on pixel format
+///
+/// Dispatches to the appropriate conversion function based on the pixel format.
+/// Supports YUV422 packed (YUYV/UYVY), YUV420 planar (I420/NV12), and RGB formats.
+#[cfg(target_os = "android")]
+fn convert_frame_to_rgb(
+    frame_data: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
+) -> Result<Vec<u8>, String> {
+    let stride_override = Some(stride);
+
+    let result = match pixel_format {
+        PixelFormat::Yuyv => convert_yuv422_to_rgb(
+            frame_data,
+            width,
+            height,
+            stride_override,
+            YuvPackedFormat::Yuyv,
+        ),
+        PixelFormat::Uyvy => convert_yuv422_to_rgb(
+            frame_data,
+            width,
+            height,
+            stride_override,
+            YuvPackedFormat::Uyvy,
+        ),
+        PixelFormat::I420 => convert_i420_to_rgb(frame_data, width, height),
+        PixelFormat::Nv12 => convert_nv12_to_rgb(frame_data, width, height),
+        PixelFormat::Rgb888 => pass_through_rgb888(frame_data, width, height),
+        PixelFormat::Bgr888 => convert_bgr888_to_rgb(frame_data, width, height),
+    };
+
+    // Convert ConversionError to String for backward compatibility
+    result.map_err(|e| e.0)
+}
+
 /// Stream YUV 4:2:2 frames using isochronous transfers with RGB conversion
 /// Supports both YUYV and UYVY formats based on streaming config
 /// width/height: The negotiated resolution from UVC descriptors
 /// Returns StreamResult to indicate if restart was requested
 #[cfg(target_os = "android")]
 fn stream_frames_yuy2(
-    ctx: &LibusbContext,
+    usb_ctx: &LibusbContext,
     dev: &LibusbDeviceHandle,
     ep_info: &EndpointInfo,
-    app_handle: AppHandle,
-    shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
-    display_settings: Arc<Mutex<DisplaySettings>>,
-    streaming_config: Arc<Mutex<StreamingConfig>>,
-    _width_index: Arc<Mutex<Option<usize>>>,
-    stride_index: Arc<Mutex<Option<usize>>>,
+    stream_ctx: &StreamingContext,
     descriptor_width: u32,
     descriptor_height: u32,
-    validation_level: crate::ValidationLevel,
 ) -> Result<StreamResult, LibusbError> {
     use std::time::{Duration, Instant};
     use tauri::Emitter;
 
     // Get current pixel format to determine expected frame size
     let pixel_format = {
-        let config = streaming_config.lock().unwrap();
+        let config = stream_ctx.streaming_config.lock().unwrap();
         config.pixel_format
     };
 
@@ -1506,18 +1258,22 @@ fn stream_frames_yuy2(
     );
 
     // Emit connected event to update frontend UI
-    crate::emit_usb_event(&app_handle, true, Some(format!("{} Camera", format_name)));
+    crate::emit_usb_event(
+        &stream_ctx.app_handle,
+        true,
+        Some(format!("{} Camera", format_name)),
+    );
 
     // Create the isochronous stream with descriptor-based frame size
     let mut iso_stream = unsafe {
         IsochronousStream::new(
-            ctx.get_context_ptr(),
+            usb_ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
             expected_frame_size,
             None, // No packet capture (can be enabled for E2E testing)
-            validation_level,
+            stream_ctx.validation_level,
             descriptor_width as usize,
             descriptor_height as usize,
         )?
@@ -1528,7 +1284,7 @@ fn stream_frames_yuy2(
 
     // Spawn event loop thread
     let event_loop_handle = {
-        let ctx_ptr = SendableContextPtr::new(ctx.get_context_ptr());
+        let ctx_ptr = SendableContextPtr::new(usb_ctx.get_context_ptr());
         let stop_flag = iso_stream.stop_flag.clone();
 
         std::thread::spawn(move || {
@@ -1555,7 +1311,7 @@ fn stream_frames_yuy2(
     };
 
     // Emit status update to frontend
-    let _ = app_handle.emit(
+    let _ = stream_ctx.app_handle.emit(
         "usb-status",
         serde_json::json!({
             "status": "streaming",
@@ -1580,7 +1336,7 @@ fn stream_frames_yuy2(
     loop {
         // Check if restart was requested (e.g., user changed video format)
         {
-            let config = streaming_config.lock().unwrap();
+            let config = stream_ctx.streaming_config.lock().unwrap();
             if config.restart_requested {
                 log::info!("Restart requested, stopping YUY2 streaming");
                 iso_stream.stop();
@@ -1644,40 +1400,25 @@ fn stream_frames_yuy2(
                     continue;
                 }
 
-                // Get current display settings for overrides
-                let settings = display_settings.lock().unwrap();
-                let stride_idx = stride_index.lock().unwrap();
-
-                // Calculate actual dimensions from frame data
-                // Some cameras send more data than their descriptor claims (e.g., 1920px wide
-                // despite advertising 640px). We use the actual frame size to determine the
-                // real width, while trusting the descriptor height.
-                let height = settings.height.unwrap_or(base_height);
-
-                // Calculate actual stride from frame data
-                let actual_stride = if frame_size > 0 && height > 0 {
-                    // stride = frame_size / height, ensure even for YUY2
-                    let raw_stride = (frame_size as u32) / height;
-                    (raw_stride / 2) * 2 // Round down to even
-                } else {
-                    base_width * 2
+                // Calculate frame dimensions using helper function
+                let dims = {
+                    let display = stream_ctx.display.lock().unwrap();
+                    calculate_frame_dimensions(
+                        frame_size,
+                        base_width,
+                        base_height,
+                        &display.settings,
+                        &display.stride_index,
+                    )
                 };
 
-                // Derive actual width from stride (YUY2 = 2 bytes per pixel)
-                let actual_width = actual_stride / 2;
-
-                // Use settings override or calculated values
-                let width = settings.width.unwrap_or(actual_width);
-
-                // Calculate stride: use stride_index multiplier if set, otherwise settings.stride or auto
-                let stride = if let Some(si) = *stride_idx {
-                    // Stride index is set - use multiplier
-                    let multiplier = crate::STRIDE_OPTIONS[si];
-                    ((width as f32 * multiplier) as u32 / 2) * 2 // Round to even
-                } else {
-                    settings.stride.unwrap_or(actual_stride)
-                };
-                drop(stride_idx);
+                let FrameDimensions {
+                    width,
+                    height,
+                    stride,
+                    actual_width,
+                    actual_stride,
+                } = dims;
 
                 // Log when we detect camera sending different resolution than descriptor
                 static RESOLUTION_LOGGED: std::sync::atomic::AtomicBool =
@@ -1691,8 +1432,6 @@ fn stream_frames_yuy2(
                     );
                 }
 
-                drop(settings); // Release lock before conversion
-
                 // Log settings changes
                 static LAST_SETTINGS: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
@@ -1701,7 +1440,7 @@ fn stream_frames_yuy2(
                 let last = LAST_SETTINGS.swap(settings_hash, std::sync::atomic::Ordering::Relaxed);
                 if last != settings_hash {
                     log::info!("Display settings: {}x{} stride={}", width, height, stride);
-                    let _ = app_handle.emit(
+                    let _ = stream_ctx.app_handle.emit(
                         "usb-status",
                         serde_json::json!({
                             "status": "streaming",
@@ -1710,40 +1449,16 @@ fn stream_frames_yuy2(
                     );
                 };
 
-                // Use the calculated stride as override (it's already properly computed above)
-                let stride_override = Some(stride);
-
                 // Get pixel format from streaming config
                 let pixel_format = {
-                    let config = streaming_config.lock().unwrap();
+                    let config = stream_ctx.streaming_config.lock().unwrap();
                     config.pixel_format
                 };
 
-                // Convert to RGB based on format
-                // YUV422 packed formats (YUYV/UYVY) use 2 bytes/pixel
-                // YUV420 planar formats (I420/NV12) use 1.5 bytes/pixel
-                // RGB formats (RGB888/BGR888) use 3 bytes/pixel
+                // Convert frame to RGB using helper function
                 {
-                    let conversion_result = match pixel_format {
-                        PixelFormat::Yuyv => convert_yuv422_to_rgb(
-                            &frame_data,
-                            width,
-                            height,
-                            stride_override,
-                            YuvPackedFormat::Yuyv,
-                        ),
-                        PixelFormat::Uyvy => convert_yuv422_to_rgb(
-                            &frame_data,
-                            width,
-                            height,
-                            stride_override,
-                            YuvPackedFormat::Uyvy,
-                        ),
-                        PixelFormat::I420 => convert_i420_to_rgb(&frame_data, width, height),
-                        PixelFormat::Nv12 => convert_nv12_to_rgb(&frame_data, width, height),
-                        PixelFormat::Rgb888 => pass_through_rgb888(&frame_data, width, height),
-                        PixelFormat::Bgr888 => convert_bgr888_to_rgb(&frame_data, width, height),
-                    };
+                    let conversion_result =
+                        convert_frame_to_rgb(&frame_data, width, height, stride, pixel_format);
                     match conversion_result {
                         Ok(rgb_data) => {
                             // Log RGB buffer size once
@@ -1760,18 +1475,22 @@ fn stream_frames_yuy2(
                                 );
                             }
 
-                            // Store both RGB and raw YUY2 frames in shared buffer
+                            // Store RGB frame in shared buffer, only clone raw when capturing
                             {
-                                let mut buffer = shared_frame_buffer.lock().unwrap();
+                                let mut buffer = stream_ctx.frame_buffer.lock().unwrap();
                                 buffer.frame = rgb_data;
-                                buffer.raw_frame = frame_data.clone(); // Store raw YUY2 for debugging
+                                // Only clone raw frame data when capturing is enabled
+                                // This saves ~54MB/s at 30fps 720p (921,600 bytes/frame)
+                                if buffer.capture_raw_frames {
+                                    buffer.raw_frame = frame_data.clone();
+                                }
                                 buffer.timestamp = Instant::now();
                                 buffer.width = width;
                                 buffer.height = height;
                             }
 
                             // Emit notification to trigger frontend fetch
-                            let _ = app_handle.emit("frame-ready", ());
+                            let _ = stream_ctx.app_handle.emit("frame-ready", ());
 
                             if frame_count % 30 == 0 {
                                 log::info!(
