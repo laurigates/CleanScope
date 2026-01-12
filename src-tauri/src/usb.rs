@@ -56,6 +56,79 @@ use crate::yuv_conversion::{
     pass_through_rgb888, YuvPackedFormat,
 };
 
+/// Event loop timeout for libusb event handling (100ms)
+#[cfg(target_os = "android")]
+const LIBUSB_EVENT_TIMEOUT_USEC: libc::suseconds_t = 100_000;
+
+/// Spawns a thread that runs the libusb event loop.
+///
+/// The event loop processes asynchronous USB transfers (isochronous callbacks).
+/// It runs until the stop_flag is set to true.
+///
+/// # Arguments
+/// * `ctx_ptr` - Send-safe wrapper for the libusb context pointer
+/// * `stop_flag` - Atomic flag to signal when the loop should exit
+/// * `thread_name` - Name for the spawned thread (for debugging)
+/// * `debug_logging` - If true, logs iteration counts for debugging
+///
+/// # Returns
+/// JoinHandle for the spawned thread
+#[cfg(target_os = "android")]
+fn spawn_libusb_event_loop(
+    ctx_ptr: SendableContextPtr,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    thread_name: &'static str,
+    debug_logging: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let mut timeval = libc::timeval {
+                tv_sec: 0,
+                tv_usec: LIBUSB_EVENT_TIMEOUT_USEC,
+            };
+
+            let mut iteration = 0u32;
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe {
+                    let ret =
+                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
+
+                    if debug_logging {
+                        iteration += 1;
+                        if iteration <= 5 || iteration % 50 == 0 {
+                            log::debug!(
+                                "[{}] Event loop iteration {}, ret={}",
+                                thread_name,
+                                iteration,
+                                ret
+                            );
+                        }
+                    }
+
+                    if ret < 0 {
+                        let err = LibusbError::from(ret);
+                        if err != LibusbError::Interrupted {
+                            log::error!("[{}] Event loop error: {}", thread_name, err);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if debug_logging {
+                log::info!(
+                    "[{}] Event loop exiting after {} iterations",
+                    thread_name,
+                    iteration
+                );
+            } else {
+                log::info!("[{}] Event loop exiting", thread_name);
+            }
+        })
+        .expect("Failed to spawn event loop thread")
+}
+
 /// Initialize the USB handler
 /// This is called from the main thread during app setup
 pub fn init_usb_handler(ctx: StreamingContext) {
@@ -804,32 +877,12 @@ fn stream_frames_isochronous_with_format_detection(
     iso_stream.start()?;
 
     // Spawn event loop thread
-    let event_loop_handle = {
-        let ctx_ptr = SendableContextPtr::new(ctx.get_context_ptr());
-        let stop_flag = iso_stream.stop_flag.clone();
-
-        std::thread::spawn(move || {
-            let mut timeval = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 100_000 as libc::suseconds_t,
-            };
-
-            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                unsafe {
-                    let ret =
-                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
-                    if ret < 0 {
-                        let err = LibusbError::from(ret);
-                        if err != LibusbError::Interrupted {
-                            log::error!("Event loop error: {}", err);
-                            break;
-                        }
-                    }
-                }
-            }
-            log::info!("Format detection event loop exiting");
-        })
-    };
+    let event_loop_handle = spawn_libusb_event_loop(
+        SendableContextPtr::new(ctx.get_context_ptr()),
+        iso_stream.stop_flag.clone(),
+        "format-detection",
+        false,
+    );
 
     // Phase 1: Format detection - check first N frames for JPEG markers
     let detection_start = Instant::now();
@@ -1021,41 +1074,12 @@ fn stream_frames_isochronous(
     iso_stream.start()?;
 
     // Spawn a thread to run the libusb event loop
-    let event_loop_handle = {
-        // Wrap the raw pointer in a Send-safe wrapper (uses usize internally)
-        let ctx_ptr = SendableContextPtr::new(ctx.get_context_ptr());
-        let stop_flag = iso_stream.stop_flag.clone();
-
-        std::thread::spawn(move || {
-            log::info!("Event loop thread started");
-
-            let mut timeval = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 100_000 as libc::suseconds_t, // 100ms timeout
-            };
-
-            let mut iteration = 0u32;
-            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                unsafe {
-                    let ret =
-                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
-                    iteration += 1;
-                    if iteration <= 5 || iteration % 50 == 0 {
-                        log::debug!("Event loop iteration {}, ret={}", iteration, ret);
-                    }
-                    if ret < 0 {
-                        let err = LibusbError::from(ret);
-                        if err != LibusbError::Interrupted {
-                            log::error!("Event loop error: {}", err);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            log::info!("Event loop thread exiting after {} iterations", iteration);
-        })
-    };
+    let event_loop_handle = spawn_libusb_event_loop(
+        SendableContextPtr::new(ctx.get_context_ptr()),
+        iso_stream.stop_flag.clone(),
+        "legacy-streaming",
+        true, // Enable debug logging for legacy streaming path
+    );
 
     // Process received frames and emit to frontend
     let mut frame_count = 0u32;
@@ -1283,32 +1307,12 @@ fn stream_frames_yuy2(
     iso_stream.start()?;
 
     // Spawn event loop thread
-    let event_loop_handle = {
-        let ctx_ptr = SendableContextPtr::new(usb_ctx.get_context_ptr());
-        let stop_flag = iso_stream.stop_flag.clone();
-
-        std::thread::spawn(move || {
-            let mut timeval = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 100_000 as libc::suseconds_t,
-            };
-
-            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                unsafe {
-                    let ret =
-                        libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
-                    if ret < 0 {
-                        let err = LibusbError::from(ret);
-                        if err != LibusbError::Interrupted {
-                            log::error!("Event loop error: {}", err);
-                            break;
-                        }
-                    }
-                }
-            }
-            log::info!("YUY2 event loop exiting");
-        })
-    };
+    let event_loop_handle = spawn_libusb_event_loop(
+        SendableContextPtr::new(usb_ctx.get_context_ptr()),
+        iso_stream.stop_flag.clone(),
+        "yuy2-streaming",
+        false,
+    );
 
     // Emit status update to frontend
     let _ = stream_ctx.app_handle.emit(
