@@ -1114,6 +1114,96 @@ struct IsoCallbackContext {
     sequence_counter: Arc<AtomicU64>,
 }
 
+/// Trigger that caused frame emission
+#[derive(Debug, Clone, Copy)]
+enum FrameTrigger {
+    /// FID bit toggled (MJPEG only)
+    FidToggle,
+    /// EOF marker received (MJPEG only)
+    EofMarker,
+    /// Buffer reached expected size (YUY2 only)
+    SizeBased,
+}
+
+impl std::fmt::Display for FrameTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameTrigger::FidToggle => write!(f, "FID toggle"),
+            FrameTrigger::EofMarker => write!(f, "EOF"),
+            FrameTrigger::SizeBased => write!(f, "size-based"),
+        }
+    }
+}
+
+/// Emits a complete MJPEG frame to the frame receiver.
+///
+/// Takes the entire frame buffer and sends it if non-empty.
+/// The buffer is cleared after emission regardless of success.
+fn emit_mjpeg_frame(
+    state: &mut SharedFrameState,
+    context: &IsoCallbackContext,
+    trigger: FrameTrigger,
+) {
+    let frame = std::mem::take(&mut state.frame_buffer);
+    if !frame.is_empty() {
+        log::info!(
+            "Complete MJPEG frame: {} bytes (trigger: {})",
+            frame.len(),
+            trigger
+        );
+        let _ = context.frame_sender.send(frame);
+    }
+}
+
+/// Emits a complete YUY2 frame to the frame receiver with validation.
+///
+/// Drains exactly `expected_size` bytes from the buffer, validates the frame,
+/// and sends it. Overflow bytes are preserved in the buffer.
+fn emit_yuy2_frame(state: &mut SharedFrameState, context: &IsoCallbackContext) {
+    let expected_size = state.expected_frame_size;
+    let buffer_size = state.frame_buffer.len();
+
+    if buffer_size < expected_size {
+        return;
+    }
+
+    let overflow = buffer_size - expected_size;
+    if overflow > 0 {
+        log::debug!(
+            "Complete YUY2 frame: {} bytes ({} overflow bytes preserved)",
+            expected_size,
+            overflow
+        );
+    }
+
+    let frame: Vec<u8> = state.frame_buffer.drain(..expected_size).collect();
+
+    // Validate frame for corruption
+    let validation = crate::frame_validation::validate_yuy2_frame(
+        &frame,
+        context.frame_width,
+        context.frame_height,
+        context.expected_frame_size,
+        context.validation_level,
+    );
+
+    if !validation.valid {
+        state.validation_warning_count += 1;
+        if state.validation_warning_count <= 10 || state.validation_warning_count % 100 == 0 {
+            log::warn!(
+                "Frame validation failed (#{}) - {}. avg_row_diff={:?}, size_ratio={:.2}, aligned={}",
+                state.validation_warning_count,
+                validation.failure_reason.as_deref().unwrap_or("unknown"),
+                validation.avg_row_diff,
+                validation.size_ratio,
+                validation.stride_aligned
+            );
+        }
+    }
+
+    let _ = context.frame_sender.send(frame);
+}
+
 /// Manages isochronous USB transfers for video streaming
 pub struct IsochronousStream {
     /// libusb context (needed for event handling)
@@ -1639,19 +1729,8 @@ fn process_urb_payload_in_order(
                 if pkt.frame_id != last_fid {
                     // FID toggled - new frame starting
                     if is_mjpeg {
-                        let frame_size = state.frame_buffer.len();
-                        if frame_size > 0 && state.synced {
-                            let has_jpeg_marker = frame_size >= 2
-                                && state.frame_buffer[0] == 0xFF
-                                && state.frame_buffer[1] == 0xD8;
-                            if has_jpeg_marker {
-                                log::info!(
-                                    "Complete MJPEG frame: {} bytes (trigger: FID toggle)",
-                                    frame_size
-                                );
-                                let frame = std::mem::take(&mut state.frame_buffer);
-                                let _ = context.frame_sender.send(frame);
-                            }
+                        if state.synced && is_jpeg_data(&state.frame_buffer) {
+                            emit_mjpeg_frame(state, context, FrameTrigger::FidToggle);
                         }
                         state.frame_buffer.clear();
                     }
@@ -1676,57 +1755,14 @@ fn process_urb_payload_in_order(
         data_offset += pkt.payload_len;
 
         // For YUY2: Check if buffer has reached expected frame size
-        if !is_mjpeg {
-            let buffer_size = state.frame_buffer.len();
-            let expected_size = state.expected_frame_size;
-            if buffer_size >= expected_size {
-                let overflow = buffer_size - expected_size;
-                if overflow > 0 {
-                    log::debug!(
-                        "Complete YUY2 frame: {} bytes ({} overflow bytes preserved)",
-                        expected_size,
-                        overflow
-                    );
-                }
-                let frame: Vec<u8> = state.frame_buffer.drain(..expected_size).collect();
-
-                // Validate frame for corruption
-                let validation = crate::frame_validation::validate_yuy2_frame(
-                    &frame,
-                    context.frame_width,
-                    context.frame_height,
-                    context.expected_frame_size,
-                    context.validation_level,
-                );
-
-                if !validation.valid {
-                    state.validation_warning_count += 1;
-                    if state.validation_warning_count <= 10
-                        || state.validation_warning_count % 100 == 0
-                    {
-                        log::warn!(
-                            "Frame validation failed (#{}) - {}. avg_row_diff={:?}, size_ratio={:.2}, aligned={}",
-                            state.validation_warning_count,
-                            validation.failure_reason.as_deref().unwrap_or("unknown"),
-                            validation.avg_row_diff,
-                            validation.size_ratio,
-                            validation.stride_aligned
-                        );
-                    }
-                }
-
-                let _ = context.frame_sender.send(frame);
-            }
+        if !is_mjpeg && state.frame_buffer.len() >= state.expected_frame_size {
+            emit_yuy2_frame(state, context);
         }
 
         // For MJPEG: EOF is reliable
         if is_mjpeg && pkt.end_of_frame && !state.frame_buffer.is_empty() {
-            let has_jpeg_marker = is_jpeg_data(&state.frame_buffer);
-
-            if has_jpeg_marker {
-                log::info!("Complete MJPEG frame: {} bytes (trigger: EOF)", frame_size);
-                let frame = std::mem::take(&mut state.frame_buffer);
-                let _ = context.frame_sender.send(frame);
+            if is_jpeg_data(&state.frame_buffer) {
+                emit_mjpeg_frame(state, context, FrameTrigger::EofMarker);
             }
             state.frame_buffer.clear();
         }
