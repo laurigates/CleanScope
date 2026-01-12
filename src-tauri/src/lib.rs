@@ -836,6 +836,20 @@ pub fn emit_camera_frame(app: &AppHandle, width: u32, height: u32) {
     let _ = app.emit("camera-frame", Resolution { width, height });
 }
 
+/// Emit frame-ready event with frame metadata
+///
+/// This allows the frontend to skip the `get_frame_info` IPC call
+/// and only fetch the raw frame data.
+pub fn emit_frame_ready(app: &AppHandle, width: u32, height: u32, is_jpeg: bool) {
+    let format = if is_jpeg { "jpeg" } else { "rgb" };
+    let info = FrameInfo {
+        width,
+        height,
+        format: format.to_string(),
+    };
+    let _ = app.emit("frame-ready", info);
+}
+
 /// Run the `CleanScope` application
 ///
 /// Initializes logging, sets up the Tauri builder with commands and plugins,

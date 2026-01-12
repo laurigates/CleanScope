@@ -1523,8 +1523,8 @@ fn stream_frames_yuy2(
                                 buffer.height = height;
                             }
 
-                            // Emit notification to trigger frontend fetch
-                            let _ = stream_ctx.app_handle.emit("frame-ready", ());
+                            // Emit frame-ready with metadata (reduces frontend IPC calls)
+                            crate::emit_frame_ready(&stream_ctx.app_handle, width, height, false);
 
                             if frame_count % 30 == 0 {
                                 log::info!(
