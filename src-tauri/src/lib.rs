@@ -3,7 +3,7 @@
 //! This module contains the core Tauri application logic and USB camera handling.
 
 mod capture;
-mod frame_validation;
+pub mod frame_validation;
 pub mod replay;
 mod usb;
 pub mod yuv_conversion;
