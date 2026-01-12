@@ -142,25 +142,35 @@ onMount(async () => {
   unlistenFns.push(unlistenUsbStatus);
 
   // Listen for frame-ready events and fetch frame data
-  const unlistenFrame = await listen("frame-ready", async () => {
-    try {
-      // Fetch frame info (format, dimensions) and raw bytes in parallel
-      const [frameInfo, frameData] = await Promise.all([
-        invoke<{ width: number; height: number; format: string }>("get_frame_info"),
-        invoke<ArrayBuffer>("get_frame"),
-      ]);
+  // The event payload may contain frame info (when available from backend)
+  // or be empty (legacy paths), in which case we fetch info separately
+  const unlistenFrame = await listen<{ width: number; height: number; format: string } | null>(
+    "frame-ready",
+    async (event) => {
+      try {
+        // Get frame info from event payload if available, otherwise fetch it
+        const frameInfoPromise = event.payload?.width
+          ? Promise.resolve(event.payload)
+          : invoke<{ width: number; height: number; format: string }>("get_frame_info");
 
-      await renderFrame(frameData, frameInfo.format, frameInfo.width, frameInfo.height);
-      frameCount++;
+        // Fetch frame data (always needed)
+        const [frameInfo, frameData] = await Promise.all([
+          frameInfoPromise,
+          invoke<ArrayBuffer>("get_frame"),
+        ]);
 
-      // Track timestamp for FPS calculation
-      const now = performance.now();
-      frameTimestamps = [...frameTimestamps.slice(-(FPS_SAMPLE_SIZE - 1)), now];
-    } catch (e) {
-      // Silently ignore frame fetch errors (e.g., no frame available yet)
-      console.debug("Frame fetch error:", e);
-    }
-  });
+        await renderFrame(frameData, frameInfo.format, frameInfo.width, frameInfo.height);
+        frameCount++;
+
+        // Track timestamp for FPS calculation
+        const now = performance.now();
+        frameTimestamps = [...frameTimestamps.slice(-(FPS_SAMPLE_SIZE - 1)), now];
+      } catch (e) {
+        // Silently ignore frame fetch errors (e.g., no frame available yet)
+        console.debug("Frame fetch error:", e);
+      }
+    },
+  );
   unlistenFns.push(unlistenFrame);
 
   // Check initial connection status
