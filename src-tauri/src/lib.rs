@@ -22,6 +22,54 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use thiserror::Error;
+
+/// Unified error type for Tauri commands.
+///
+/// Provides structured error handling with consistent error messages
+/// and the ability to match on error types for better debugging.
+#[derive(Debug, Error)]
+pub enum AppError {
+    /// Mutex lock was poisoned (another thread panicked while holding it)
+    #[error("Lock poisoned: {0}")]
+    LockPoisoned(String),
+
+    /// IO error during file operations
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Packet capture error
+    #[error("Capture error: {0}")]
+    Capture(#[from] capture::CaptureError),
+
+    /// Frame is empty or not available
+    #[error("No frame available")]
+    NoFrame,
+
+    /// Path resolution error (e.g., could not get cache dir)
+    #[error("Path error: {0}")]
+    PathError(String),
+}
+
+// Tauri requires errors to be serializable for IPC
+impl serde::Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// Helper macro to convert mutex lock errors to `AppError`
+macro_rules! lock_or_err {
+    ($mutex:expr) => {
+        $mutex
+            .lock()
+            .map_err(|e| AppError::LockPoisoned(e.to_string()))
+    };
+}
+
 /// Shared frame buffer for storing the latest camera frame
 pub struct FrameBuffer {
     /// Processed frame data (JPEG or RGB)
@@ -255,14 +303,11 @@ struct FrameInfo {
 /// - MJPEG cameras: JPEG-encoded data
 /// - YUY2 cameras: Raw RGB24 data (3 bytes per pixel)
 #[tauri::command]
-fn get_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
-    let buffer = state
-        .frame_buffer
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+fn get_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, AppError> {
+    let buffer = lock_or_err!(state.frame_buffer)?;
 
     if buffer.frame.is_empty() {
-        return Err("No frame available".to_string());
+        return Err(AppError::NoFrame);
     }
 
     Ok(tauri::ipc::Response::new(buffer.frame.clone()))
@@ -433,14 +478,11 @@ fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Captu
 
 /// Get frame metadata (dimensions and format)
 #[tauri::command]
-fn get_frame_info(state: State<'_, AppState>) -> Result<FrameInfo, String> {
-    let buffer = state
-        .frame_buffer
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+fn get_frame_info(state: State<'_, AppState>) -> Result<FrameInfo, AppError> {
+    let buffer = lock_or_err!(state.frame_buffer)?;
 
     if buffer.frame.is_empty() {
-        return Err("No frame available".to_string());
+        return Err(AppError::NoFrame);
     }
 
     // Detect format based on JPEG signature
@@ -470,11 +512,8 @@ fn cycle_index(current: &mut Option<usize>, max_len: usize) -> Option<usize> {
 
 /// Cycle through width options
 #[tauri::command]
-fn cycle_width(state: State<'_, AppState>) -> Result<String, String> {
-    let mut display = state
-        .display
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn cycle_width(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut display = lock_or_err!(state.display)?;
 
     let new_index = cycle_index(&mut display.width_index, WIDTH_OPTIONS.len());
     display.settings.width = new_index.map(|i| WIDTH_OPTIONS[i]);
@@ -487,11 +526,8 @@ fn cycle_width(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Cycle through height options
 #[tauri::command]
-fn cycle_height(state: State<'_, AppState>) -> Result<String, String> {
-    let mut display = state
-        .display
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn cycle_height(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut display = lock_or_err!(state.display)?;
 
     let new_index = cycle_index(&mut display.height_index, HEIGHT_OPTIONS.len());
     display.settings.height = new_index.map(|i| HEIGHT_OPTIONS[i]);
@@ -504,11 +540,8 @@ fn cycle_height(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Cycle through stride options
 #[tauri::command]
-fn cycle_stride(state: State<'_, AppState>) -> Result<String, String> {
-    let mut display = state
-        .display
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn cycle_stride(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut display = lock_or_err!(state.display)?;
 
     let new_index = cycle_index(&mut display.stride_index, STRIDE_OPTIONS.len());
 
@@ -520,11 +553,8 @@ fn cycle_stride(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Get current display settings as a summary string
 #[tauri::command]
-fn get_display_settings(state: State<'_, AppState>) -> Result<String, String> {
-    let display = state
-        .display
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn get_display_settings(state: State<'_, AppState>) -> Result<String, AppError> {
+    let display = lock_or_err!(state.display)?;
     let w = display
         .settings
         .width
