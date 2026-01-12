@@ -389,17 +389,47 @@ struct UvcNegotiatedParams {
     max_frame_size: u32,
 }
 
-/// Maximum number of format indices to try when searching for MJPEG
+/// Configuration for UVC format detection
+///
+/// These values control how the app discovers and validates video formats
+/// from USB Video Class devices.
 #[cfg(target_os = "android")]
-const MAX_FORMAT_INDEX: u8 = 4;
+#[derive(Debug, Clone)]
+pub struct UvcConfig {
+    /// Maximum format index to try when searching for MJPEG.
+    /// USB cameras may have multiple format indices (1-based).
+    /// Default: 4 (covers most consumer cameras)
+    pub max_format_index: u8,
 
-/// Number of frames to check before deciding if format is MJPEG
-#[cfg(target_os = "android")]
-const FRAMES_TO_CHECK_FORMAT: u32 = 10;
+    /// Number of frames to analyze before deciding if format is MJPEG.
+    /// More frames = more accurate detection but slower startup.
+    /// Default: 10
+    pub frames_to_check_format: u32,
 
-/// Timeout in seconds for format detection
+    /// Timeout in seconds for format detection phase.
+    /// If detection takes longer, falls back to best guess.
+    /// Default: 10 seconds
+    pub detection_timeout_secs: u64,
+}
+
 #[cfg(target_os = "android")]
-const FORMAT_DETECTION_TIMEOUT_SECS: u64 = 10;
+impl Default for UvcConfig {
+    fn default() -> Self {
+        Self {
+            max_format_index: 4,
+            frames_to_check_format: 10,
+            detection_timeout_secs: 10,
+        }
+    }
+}
+
+/// Default UVC configuration
+#[cfg(target_os = "android")]
+const UVC_CONFIG: UvcConfig = UvcConfig {
+    max_format_index: 4,
+    frames_to_check_format: 10,
+    detection_timeout_secs: 10,
+};
 
 /// Discover available video formats from UVC descriptors and store them in streaming config.
 ///
@@ -755,11 +785,11 @@ fn run_camera_loop_inner(
     } else {
         // Auto-detect: Try different format indices to find MJPEG format
         // Format index 1 is not guaranteed to be MJPEG - varies by device
-        for format_index in 1..=MAX_FORMAT_INDEX {
+        for format_index in 1..=UVC_CONFIG.max_format_index {
             log::info!(
                 "=== Trying format index {} of {} ===",
                 format_index,
-                MAX_FORMAT_INDEX
+                UVC_CONFIG.max_format_index
             );
 
             match try_mjpeg_streaming(
@@ -886,17 +916,17 @@ fn stream_frames_isochronous_with_format_detection(
 
     // Phase 1: Format detection - check first N frames for JPEG markers
     let detection_start = Instant::now();
-    let detection_timeout = Duration::from_secs(FORMAT_DETECTION_TIMEOUT_SECS);
+    let detection_timeout = Duration::from_secs(UVC_CONFIG.detection_timeout_secs);
     let mut frames_checked = 0u32;
     let mut jpeg_frames = 0u32;
     let mut non_jpeg_frames = 0u32;
 
     log::info!(
         "Format detection phase: checking up to {} frames for JPEG markers",
-        FRAMES_TO_CHECK_FORMAT
+        UVC_CONFIG.frames_to_check_format
     );
 
-    while frames_checked < FRAMES_TO_CHECK_FORMAT {
+    while frames_checked < UVC_CONFIG.frames_to_check_format {
         if detection_start.elapsed() > detection_timeout {
             log::warn!(
                 "Format detection timeout after {} frames ({} JPEG, {} non-JPEG)",
@@ -1817,8 +1847,9 @@ fn stream_frames(
                                 );
                             }
 
-                            // Format detection: check after FRAMES_TO_CHECK_FORMAT frames
-                            if !format_confirmed && frame_count >= FRAMES_TO_CHECK_FORMAT {
+                            // Format detection: check after UVC_CONFIG.frames_to_check_format frames
+                            if !format_confirmed && frame_count >= UVC_CONFIG.frames_to_check_format
+                            {
                                 let is_mjpeg = jpeg_frames > 0 && jpeg_frames >= frame_count / 2;
                                 log::info!(
                                     "Bulk format detection: {} JPEG / {} total - {}",

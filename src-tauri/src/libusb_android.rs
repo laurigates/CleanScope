@@ -1023,20 +1023,51 @@ pub mod uvc {
 // Isochronous Transfer Support
 // ============================================================================
 
-/// Number of isochronous packets per transfer
-/// Higher values = better throughput, lower values = lower latency
-const ISO_PACKETS_PER_TRANSFER: i32 = 32;
+/// Configuration for isochronous USB transfers
+///
+/// These values control how USB video data is streamed from the camera.
+/// Tuning these affects latency, throughput, and CPU usage.
+#[derive(Debug, Clone)]
+pub struct IsoTransferConfig {
+    /// Number of isochronous packets per transfer.
+    /// Higher values = better throughput, lower values = lower latency.
+    /// Default: 32 (balanced for USB endoscopes)
+    pub packets_per_transfer: i32,
 
-/// Number of transfers to keep in flight simultaneously
-/// This ensures continuous streaming without gaps
-const NUM_TRANSFERS: usize = 4;
+    /// Number of transfers to keep in flight simultaneously.
+    /// More transfers = continuous streaming without gaps.
+    /// Default: 4 (allows overlapped processing)
+    pub num_transfers: usize,
 
-/// Timeout for event handling in milliseconds
-const EVENT_TIMEOUT_MS: i32 = 100;
+    /// Timeout for event handling in milliseconds.
+    /// Lower values = more responsive stop, higher values = less CPU usage.
+    /// Default: 100ms
+    pub event_timeout_ms: i32,
+}
 
-/// Known YUY2 frame sizes for common resolutions (2 bytes per pixel)
+impl Default for IsoTransferConfig {
+    fn default() -> Self {
+        Self {
+            packets_per_transfer: 32,
+            num_transfers: 4,
+            event_timeout_ms: 100,
+        }
+    }
+}
+
+/// Default isochronous transfer configuration
+const ISO_CONFIG: IsoTransferConfig = IsoTransferConfig {
+    packets_per_transfer: 32,
+    num_transfers: 4,
+    event_timeout_ms: 100,
+};
+
+/// Known YUY2 frame sizes for common resolutions
+///
+/// Format: (frame_size_bytes, width, height)
+/// YUY2 uses 2 bytes per pixel (Y-U-Y-V packed format).
 const YUY2_FRAME_SIZES: &[(usize, u32, u32)] = &[
-    (1843200, 1280, 720), // 720p
+    (1843200, 1280, 720), // 720p (HD)
     (921600, 640, 720),   // Half 720p width
     (614400, 640, 480),   // VGA
     (460800, 640, 360),   // 360p
@@ -1108,7 +1139,7 @@ struct IsoCallbackContext {
     frame_width: usize,
     /// Frame height in pixels (for validation)
     frame_height: usize,
-    /// Transfer index (0 to NUM_TRANSFERS-1) for this transfer
+    /// Transfer index (0 to ISO_CONFIG.num_transfers-1) for this transfer
     transfer_index: usize,
     /// Global sequence counter shared across all transfers for ordering
     sequence_counter: Arc<AtomicU64>,
@@ -1284,15 +1315,15 @@ impl IsochronousStream {
         // Global sequence counter for URB ordering (shared across all transfers)
         let sequence_counter = Arc::new(AtomicU64::new(0));
 
-        let buffer_size = (max_packet_size as usize) * (ISO_PACKETS_PER_TRANSFER as usize);
+        let buffer_size = (max_packet_size as usize) * (ISO_CONFIG.packets_per_transfer as usize);
 
-        let mut transfers = Vec::with_capacity(NUM_TRANSFERS);
-        let mut buffers = Vec::with_capacity(NUM_TRANSFERS);
-        let mut contexts = Vec::with_capacity(NUM_TRANSFERS);
+        let mut transfers = Vec::with_capacity(ISO_CONFIG.num_transfers);
+        let mut buffers = Vec::with_capacity(ISO_CONFIG.num_transfers);
+        let mut contexts = Vec::with_capacity(ISO_CONFIG.num_transfers);
 
-        for i in 0..NUM_TRANSFERS {
+        for i in 0..ISO_CONFIG.num_transfers {
             // Allocate transfer with space for ISO packet descriptors
-            let transfer = libusb1_sys::libusb_alloc_transfer(ISO_PACKETS_PER_TRANSFER);
+            let transfer = libusb1_sys::libusb_alloc_transfer(ISO_CONFIG.packets_per_transfer);
             if transfer.is_null() {
                 // Clean up already allocated transfers
                 for t in &transfers {
@@ -1327,8 +1358,8 @@ impl IsochronousStream {
 
         log::info!(
             "Allocated {} isochronous transfers, {} packets each, {} bytes per packet (buffer {})",
-            NUM_TRANSFERS,
-            ISO_PACKETS_PER_TRANSFER,
+            ISO_CONFIG.num_transfers,
+            ISO_CONFIG.packets_per_transfer,
             max_packet_size,
             buffer_size
         );
@@ -1353,11 +1384,11 @@ impl IsochronousStream {
             self.endpoint
         );
 
-        for i in 0..NUM_TRANSFERS {
+        for i in 0..ISO_CONFIG.num_transfers {
             self.setup_and_submit_transfer(i)?;
         }
 
-        log::info!("All {} transfers submitted", NUM_TRANSFERS);
+        log::info!("All {} transfers submitted", ISO_CONFIG.num_transfers);
         Ok(())
     }
 
@@ -1376,7 +1407,7 @@ impl IsochronousStream {
             (*transfer).timeout = 0; // No timeout for isochronous
             (*transfer).length = buffer_len;
             (*transfer).buffer = buffer;
-            (*transfer).num_iso_packets = ISO_PACKETS_PER_TRANSFER;
+            (*transfer).num_iso_packets = ISO_CONFIG.packets_per_transfer;
             (*transfer).callback = iso_transfer_callback;
             (*transfer).user_data = context_ptr as *mut libc::c_void;
 
@@ -1407,7 +1438,7 @@ impl IsochronousStream {
 
         let mut timeval = libc::timeval {
             tv_sec: 0,
-            tv_usec: (EVENT_TIMEOUT_MS * 1000) as libc::suseconds_t,
+            tv_usec: (ISO_CONFIG.event_timeout_ms * 1000) as libc::suseconds_t,
         };
 
         while !self.stop_flag.load(Ordering::Relaxed) {

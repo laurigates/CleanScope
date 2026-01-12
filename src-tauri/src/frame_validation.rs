@@ -8,10 +8,44 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Thresholds for different validation levels
-const STRICT_ROW_DIFF_THRESHOLD: f32 = 40.0;
-const MODERATE_SIZE_TOLERANCE: f32 = 1.1; // 10% tolerance
-const MINIMAL_SIZE_TOLERANCE: f32 = 2.0; // 100% tolerance
+/// Configuration for frame validation thresholds
+///
+/// These values control how strictly frames are validated for corruption.
+/// Lower thresholds catch more artifacts but may reject valid frames.
+#[derive(Debug, Clone)]
+pub struct ValidationConfig {
+    /// Maximum allowed average Y-channel row difference (Strict mode).
+    /// Values above this threshold indicate horizontal banding.
+    /// Default: 40.0 (empirically determined for USB endoscopes)
+    pub row_diff_threshold: f32,
+
+    /// Size tolerance for strict/moderate modes (fraction).
+    /// Frame size must be within (1/tolerance, tolerance) of expected.
+    /// Default: 1.1 (10% tolerance)
+    pub size_tolerance_moderate: f32,
+
+    /// Size tolerance for minimal mode (fraction).
+    /// Frame size must be within (1/tolerance, tolerance) of expected.
+    /// Default: 2.0 (100% tolerance)
+    pub size_tolerance_minimal: f32,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            row_diff_threshold: 40.0,
+            size_tolerance_moderate: 1.1,
+            size_tolerance_minimal: 2.0,
+        }
+    }
+}
+
+/// Default validation configuration
+const VALIDATION_CONFIG: ValidationConfig = ValidationConfig {
+    row_diff_threshold: 40.0,
+    size_tolerance_moderate: 1.1,
+    size_tolerance_minimal: 2.0,
+};
 
 /// Frame validation strictness levels
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -100,9 +134,11 @@ pub fn validate_yuy2_frame(
 
     // Size validation (all levels except Off)
     let size_valid = match level {
-        ValidationLevel::Minimal => (0.5..=MINIMAL_SIZE_TOLERANCE).contains(&size_ratio),
+        ValidationLevel::Minimal => {
+            (0.5..=VALIDATION_CONFIG.size_tolerance_minimal).contains(&size_ratio)
+        }
         ValidationLevel::Moderate | ValidationLevel::Strict => {
-            (0.9..=MODERATE_SIZE_TOLERANCE).contains(&size_ratio)
+            (0.9..=VALIDATION_CONFIG.size_tolerance_moderate).contains(&size_ratio)
         }
         ValidationLevel::Off => true,
     };
@@ -141,10 +177,10 @@ pub fn validate_yuy2_frame(
 
     let row_diff_valid = match (level, avg_row_diff) {
         (ValidationLevel::Strict, Some(diff)) => {
-            if diff > STRICT_ROW_DIFF_THRESHOLD {
+            if diff > VALIDATION_CONFIG.row_diff_threshold {
                 failure_reasons.push(format!(
                     "High row difference: {:.1} (threshold {})",
-                    diff, STRICT_ROW_DIFF_THRESHOLD
+                    diff, VALIDATION_CONFIG.row_diff_threshold
                 ));
                 false
             } else {
