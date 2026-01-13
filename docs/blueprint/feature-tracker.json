@@ -1,0 +1,182 @@
+{
+  "version": "1.0.0",
+  "source_document": "docs/blueprint/work-overview.md",
+  "last_updated": "2026-01-13",
+  "statistics": {
+    "total_features": 18,
+    "complete": 12,
+    "in_progress": 1,
+    "pending": 5,
+    "completion_percentage": 66.7
+  },
+  "phases": [
+    {
+      "id": "foundation",
+      "name": "Foundation & Scaffolding",
+      "status": "complete",
+      "features": [
+        {
+          "id": "F001",
+          "name": "Tauri v2 + Rust Android app scaffolding",
+          "status": "complete",
+          "notes": "Base project structure with Tauri v2"
+        },
+        {
+          "id": "F002",
+          "name": "Svelte 5 frontend with runes syntax",
+          "status": "complete",
+          "notes": "Modern Svelte 5 runes for reactivity"
+        },
+        {
+          "id": "F003",
+          "name": "Android USB intent filters",
+          "status": "complete",
+          "notes": "Auto-launch on USB device attachment"
+        },
+        {
+          "id": "F004",
+          "name": "JNI bridge for USB file descriptor access",
+          "status": "complete",
+          "notes": "Native bridge to Android USB APIs"
+        }
+      ]
+    },
+    {
+      "id": "usb-integration",
+      "name": "USB & libusb Integration",
+      "status": "complete",
+      "features": [
+        {
+          "id": "F005",
+          "name": "libusb1-sys with vendored libusb for Android",
+          "status": "complete",
+          "notes": "Cross-compiled libusb for Android target"
+        },
+        {
+          "id": "F006",
+          "name": "libusb Android wrapper (libusb_android.rs)",
+          "status": "complete",
+          "notes": "Safe FFI wrapper with isochronous transfer support"
+        },
+        {
+          "id": "F007",
+          "name": "UVC streaming protocol (probe/commit)",
+          "status": "complete",
+          "notes": "Format negotiation per UVC spec"
+        }
+      ]
+    },
+    {
+      "id": "video-pipeline",
+      "name": "Video Pipeline",
+      "status": "complete",
+      "features": [
+        {
+          "id": "F008",
+          "name": "MJPEG frame boundary detection",
+          "status": "complete",
+          "notes": "Detect JPEG markers (0xFFD8/0xFFD9)"
+        },
+        {
+          "id": "F009",
+          "name": "YUY2/YUYV frame processing",
+          "status": "complete",
+          "notes": "Uncompressed video format support with format toggle"
+        },
+        {
+          "id": "F010",
+          "name": "Frame streaming architecture (ADR-001)",
+          "status": "complete",
+          "notes": "FrameBuffer with Arc<Mutex<>>, polling pattern"
+        },
+        {
+          "id": "F011",
+          "name": "Frontend canvas rendering",
+          "status": "complete",
+          "notes": "createImageBitmap() for efficient rendering"
+        },
+        {
+          "id": "F012",
+          "name": "Frame validation system",
+          "status": "complete",
+          "notes": "Row similarity, size, stride checks with configurable levels"
+        }
+      ]
+    },
+    {
+      "id": "ui-features",
+      "name": "UI & User Experience",
+      "status": "in_progress",
+      "features": [
+        {
+          "id": "F013",
+          "name": "Basic UI with connection status",
+          "status": "complete",
+          "notes": "Connection state display, debug controls"
+        },
+        {
+          "id": "F014",
+          "name": "Resolution cycling UI",
+          "status": "pending",
+          "notes": "Per ADR-003 progressive negotiation",
+          "dependencies": ["ADR-003"]
+        },
+        {
+          "id": "F015",
+          "name": "Debug UI controls (width/height/stride/offset)",
+          "status": "complete",
+          "notes": "Manual override controls for troubleshooting"
+        }
+      ]
+    },
+    {
+      "id": "reliability",
+      "name": "Reliability & Error Handling",
+      "status": "pending",
+      "features": [
+        {
+          "id": "F016",
+          "name": "USB disconnection error handling",
+          "status": "pending",
+          "notes": "Graceful handling of device removal"
+        },
+        {
+          "id": "F017",
+          "name": "Reconnection handling",
+          "status": "pending",
+          "notes": "Auto-reconnect on device reattachment"
+        },
+        {
+          "id": "F018",
+          "name": "Frame rate optimization",
+          "status": "pending",
+          "notes": "Performance tuning for smooth video"
+        }
+      ]
+    }
+  ],
+  "work_orders": [
+    {
+      "id": "usb-permission-fix",
+      "file": "docs/blueprint/work-orders/usb-permission-fix.md",
+      "related_features": ["F016", "F017"]
+    }
+  ],
+  "adrs": [
+    {
+      "id": "ADR-001",
+      "title": "Frame Streaming Architecture",
+      "related_features": ["F010"]
+    },
+    {
+      "id": "ADR-002",
+      "title": "JPEG Decoding Strategy",
+      "related_features": ["F008", "F011"]
+    },
+    {
+      "id": "ADR-003",
+      "title": "Resolution Negotiation Protocol",
+      "related_features": ["F014"]
+    }
+  ]
+}

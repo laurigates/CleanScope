@@ -1,0 +1,49 @@
+{
+  "format_version": "3.0.0",
+  "created_at": "2025-12-21T00:00:00Z",
+  "updated_at": "2026-01-13T00:00:00Z",
+  "created_by": {
+    "blueprint_plugin": "3.0.0"
+  },
+  "project": {
+    "name": "CleanScope",
+    "type": "team",
+    "detected_stack": ["rust", "tauri", "svelte", "android"]
+  },
+  "structure": {
+    "has_prds": false,
+    "has_adrs": true,
+    "has_prps": false,
+    "has_work_orders": true,
+    "has_ai_docs": false,
+    "has_modular_rules": true,
+    "has_document_detection": false,
+    "has_feature_tracker": true,
+    "claude_md_mode": "both"
+  },
+  "generated": {
+    "rules": {},
+    "commands": {}
+  },
+  "custom_overrides": {
+    "rules": [
+      "development.md",
+      "testing.md",
+      "video-pipeline.md"
+    ],
+    "commands": []
+  },
+  "upgrade_history": [
+    {
+      "from": "1.1.0",
+      "to": "3.0.0",
+      "date": "2026-01-13",
+      "changes": [
+        "Moved state from .claude/blueprints/ to docs/blueprint/",
+        "Moved ADRs from .claude/blueprints/adr/ to docs/adrs/",
+        "Created docs/blueprint/README.md",
+        "Registered existing rules as custom overrides"
+      ]
+    }
+  ]
+}

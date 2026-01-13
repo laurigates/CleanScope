@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current Focus
+
+**Phase:** UI & User Experience (66.7% complete)
+
+| Status | Count | Features |
+|--------|-------|----------|
+| Complete | 12 | Foundation, USB integration, video pipeline, basic UI |
+| In Progress | 1 | UI features phase |
+| Pending | 5 | Resolution cycling, error handling, reconnection, frame rate optimization |
+
+**Next priorities:**
+1. Resolution cycling UI (ADR-003)
+2. USB disconnection error handling
+3. Reconnection handling
+
+See `docs/blueprint/feature-tracker.json` for full breakdown.
+
 ## Project Overview
 
 CleanScope is a privacy-respecting Android application for viewing video feeds from USB-C endoscopes (UVC devices). Built with Tauri v2 + Rust to avoid Java/Kotlin complexity.
@@ -238,3 +255,20 @@ adb logcat -s RustStdoutStderr:* | grep -E "stride|resolution|width|height"
 # Watch frame validation warnings (see env var section for levels)
 adb logcat -s RustStdoutStderr:* | grep -E "validation|row_diff|size_ratio"
 ```
+
+## See Also
+
+**Modular rules** (`.claude/rules/`):
+- `development.md` - TDD workflow, Tauri commands, state management patterns
+- `testing.md` - Rust/frontend testing, Android testing workflow
+- `video-pipeline.md` - Frame assembly, YUV conversion, debugging checklist
+
+**Architecture Decision Records** (`docs/adrs/`):
+- ADR-001: Frame Streaming Architecture (polling pattern)
+- ADR-002: JPEG Decoding Strategy (browser-native)
+- ADR-003: Resolution Negotiation Protocol (progressive)
+
+**Blueprint** (`docs/blueprint/`):
+- `work-overview.md` - Current phase and completed work
+- `feature-tracker.json` - Feature status and progress
+- `work-orders/` - Detailed task breakdowns
