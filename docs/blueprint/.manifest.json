@@ -29,7 +29,9 @@
     "rules": [
       "development.md",
       "testing.md",
-      "video-pipeline.md"
+      "video-pipeline.md",
+      "rust-backend.md",
+      "svelte-frontend.md"
     ],
     "commands": []
   },
