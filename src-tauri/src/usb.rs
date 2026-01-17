@@ -14,7 +14,7 @@ use crate::frame_assembler::is_jpeg_data;
 use crate::{DisplayConfig, FrameBuffer, StreamingConfig, ValidationLevel};
 
 #[cfg(target_os = "android")]
-use crate::PixelFormat;
+use crate::{DisplaySettings, PixelFormat};
 
 /// Context for USB streaming operations
 ///
@@ -438,7 +438,7 @@ const UVC_CONFIG: UvcConfig = UvcConfig {
 fn discover_and_store_formats(
     dev: &LibusbDeviceHandle,
     streaming_config: &Arc<Mutex<StreamingConfig>>,
-) -> Vec<uvc::FormatDescriptor> {
+) -> Vec<uvc::UvcFormatInfo> {
     let formats = dev.get_format_descriptors().unwrap_or_default();
     {
         let mut config = streaming_config.lock().unwrap();
@@ -452,15 +452,19 @@ fn discover_and_store_formats(
                     uvc::UvcFormatType::FrameBased => "H264".to_string(),
                     uvc::UvcFormatType::Unknown(n) => format!("UNK:{}", n),
                 };
-                let resolutions: Vec<String> = f
+                let frames: Vec<crate::DiscoveredFrame> = f
                     .frames
                     .iter()
-                    .map(|fr| format!("{}x{}", fr.width, fr.height))
+                    .map(|fr| crate::DiscoveredFrame {
+                        frame_index: fr.frame_index,
+                        width: fr.width,
+                        height: fr.height,
+                    })
                     .collect();
                 crate::DiscoveredFormat {
                     index: f.format_index,
                     format_type,
-                    resolutions,
+                    frames,
                 }
             })
             .collect();
@@ -571,7 +575,7 @@ fn try_mjpeg_streaming(
 
 /// Start YUV fallback streaming when MJPEG is not available.
 ///
-/// Uses format index 1 by default and streams with RGB conversion.
+/// Uses format index 1 by default and selected frame index from config.
 #[cfg(target_os = "android")]
 fn start_yuy2_fallback(
     usb_ctx: &LibusbContext,
@@ -579,8 +583,16 @@ fn start_yuy2_fallback(
     ep_info: &EndpointInfo,
     stream_ctx: &StreamingContext,
 ) -> Result<StreamResult, LibusbError> {
-    // Start streaming with format 1 and get negotiated resolution
-    let params = start_uvc_streaming_with_resolution(dev, Some(ep_info), 1)?;
+    // Get selected frame index from config, default to 1
+    let frame_idx = stream_ctx
+        .streaming_config
+        .lock()
+        .unwrap()
+        .selected_frame_index
+        .unwrap_or(1);
+
+    // Start streaming with format 1 and selected frame index
+    let params = start_uvc_streaming_with_resolution(dev, Some(ep_info), 1, frame_idx)?;
     log::info!(
         "Starting YUV streaming on endpoint 0x{:02x}, resolution {}x{}",
         params.endpoint,
@@ -708,10 +720,16 @@ fn run_camera_loop_inner(
     let formats = discover_and_store_formats(&dev, &stream_ctx.streaming_config);
 
     // Get user's format selection and MJPEG skip preference
-    let (selected_format, skip_mjpeg) = {
+    let (selected_format, selected_frame, skip_mjpeg) = {
         let config = stream_ctx.streaming_config.lock().unwrap();
-        (config.selected_format_index, config.skip_mjpeg_detection)
+        (
+            config.selected_format_index,
+            config.selected_frame_index,
+            config.skip_mjpeg_detection,
+        )
     };
+    // Default to frame index 1 if not specified
+    let frame_idx = selected_frame.unwrap_or(1);
 
     // Determine which format(s) to try based on user selection
     if let Some(format_idx) = selected_format {
@@ -727,7 +745,7 @@ fn run_camera_loop_inner(
 
         if is_mjpeg {
             // Start MJPEG streaming with selected format
-            let endpoint = start_uvc_streaming(&dev, Some(&ep_info), format_idx)?;
+            let endpoint = start_uvc_streaming(&dev, Some(&ep_info), format_idx, frame_idx)?;
             log::info!(
                 "MJPEG streaming started on endpoint 0x{:02x} with format {}",
                 endpoint,
@@ -762,7 +780,8 @@ fn run_camera_loop_inner(
             return Ok(StreamResult::Normal);
         } else {
             // Start YUV streaming with selected format
-            let params = start_uvc_streaming_with_resolution(&dev, Some(&ep_info), format_idx)?;
+            let params =
+                start_uvc_streaming_with_resolution(&dev, Some(&ep_info), format_idx, frame_idx)?;
             log::info!(
                 "YUV streaming started on endpoint 0x{:02x}, resolution {}x{} with format {}",
                 params.endpoint,
@@ -1570,8 +1589,10 @@ fn start_uvc_streaming(
     dev: &LibusbDeviceHandle,
     endpoint_info: Option<&EndpointInfo>,
     format_index: u8,
+    frame_index: u8,
 ) -> Result<u8, LibusbError> {
-    let params = start_uvc_streaming_with_resolution(dev, endpoint_info, format_index)?;
+    let params =
+        start_uvc_streaming_with_resolution(dev, endpoint_info, format_index, frame_index)?;
     Ok(params.endpoint)
 }
 
@@ -1582,10 +1603,12 @@ fn start_uvc_streaming_with_resolution(
     dev: &LibusbDeviceHandle,
     endpoint_info: Option<&EndpointInfo>,
     format_index: u8,
+    frame_index: u8,
 ) -> Result<UvcNegotiatedParams, LibusbError> {
     log::info!(
-        "Initiating UVC probe/commit sequence with format_index={}",
-        format_index
+        "Initiating UVC probe/commit sequence with format_index={}, frame_index={}",
+        format_index,
+        frame_index
     );
 
     // Get format descriptors first so we can look up resolution
@@ -1595,7 +1618,7 @@ fn start_uvc_streaming_with_resolution(
     let mut probe = UvcStreamControl::default();
     probe.bm_hint = 1; // dwFrameInterval field is valid
     probe.b_format_index = format_index; // Try specified format
-    probe.b_frame_index = 1; // First frame size
+    probe.b_frame_index = frame_index; // Selected resolution
 
     // Request type: Class request to interface, direction OUT then IN
     let request_type_out = uvc::USB_TYPE_CLASS | uvc::USB_RECIP_INTERFACE | uvc::USB_DIR_OUT;
@@ -1771,7 +1794,6 @@ fn stream_frames(
     let timeout_ms = 1000;
     let mut frame_count = 0u32;
     let mut jpeg_frames = 0u32;
-    let mut non_jpeg_frames = 0u32;
     let mut format_confirmed = false;
 
     loop {
@@ -1838,7 +1860,6 @@ fn stream_frames(
                                     );
                                 }
                             } else {
-                                non_jpeg_frames += 1;
                                 log::warn!(
                                     "Non-JPEG frame received: {} bytes, header: {:02x?}",
                                     local_frame_buffer.len(),

@@ -49,6 +49,10 @@ pub enum AppError {
     /// Path resolution error (e.g., could not get cache dir)
     #[error("Path error: {0}")]
     PathError(String),
+
+    /// Resource not found (e.g., no formats discovered)
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 // Tauri requires errors to be serializable for IPC
@@ -161,10 +165,23 @@ pub struct StreamingConfig {
     pub pixel_format: PixelFormat,
     /// Selected format index (None = auto-detect, Some(n) = use format n)
     pub selected_format_index: Option<u8>,
-    /// Available formats discovered from camera (`format_index`, `type_name`, resolutions)
+    /// Selected frame index for resolution (None = use first available, Some(n) = use frame n)
+    pub selected_frame_index: Option<u8>,
+    /// Available formats discovered from camera
     pub available_formats: Vec<DiscoveredFormat>,
     /// Flag to signal streaming should restart with new settings
     pub restart_requested: bool,
+}
+
+/// A discovered frame descriptor (resolution info) from UVC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredFrame {
+    /// UVC frame index (1-based)
+    pub frame_index: u8,
+    /// Frame width in pixels
+    pub width: u16,
+    /// Frame height in pixels
+    pub height: u16,
 }
 
 /// A discovered camera format for UI display
@@ -174,8 +191,8 @@ pub struct DiscoveredFormat {
     pub index: u8,
     /// Human-readable format type (e.g., "MJPEG", "YUY2")
     pub format_type: String,
-    /// Available resolutions as `WxH` strings
-    pub resolutions: Vec<String>,
+    /// Available frames with resolution info
+    pub frames: Vec<DiscoveredFrame>,
 }
 
 /// Available width options for cycling
@@ -230,6 +247,19 @@ pub struct Resolution {
     pub height: u32,
 }
 
+/// Resolution info with frame index and available count
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolutionInfo {
+    /// Width in pixels
+    pub width: u16,
+    /// Height in pixels
+    pub height: u16,
+    /// UVC frame index (1-based)
+    pub frame_index: u8,
+    /// Number of available resolutions in current format
+    pub available_count: usize,
+}
+
 /// Build information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildInfo {
@@ -262,28 +292,152 @@ fn check_usb_status() -> Result<UsbStatus, String> {
     })
 }
 
-/// Cycle through available camera resolutions
+/// Cycle through available camera resolutions within the current format
+/// Returns the new resolution info including dimensions and available count
 #[tauri::command]
-fn cycle_resolution() -> Result<String, String> {
-    // TODO: Implement resolution cycling
-    log::info!("Cycling resolution");
-    Ok("640x480".to_string())
+fn cycle_resolution(state: State<'_, AppState>) -> Result<ResolutionInfo, AppError> {
+    let mut config = lock_or_err!(&state.streaming_config)?;
+
+    // Get current format (use first available if none selected)
+    let current_format_idx = config
+        .selected_format_index
+        .or_else(|| config.available_formats.first().map(|f| f.index));
+
+    let Some(format_idx) = current_format_idx else {
+        return Err(AppError::NotFound(
+            "No video formats discovered".to_string(),
+        ));
+    };
+
+    // Find the current format's frames
+    let format = config
+        .available_formats
+        .iter()
+        .find(|f| f.index == format_idx)
+        .ok_or_else(|| AppError::NotFound(format!("Format {} not found", format_idx)))?;
+
+    if format.frames.is_empty() {
+        return Err(AppError::NotFound(
+            "No resolutions available for this format".to_string(),
+        ));
+    }
+
+    // Get current frame index or default to first frame
+    let current_frame_idx = config
+        .selected_frame_index
+        .unwrap_or(format.frames[0].frame_index);
+
+    // Find current position and cycle to next
+    let current_pos = format
+        .frames
+        .iter()
+        .position(|f| f.frame_index == current_frame_idx)
+        .unwrap_or(0);
+    let next_pos = (current_pos + 1) % format.frames.len();
+    let next_frame = &format.frames[next_pos];
+
+    // Clone data we need before releasing the lock
+    let result = ResolutionInfo {
+        width: next_frame.width,
+        height: next_frame.height,
+        frame_index: next_frame.frame_index,
+        available_count: format.frames.len(),
+    };
+
+    // Update state
+    config.selected_frame_index = Some(next_frame.frame_index);
+    config.restart_requested = true;
+
+    log::info!(
+        "Cycling resolution to {}x{} (frame_index={}, {}/{} available)",
+        result.width,
+        result.height,
+        result.frame_index,
+        next_pos + 1,
+        result.available_count
+    );
+
+    Ok(result)
 }
 
-/// Get the list of available resolutions
+/// Get the list of available resolutions for the current format
 #[tauri::command]
-fn get_resolutions() -> Result<Vec<Resolution>, String> {
-    // TODO: Query camera for supported resolutions
-    Ok(vec![
-        Resolution {
-            width: 640,
-            height: 480,
-        },
-        Resolution {
-            width: 1280,
-            height: 720,
-        },
-    ])
+fn get_resolutions(state: State<'_, AppState>) -> Result<Vec<Resolution>, AppError> {
+    let config = lock_or_err!(&state.streaming_config)?;
+
+    // Get current format (use first available if none selected)
+    let current_format_idx = config
+        .selected_format_index
+        .or_else(|| config.available_formats.first().map(|f| f.index));
+
+    let Some(format_idx) = current_format_idx else {
+        return Ok(vec![]); // No formats discovered yet
+    };
+
+    // Find the current format's frames
+    let format = config
+        .available_formats
+        .iter()
+        .find(|f| f.index == format_idx);
+
+    let Some(format) = format else {
+        return Ok(vec![]);
+    };
+
+    Ok(format
+        .frames
+        .iter()
+        .map(|f| Resolution {
+            width: f.width as u32,
+            height: f.height as u32,
+        })
+        .collect())
+}
+
+/// Get the current resolution info
+#[tauri::command]
+fn get_current_resolution(state: State<'_, AppState>) -> Result<ResolutionInfo, AppError> {
+    let config = lock_or_err!(&state.streaming_config)?;
+
+    // Get current format (use first available if none selected)
+    let current_format_idx = config
+        .selected_format_index
+        .or_else(|| config.available_formats.first().map(|f| f.index));
+
+    let Some(format_idx) = current_format_idx else {
+        return Err(AppError::NotFound(
+            "No video formats discovered".to_string(),
+        ));
+    };
+
+    // Find the current format's frames
+    let format = config
+        .available_formats
+        .iter()
+        .find(|f| f.index == format_idx)
+        .ok_or_else(|| AppError::NotFound(format!("Format {} not found", format_idx)))?;
+
+    if format.frames.is_empty() {
+        return Err(AppError::NotFound("No resolutions available".to_string()));
+    }
+
+    // Get current frame index or default to first frame
+    let current_frame_idx = config
+        .selected_frame_index
+        .unwrap_or(format.frames[0].frame_index);
+    let current_frame = format
+        .frames
+        .iter()
+        .find(|f| f.frame_index == current_frame_idx)
+        .or_else(|| format.frames.first())
+        .ok_or_else(|| AppError::NotFound("No frames available".to_string()))?;
+
+    Ok(ResolutionInfo {
+        width: current_frame.width,
+        height: current_frame.height,
+        frame_index: current_frame.frame_index,
+        available_count: format.frames.len(),
+    })
 }
 
 /// Frame information returned to frontend
@@ -913,6 +1067,7 @@ pub fn run() {
             check_usb_status,
             cycle_resolution,
             get_resolutions,
+            get_current_resolution,
             get_frame,
             get_frame_info,
             dump_frame,

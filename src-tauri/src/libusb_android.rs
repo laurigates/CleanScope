@@ -1543,17 +1543,9 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
             // Get sequence number for this URB (atomically increment counter)
             let sequence = context.sequence_counter.fetch_add(1, Ordering::SeqCst);
 
-            // Extract payload from this URB
-            let payload = extract_urb_payloads(xfr, context.max_packet_size, context);
-
-            log::trace!(
-                "URB completed: transfer_index={}, sequence={}, payload_bytes={}",
-                context.transfer_index,
-                sequence,
-                payload.data.len()
-            );
-
-            // Lock shared state and add payload to pending queue
+            // Lock shared state FIRST to check format before extracting payloads
+            // This allows us to skip header validation for YUY2 format, avoiding
+            // false positives where pixel data matches header patterns.
             let mut state = match context.shared_state.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1561,6 +1553,26 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
                     poisoned.into_inner()
                 }
             };
+
+            // Check if format is confirmed as YUY2 (not MJPEG)
+            // is_mjpeg == Some(false) means YUY2 format is confirmed
+            let skip_header_validation = state.is_mjpeg == Some(false);
+
+            // Extract payload from this URB (skip header validation for YUY2)
+            let payload = extract_urb_payloads(
+                xfr,
+                context.max_packet_size,
+                context,
+                skip_header_validation,
+            );
+
+            log::trace!(
+                "URB completed: transfer_index={}, sequence={}, payload_bytes={}, skip_headers={}",
+                context.transfer_index,
+                sequence,
+                payload.data.len(),
+                skip_header_validation
+            );
 
             // Store in pending URBs map
             state.pending_urbs.insert(sequence, payload);
@@ -1633,12 +1645,19 @@ struct PacketMeta {
 /// Extract payload data from a completed URB without processing frame logic.
 /// This allows us to buffer URBs for in-order processing.
 ///
+/// # Arguments
+/// * `xfr` - The completed USB transfer
+/// * `max_packet_size` - Maximum packet size for this endpoint
+/// * `context` - Callback context with capture state
+/// * `skip_header_validation` - If true, treat all packet data as pure payload (for YUY2 format)
+///
 /// # Safety
 /// The transfer pointer must be valid.
 unsafe fn extract_urb_payloads(
     xfr: &mut libusb1_sys::libusb_transfer,
     max_packet_size: u16,
     context: &IsoCallbackContext,
+    skip_header_validation: bool,
 ) -> UrbPayload {
     let num_packets = xfr.num_iso_packets as usize;
     let mut data = Vec::with_capacity(num_packets * max_packet_size as usize);
@@ -1671,9 +1690,18 @@ unsafe fn extract_urb_payloads(
         // UVC payloads have a header (typically 2-12 bytes)
         // Use validate_uvc_header() to properly detect headers with all valid lengths
         // (2, 6, 8, or 12 bytes depending on PTS/SCR flags)
-        let validated_header = validate_uvc_header(pkt_data);
-        let is_uvc_header = validated_header.is_some();
-        let header_len = validated_header.unwrap_or(0);
+        //
+        // IMPORTANT: For YUY2 format, skip header validation entirely to avoid
+        // false positives where pixel data (e.g., Y=2, U=128) matches header patterns.
+        // UVC headers only appear at the start of isochronous packets, not mid-stream,
+        // and once we've confirmed YUY2 format, we know the data layout.
+        let (is_uvc_header, header_len) = if skip_header_validation {
+            // YUY2 format confirmed - treat all data as pure payload
+            (false, 0)
+        } else {
+            let validated = validate_uvc_header(pkt_data);
+            (validated.is_some(), validated.unwrap_or(0))
+        };
 
         // Extract flags from header (if present)
         let (end_of_frame, frame_id, error) = if is_uvc_header {

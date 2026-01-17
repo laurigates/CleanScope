@@ -158,8 +158,15 @@
   "work_orders": [
     {
       "id": "usb-permission-fix",
-      "file": "docs/blueprint/work-orders/usb-permission-fix.md",
+      "file": "docs/blueprint/work-orders/completed/usb-permission-fix.md",
+      "status": "completed",
       "related_features": ["F016", "F017"]
+    },
+    {
+      "id": "resolution-cycling-ui",
+      "file": "docs/blueprint/work-orders/resolution-cycling-ui.md",
+      "status": "open",
+      "related_features": ["F014"]
     }
   ],
   "adrs": [

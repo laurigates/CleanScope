@@ -3,10 +3,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onDestroy, onMount } from "svelte";
 
+// Resolution info from the backend
+interface ResolutionInfo {
+  width: number;
+  height: number;
+  frame_index: number;
+  available_count: number;
+}
+
 let connectionStatus = $state<"disconnected" | "connecting" | "connected">("disconnected");
 let cameraInfo = $state<string>("");
 let currentResolution = $state<string>("");
-const availableResolutions = $state<string[]>([]);
+let resolutionInfo = $state<ResolutionInfo | null>(null);
+let isCyclingResolution = $state<boolean>(false);
 let errorMessage = $state<string>("");
 let frameCount = $state<number>(0);
 let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
@@ -111,16 +120,19 @@ onMount(async () => {
   // Listen for USB device events from Rust backend
   const unlistenUsb = await listen<{ connected: boolean; info?: string }>(
     "usb-device-event",
-    (event) => {
+    async (event) => {
       if (event.payload.connected) {
         connectionStatus = "connected";
         cameraInfo = event.payload.info || "USB Camera";
         wasConnected = true;
+        // Fetch current resolution after a brief delay to let streaming initialize
+        setTimeout(() => fetchCurrentResolution(), 500);
       } else {
         connectionStatus = "disconnected";
         cameraInfo = "";
         frameCount = 0;
         frameTimestamps = [];
+        resolutionInfo = null;
       }
     },
   );
@@ -270,12 +282,28 @@ async function renderFrame(
 }
 
 async function cycleResolution() {
-  if (connectionStatus !== "connected") return;
+  if (connectionStatus !== "connected" || isCyclingResolution) return;
+  isCyclingResolution = true;
+
   try {
-    const newRes = await invoke<string>("cycle_resolution");
-    currentResolution = newRes;
+    const info = await invoke<ResolutionInfo>("cycle_resolution");
+    resolutionInfo = info;
+    currentResolution = `${info.width}x${info.height}`;
   } catch (e) {
+    console.error("Resolution cycle failed:", e);
     errorMessage = `Failed to change resolution: ${e}`;
+  } finally {
+    isCyclingResolution = false;
+  }
+}
+
+async function fetchCurrentResolution() {
+  try {
+    const info = await invoke<ResolutionInfo>("get_current_resolution");
+    resolutionInfo = info;
+    currentResolution = `${info.width}x${info.height}`;
+  } catch (e) {
+    console.debug("Could not get current resolution:", e);
   }
 }
 
@@ -409,9 +437,26 @@ function getStatusColor(): string {
       <button class="debug-btn format" onclick={toggleMjpeg}>{mjpegSetting}</button>
       <button class="debug-btn format" onclick={cyclePixelFormat}>{pixelFormatSetting}</button>
       <button class="debug-btn capture" onclick={captureFrame}>Capture</button>
-      {#if currentResolution}
-        <button class="debug-btn detected">{currentResolution}</button>
-      {/if}
+      <!-- Resolution cycling button -->
+      <button
+        class="debug-btn resolution"
+        onclick={cycleResolution}
+        disabled={connectionStatus !== "connected" || isCyclingResolution}
+        title={resolutionInfo && resolutionInfo.available_count > 1
+          ? `Tap to cycle (${resolutionInfo.available_count} available)`
+          : "Resolution"}
+      >
+        {#if isCyclingResolution}
+          Changing...
+        {:else if currentResolution}
+          {currentResolution}
+          {#if resolutionInfo && resolutionInfo.available_count > 1}
+            <span class="resolution-count">({resolutionInfo.available_count})</span>
+          {/if}
+        {:else}
+          Resolution
+        {/if}
+      </button>
     </div>
 
     {#if captureResult}
@@ -580,21 +625,6 @@ function getStatusColor(): string {
     font-family: monospace;
   }
 
-  .resolution-btn {
-    background: #333;
-    border: none;
-    color: white;
-    padding: 0.5rem 1rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .resolution-btn:hover {
-    background: #444;
-  }
-
   .debug-controls {
     display: flex;
     flex-wrap: wrap;
@@ -627,14 +657,6 @@ function getStatusColor(): string {
     background: #3b82f6;
   }
 
-  .debug-btn.detected {
-    background: #059669;
-  }
-
-  .debug-btn.detected:hover {
-    background: #10b981;
-  }
-
   .debug-btn.format {
     background: #0891b2;
   }
@@ -649,6 +671,26 @@ function getStatusColor(): string {
 
   .debug-btn.capture:hover {
     background: #8b5cf6;
+  }
+
+  .debug-btn.resolution {
+    background: #059669;
+  }
+
+  .debug-btn.resolution:hover:not(:disabled) {
+    background: #10b981;
+  }
+
+  .debug-btn.resolution:disabled {
+    background: #374151;
+    cursor: not-allowed;
+    opacity: 0.7;
+  }
+
+  .resolution-count {
+    font-size: 0.65rem;
+    opacity: 0.8;
+    margin-left: 0.25rem;
   }
 
   .capture-info {

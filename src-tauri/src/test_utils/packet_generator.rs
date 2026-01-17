@@ -48,6 +48,24 @@ impl Rgb {
         g: 128,
         b: 128,
     };
+    /// Yellow color
+    pub const YELLOW: Rgb = Rgb {
+        r: 255,
+        g: 255,
+        b: 0,
+    };
+    /// Cyan color
+    pub const CYAN: Rgb = Rgb {
+        r: 0,
+        g: 255,
+        b: 255,
+    };
+    /// Magenta color
+    pub const MAGENTA: Rgb = Rgb {
+        r: 255,
+        g: 0,
+        b: 255,
+    };
 
     /// Convert RGB to YUY2 (Y, U, V components)
     /// Returns (Y, U, V) using BT.601 standard
@@ -195,6 +213,41 @@ impl PacketGenerator {
         self.packetize_frame(&frame_data, frame_size)
     }
 
+    /// Generate YUY2 packets for SMPTE color bars test pattern
+    ///
+    /// Creates 8 vertical color bars (White, Yellow, Cyan, Green, Magenta, Red, Blue, Black),
+    /// useful for testing YUV-to-RGB conversion accuracy.
+    pub fn yuy2_color_bars_frame(&mut self, width: u32, height: u32) -> Vec<Vec<u8>> {
+        let frame_size = (width * height * 2) as usize;
+        let frame_data = self.generate_yuy2_color_bars(width, height);
+        self.packetize_frame(&frame_data, frame_size)
+    }
+
+    /// Generate YUY2 packets for a vertical gradient test pattern
+    ///
+    /// Creates a gradient from black at top to white at bottom,
+    /// useful for detecting row alignment and stride issues.
+    pub fn yuy2_vertical_gradient_frame(&mut self, width: u32, height: u32) -> Vec<Vec<u8>> {
+        let frame_size = (width * height * 2) as usize;
+        let frame_data = self.generate_yuy2_vertical_gradient(width, height);
+        self.packetize_frame(&frame_data, frame_size)
+    }
+
+    /// Generate YUY2 packets for a crosshatch/grid test pattern
+    ///
+    /// Creates a grid pattern with white lines on black background.
+    /// Useful for detecting stride misalignment (shows as diagonal/jagged lines).
+    pub fn yuy2_crosshatch_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        grid_spacing: u32,
+    ) -> Vec<Vec<u8>> {
+        let frame_size = (width * height * 2) as usize;
+        let frame_data = self.generate_yuy2_crosshatch(width, height, grid_spacing);
+        self.packetize_frame(&frame_data, frame_size)
+    }
+
     /// Generate a minimal MJPEG frame (valid JPEG with solid color)
     ///
     /// Creates a minimal valid JPEG that can be decoded.
@@ -253,6 +306,102 @@ impl PacketGenerator {
                 let is_white = (block_x + block_y).is_multiple_of(2);
 
                 let (y_val, u_val, v_val) = if is_white {
+                    (y_white, u_white, v_white)
+                } else {
+                    (y_black, u_black, v_black)
+                };
+
+                frame.push(y_val); // Y0
+                frame.push(u_val); // U
+                frame.push(y_val); // Y1
+                frame.push(v_val); // V
+            }
+        }
+
+        frame
+    }
+
+    /// Generate YUY2 color bars frame data (SMPTE-style)
+    ///
+    /// Creates 8 vertical color bars: White, Yellow, Cyan, Green, Magenta, Red, Blue, Black.
+    /// Useful for testing YUV-to-RGB conversion accuracy and detecting color channel issues.
+    pub fn generate_yuy2_color_bars(&self, width: u32, height: u32) -> Vec<u8> {
+        let mut frame = Vec::with_capacity((width * height * 2) as usize);
+
+        // SMPTE color bar order (left to right)
+        let colors = [
+            Rgb::WHITE,
+            Rgb::YELLOW,
+            Rgb::CYAN,
+            Rgb::GREEN,
+            Rgb::MAGENTA,
+            Rgb::RED,
+            Rgb::BLUE,
+            Rgb::BLACK,
+        ];
+
+        // Precompute YUV values for each color
+        let yuv_colors: Vec<(u8, u8, u8)> = colors.iter().map(|c| c.to_yuv()).collect();
+        let bar_width = width / colors.len() as u32;
+
+        for _ in 0..height {
+            for x in 0..(width / 2) {
+                // Determine which color bar this pixel belongs to
+                let pixel_x = x * 2;
+                let bar_index = ((pixel_x / bar_width) as usize).min(colors.len() - 1);
+                let (y_val, u_val, v_val) = yuv_colors[bar_index];
+
+                frame.push(y_val); // Y0
+                frame.push(u_val); // U
+                frame.push(y_val); // Y1
+                frame.push(v_val); // V
+            }
+        }
+
+        frame
+    }
+
+    /// Generate YUY2 vertical gradient frame data
+    ///
+    /// Creates a gradient from black at the top to white at the bottom,
+    /// useful for detecting row alignment and stride issues.
+    pub fn generate_yuy2_vertical_gradient(&self, width: u32, height: u32) -> Vec<u8> {
+        let mut frame = Vec::with_capacity((width * height * 2) as usize);
+
+        for y in 0..height {
+            // Gradient from 16 (black) to 235 (white) down the height
+            let intensity = ((y as f32 / height as f32) * 219.0 + 16.0) as u8;
+
+            for _ in 0..(width / 2) {
+                frame.push(intensity); // Y0
+                frame.push(128); // U (neutral)
+                frame.push(intensity); // Y1
+                frame.push(128); // V (neutral)
+            }
+        }
+
+        frame
+    }
+
+    /// Generate YUY2 crosshatch/grid frame data
+    ///
+    /// Creates a grid pattern with white lines on black background.
+    /// Grid spacing is configurable. Useful for detecting stride misalignment,
+    /// which manifests as diagonal or jagged lines.
+    pub fn generate_yuy2_crosshatch(&self, width: u32, height: u32, grid_spacing: u32) -> Vec<u8> {
+        let mut frame = Vec::with_capacity((width * height * 2) as usize);
+        let (y_white, u_white, v_white) = Rgb::WHITE.to_yuv();
+        let (y_black, u_black, v_black) = Rgb::BLACK.to_yuv();
+
+        for row in 0..height {
+            let is_horizontal_line = row % grid_spacing == 0;
+
+            for x in 0..(width / 2) {
+                let pixel_x = x * 2;
+                let is_vertical_line = pixel_x % grid_spacing == 0;
+                let is_line = is_horizontal_line || is_vertical_line;
+
+                let (y_val, u_val, v_val) = if is_line {
                     (y_white, u_white, v_white)
                 } else {
                     (y_black, u_black, v_black)
@@ -570,5 +719,166 @@ mod tests {
             assert_eq!(frame[i], y); // Y0
             assert_eq!(frame[i + 2], y); // Y1
         }
+    }
+
+    #[test]
+    fn test_color_bars_size() {
+        let gen = PacketGenerator::default();
+        let frame = gen.generate_yuy2_color_bars(640, 480);
+        assert_eq!(frame.len(), 640 * 480 * 2);
+    }
+
+    #[test]
+    fn test_color_bars_first_bar_white() {
+        let gen = PacketGenerator::default();
+        // Width must be divisible by 8 (number of bars) and by 2 (YUY2 macropixel)
+        let frame = gen.generate_yuy2_color_bars(64, 8);
+
+        // First bar should be white (bar_width = 64/8 = 8 pixels)
+        let (y_white, _, _) = Rgb::WHITE.to_yuv();
+
+        // Check first pixel of first row
+        assert_eq!(frame[0], y_white, "First pixel Y should be white");
+    }
+
+    #[test]
+    fn test_color_bars_last_bar_black() {
+        let gen = PacketGenerator::default();
+        let frame = gen.generate_yuy2_color_bars(64, 8);
+
+        // Last bar should be black
+        let (y_black, _, _) = Rgb::BLACK.to_yuv();
+
+        // Last macropixel of first row (at position width-2 = 62)
+        // Row stride = 64 * 2 = 128 bytes, last macropixel at 128-4 = 124
+        let last_macropixel = 64 * 2 - 4;
+        assert_eq!(
+            frame[last_macropixel], y_black,
+            "Last pixel Y should be black"
+        );
+    }
+
+    #[test]
+    fn test_vertical_gradient_size() {
+        let gen = PacketGenerator::default();
+        let frame = gen.generate_yuy2_vertical_gradient(640, 480);
+        assert_eq!(frame.len(), 640 * 480 * 2);
+    }
+
+    #[test]
+    fn test_vertical_gradient_top_dark_bottom_light() {
+        let gen = PacketGenerator::default();
+        let width = 64u32;
+        let height = 64u32;
+        let frame = gen.generate_yuy2_vertical_gradient(width, height);
+
+        // First row (top) should be dark (Y close to 16)
+        let y_top = frame[0];
+        assert!(y_top < 32, "Top should be dark, got Y={}", y_top);
+
+        // Last row (bottom) should be light (Y close to 235)
+        let last_row_start = ((height - 1) * width * 2) as usize;
+        let y_bottom = frame[last_row_start];
+        assert!(y_bottom > 200, "Bottom should be light, got Y={}", y_bottom);
+
+        // Gradient should increase
+        assert!(y_bottom > y_top, "Y should increase from top to bottom");
+    }
+
+    #[test]
+    fn test_vertical_gradient_rows_uniform() {
+        let gen = PacketGenerator::default();
+        let width = 32u32;
+        let height = 16u32;
+        let frame = gen.generate_yuy2_vertical_gradient(width, height);
+
+        // Each row should have uniform Y values
+        for row in 0..height {
+            let row_start = (row * width * 2) as usize;
+            let expected_y = frame[row_start]; // Y of first pixel in row
+
+            // Check all Y values in this row are the same
+            for x in 0..(width / 2) {
+                let offset = row_start + (x * 4) as usize;
+                assert_eq!(
+                    frame[offset],
+                    expected_y,
+                    "Row {} pixel {} Y should be uniform",
+                    row,
+                    x * 2
+                );
+                assert_eq!(
+                    frame[offset + 2],
+                    expected_y,
+                    "Row {} pixel {} Y should be uniform",
+                    row,
+                    x * 2 + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crosshatch_size() {
+        let gen = PacketGenerator::default();
+        let frame = gen.generate_yuy2_crosshatch(640, 480, 32);
+        assert_eq!(frame.len(), 640 * 480 * 2);
+    }
+
+    #[test]
+    fn test_crosshatch_grid_lines() {
+        let gen = PacketGenerator::default();
+        let width = 64u32;
+        let height = 64u32;
+        let grid_spacing = 16u32;
+        let frame = gen.generate_yuy2_crosshatch(width, height, grid_spacing);
+
+        let (y_white, _, _) = Rgb::WHITE.to_yuv();
+        let (y_black, _, _) = Rgb::BLACK.to_yuv();
+
+        // Row 0 should be all white (horizontal line)
+        assert_eq!(frame[0], y_white, "Row 0 should be horizontal line (white)");
+
+        // Row 1, column 0 should be white (vertical line)
+        let row1_start = (width * 2) as usize;
+        assert_eq!(
+            frame[row1_start], y_white,
+            "Column 0 should be vertical line (white)"
+        );
+
+        // Row 1, column 1 should be black (not on any line)
+        // Column 1 means x=2 in the macropixel, which is at byte offset 4 (Y0 of second macropixel)
+        // But pixel_x=2 % 16 != 0, so it should be black
+        // Actually macropixel 1 has pixel_x = 2, which is not on grid
+        assert_eq!(
+            frame[row1_start + 4],
+            y_black,
+            "Interior pixel should be black"
+        );
+    }
+
+    #[test]
+    fn test_rgb_to_yuv_yellow() {
+        let (y, u, _v) = Rgb::YELLOW.to_yuv();
+        // Yellow has high Y (bright), low U, high V
+        assert!(y > 200, "Yellow should have high luminance");
+        assert!(u < 128, "Yellow should have U below neutral");
+    }
+
+    #[test]
+    fn test_rgb_to_yuv_cyan() {
+        let (y, u, v) = Rgb::CYAN.to_yuv();
+        // Cyan has medium-high Y, high U, low V
+        assert!(y > 150, "Cyan should have high luminance");
+        assert!(u > 128, "Cyan should have U above neutral");
+        assert!(v < 128, "Cyan should have V below neutral");
+    }
+
+    #[test]
+    fn test_rgb_to_yuv_magenta() {
+        let (_y, u, v) = Rgb::MAGENTA.to_yuv();
+        // Magenta has medium Y, high U, high V
+        assert!(u > 128, "Magenta should have U above neutral");
+        assert!(v > 128, "Magenta should have V above neutral");
     }
 }

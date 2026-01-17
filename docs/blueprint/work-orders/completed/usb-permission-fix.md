@@ -1,9 +1,17 @@
 # Work Order: USB Permission Fix
 
-## Status: Open
+## Status: Completed ✅
 **Created:** 2025-12-26
+**Completed:** 2026-01-17
 **Priority:** High
-**Assignee:** Next Agent
+
+### Resolution
+The fix was implemented using **Option 2** (get device from intent) combined with **Option 1** (no hasPermission check):
+- `get_device_name_from_intent()` extracts device name from launching intent's `EXTRA_DEVICE`
+- `get_device_from_manager()` looks up device by name in `getDeviceList()` with fallback
+- `get_usb_file_descriptor()` orchestrates the flow without `hasPermission()` check
+
+Code location: `src-tauri/src/usb.rs` lines 163-359
 
 ---
 
