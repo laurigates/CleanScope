@@ -1,6 +1,6 @@
 # Work Overview: CleanScope
 
-## Current Phase: Testing & Refinement
+## Current Phase: Reliability & Error Handling
 
 ### Completed
 - Tauri v2 + Rust Android app scaffolded
@@ -17,6 +17,11 @@
   - get_frame command with ipc::Response
   - Lightweight "frame-ready" event emission
 - Frontend canvas rendering with createImageBitmap()
+- Resolution cycling UI (ADR-003)
+- USB disconnection error handling (F016)
+  - StopReason tracking in isochronous stream
+  - Structured usb-error events with error types
+  - Frontend error state with context-aware UI
 
 ### Architecture Decision Records
 - ADR-001: Frame Streaming Architecture (polling pattern)
@@ -25,12 +30,10 @@
 
 ### Pending
 - Test on physical Android device with USB endoscope
-- Resolution cycling UI implementation
-- Error handling for USB disconnection
 - Frame rate optimization
-- Reconnection handling
+- Reconnection handling (auto-reconnect on device reattachment)
 
 ## Next Steps
 1. Deploy to physical device for end-to-end testing
-2. Implement resolution cycling based on ADR-003
-3. Add error recovery and reconnection logic
+2. Test USB disconnection scenarios
+3. Implement auto-reconnection logic

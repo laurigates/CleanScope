@@ -11,12 +11,28 @@ interface ResolutionInfo {
   available_count: number;
 }
 
+// USB error event from backend
+interface UsbError {
+  error_type: "normal" | "device_unplugged" | "transfer_error" | "timeout" | "unknown";
+  message: string;
+  recoverable: boolean;
+}
+
+// Extended USB status with disconnect reason
+interface UsbStatusExtended {
+  connected: boolean;
+  info?: string;
+  disconnect_reason?: "normal" | "device_unplugged" | "transfer_error" | "timeout" | "unknown";
+}
+
 let connectionStatus = $state<"disconnected" | "connecting" | "connected">("disconnected");
 let cameraInfo = $state<string>("");
 let currentResolution = $state<string>("");
 let resolutionInfo = $state<ResolutionInfo | null>(null);
 let isCyclingResolution = $state<boolean>(false);
 let errorMessage = $state<string>("");
+let lastUsbError = $state<UsbError | null>(null);
+let disconnectReason = $state<string | null>(null);
 let frameCount = $state<number>(0);
 let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
 let captureResult = $state<{
@@ -118,25 +134,34 @@ onMount(async () => {
   }
 
   // Listen for USB device events from Rust backend
-  const unlistenUsb = await listen<{ connected: boolean; info?: string }>(
-    "usb-device-event",
-    async (event) => {
-      if (event.payload.connected) {
-        connectionStatus = "connected";
-        cameraInfo = event.payload.info || "USB Camera";
-        wasConnected = true;
-        // Fetch current resolution after a brief delay to let streaming initialize
-        setTimeout(() => fetchCurrentResolution(), 500);
-      } else {
-        connectionStatus = "disconnected";
-        cameraInfo = "";
-        frameCount = 0;
-        frameTimestamps = [];
-        resolutionInfo = null;
-      }
-    },
-  );
+  const unlistenUsb = await listen<UsbStatusExtended>("usb-device-event", async (event) => {
+    if (event.payload.connected) {
+      connectionStatus = "connected";
+      cameraInfo = event.payload.info || "USB Camera";
+      wasConnected = true;
+      lastUsbError = null;
+      disconnectReason = null;
+      // Fetch current resolution after a brief delay to let streaming initialize
+      setTimeout(() => fetchCurrentResolution(), 500);
+    } else {
+      connectionStatus = "disconnected";
+      cameraInfo = "";
+      frameCount = 0;
+      frameTimestamps = [];
+      resolutionInfo = null;
+      // Store disconnect reason for UI feedback
+      disconnectReason = event.payload.disconnect_reason || null;
+    }
+  });
   unlistenFns.push(unlistenUsb);
+
+  // Listen for USB error events from Rust backend
+  const unlistenUsbError = await listen<UsbError>("usb-error", (event) => {
+    console.log("USB error received:", event.payload);
+    lastUsbError = event.payload;
+    errorMessage = event.payload.message;
+  });
+  unlistenFns.push(unlistenUsbError);
 
   // Listen for detailed USB status updates from Rust backend
   const unlistenUsbStatus = await listen<{ status: string; detail?: string }>(
@@ -393,14 +418,48 @@ function getStatusColor(): string {
       {#if connectionStatus === "disconnected"}
         <div class="overlay">
           <div class="waiting-message">
-            <div class="camera-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                <circle cx="12" cy="13" r="4"/>
-              </svg>
-            </div>
-            <p>Connect USB Endoscope</p>
-            <span class="hint">Plug in your USB-C camera to start</span>
+            {#if disconnectReason === "device_unplugged"}
+              <!-- Device was unplugged -->
+              <div class="camera-icon error">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                  <line x1="1" y1="1" x2="23" y2="23"/>
+                </svg>
+              </div>
+              <p>Camera Disconnected</p>
+              <span class="hint">The USB camera was unplugged. Reconnect to continue.</span>
+            {:else if disconnectReason === "timeout"}
+              <!-- Streaming timed out -->
+              <div class="camera-icon warning">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <polyline points="12,6 12,12 16,14"/>
+                </svg>
+              </div>
+              <p>Connection Timeout</p>
+              <span class="hint">No video frames received. Check camera connection.</span>
+            {:else if disconnectReason === "transfer_error"}
+              <!-- USB transfer error -->
+              <div class="camera-icon error">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+              </div>
+              <p>USB Transfer Error</p>
+              <span class="hint">A USB communication error occurred. Try reconnecting the camera.</span>
+            {:else}
+              <!-- Default: waiting for device -->
+              <div class="camera-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                  <circle cx="12" cy="13" r="4"/>
+                </svg>
+              </div>
+              <p>Connect USB Endoscope</p>
+              <span class="hint">Plug in your USB-C camera to start</span>
+            {/if}
           </div>
         </div>
       {/if}
@@ -550,6 +609,14 @@ function getStatusColor(): string {
     height: 64px;
     margin: 0 auto 1rem;
     color: #9ca3af;
+  }
+
+  .camera-icon.error {
+    color: #f87171; /* red-400 */
+  }
+
+  .camera-icon.warning {
+    color: #fbbf24; /* amber-400 */
   }
 
   .camera-icon svg {

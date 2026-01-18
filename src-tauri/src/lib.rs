@@ -238,6 +238,33 @@ pub struct UsbStatus {
     pub info: Option<String>,
 }
 
+/// Reason for USB device disconnection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectReason {
+    /// Normal disconnection (user stopped streaming, app closing)
+    Normal,
+    /// Device was physically unplugged
+    DeviceUnplugged,
+    /// USB transfer error (STALL, pipe error, etc.)
+    TransferError,
+    /// Connection timeout (no frames received)
+    Timeout,
+    /// Unknown error
+    Unknown,
+}
+
+/// USB error event for detailed error reporting to frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbError {
+    /// Type of error that occurred
+    pub error_type: DisconnectReason,
+    /// Human-readable error message
+    pub message: String,
+    /// Whether the error is recoverable (user can retry)
+    pub recoverable: bool,
+}
+
 /// Camera resolution information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
@@ -983,6 +1010,35 @@ pub fn get_current_display_settings(state: &AppState) -> Result<DisplaySettings,
 /// Emit a USB device event to the frontend
 pub fn emit_usb_event(app: &AppHandle, connected: bool, info: Option<String>) {
     let _ = app.emit("usb-device-event", UsbStatus { connected, info });
+}
+
+/// Extended USB status with disconnect reason
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbStatusExtended {
+    /// Whether a USB device is currently connected
+    pub connected: bool,
+    /// Optional information about the connected device
+    pub info: Option<String>,
+    /// Reason for disconnection (only present when connected=false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_reason: Option<DisconnectReason>,
+}
+
+/// Emit a USB disconnect event with reason to the frontend
+pub fn emit_usb_disconnect(app: &AppHandle, reason: DisconnectReason, info: Option<String>) {
+    let _ = app.emit(
+        "usb-device-event",
+        UsbStatusExtended {
+            connected: false,
+            info,
+            disconnect_reason: Some(reason),
+        },
+    );
+}
+
+/// Emit a USB error event to the frontend
+pub fn emit_usb_error(app: &AppHandle, error: UsbError) {
+    let _ = app.emit("usb-error", error);
 }
 
 /// Emit a camera frame event to the frontend

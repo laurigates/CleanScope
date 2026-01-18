@@ -1,13 +1,13 @@
 {
   "version": "1.0.0",
   "source_document": "docs/blueprint/work-overview.md",
-  "last_updated": "2026-01-13",
+  "last_updated": "2026-01-17",
   "statistics": {
     "total_features": 18,
-    "complete": 12,
+    "complete": 14,
     "in_progress": 1,
-    "pending": 5,
-    "completion_percentage": 66.7
+    "pending": 3,
+    "completion_percentage": 77.8
   },
   "phases": [
     {
@@ -106,7 +106,7 @@
     {
       "id": "ui-features",
       "name": "UI & User Experience",
-      "status": "in_progress",
+      "status": "complete",
       "features": [
         {
           "id": "F013",
@@ -117,7 +117,7 @@
         {
           "id": "F014",
           "name": "Resolution cycling UI",
-          "status": "pending",
+          "status": "complete",
           "notes": "Per ADR-003 progressive negotiation",
           "dependencies": ["ADR-003"]
         },
@@ -132,13 +132,13 @@
     {
       "id": "reliability",
       "name": "Reliability & Error Handling",
-      "status": "pending",
+      "status": "in_progress",
       "features": [
         {
           "id": "F016",
           "name": "USB disconnection error handling",
-          "status": "pending",
-          "notes": "Graceful handling of device removal"
+          "status": "complete",
+          "notes": "StopReason tracking, usb-error events, context-aware UI"
         },
         {
           "id": "F017",
@@ -164,8 +164,8 @@
     },
     {
       "id": "resolution-cycling-ui",
-      "file": "docs/blueprint/work-orders/resolution-cycling-ui.md",
-      "status": "open",
+      "file": "docs/blueprint/work-orders/completed/resolution-cycling-ui.md",
+      "status": "completed",
       "related_features": ["F014"]
     }
   ],

@@ -614,12 +614,17 @@ fn start_yuy2_fallback(
 /// This outer loop handles restart requests (e.g., when user changes video format)
 #[cfg(target_os = "android")]
 fn run_camera_loop(fd: i32, ctx: StreamingContext) {
+    use crate::DisconnectReason;
+
     log::info!("Starting camera loop with fd: {}", fd);
+
+    let mut disconnect_reason = DisconnectReason::Normal;
 
     loop {
         // Check if we should stop (app is closing)
         if ctx.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("Stop flag set, exiting camera loop");
+            disconnect_reason = DisconnectReason::Normal;
             break;
         }
 
@@ -632,6 +637,7 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
         match run_camera_loop_inner(fd, &ctx) {
             Ok(StreamResult::Normal) => {
                 log::info!("Camera loop ended normally");
+                disconnect_reason = DisconnectReason::Normal;
                 break;
             }
             Ok(StreamResult::RestartRequested) => {
@@ -640,25 +646,84 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
+            Ok(StreamResult::DeviceUnplugged) => {
+                log::warn!("Device was physically unplugged");
+                disconnect_reason = DisconnectReason::DeviceUnplugged;
+                // Emit error event for immediate feedback
+                crate::emit_usb_error(
+                    &ctx.app_handle,
+                    crate::UsbError {
+                        error_type: DisconnectReason::DeviceUnplugged,
+                        message: "USB camera was disconnected".to_string(),
+                        recoverable: true,
+                    },
+                );
+                break;
+            }
+            Ok(StreamResult::Timeout) => {
+                log::warn!("Streaming timed out - no frames received");
+                disconnect_reason = DisconnectReason::Timeout;
+                crate::emit_usb_error(
+                    &ctx.app_handle,
+                    crate::UsbError {
+                        error_type: DisconnectReason::Timeout,
+                        message: "No video frames received - camera may be disconnected"
+                            .to_string(),
+                        recoverable: true,
+                    },
+                );
+                break;
+            }
+            Ok(StreamResult::TransferError(msg)) => {
+                log::error!("USB transfer error: {}", msg);
+                disconnect_reason = DisconnectReason::TransferError;
+                crate::emit_usb_error(
+                    &ctx.app_handle,
+                    crate::UsbError {
+                        error_type: DisconnectReason::TransferError,
+                        message: format!("USB transfer error: {}", msg),
+                        recoverable: true,
+                    },
+                );
+                break;
+            }
             Err(e) => {
                 log::error!("Camera loop error: {}", e);
+                disconnect_reason = DisconnectReason::Unknown;
+                crate::emit_usb_error(
+                    &ctx.app_handle,
+                    crate::UsbError {
+                        error_type: DisconnectReason::Unknown,
+                        message: format!("Camera error: {}", e),
+                        recoverable: true,
+                    },
+                );
                 break;
             }
         }
     }
 
-    // Emit disconnected event when camera loop exits
-    log::info!("Camera loop exited, emitting disconnect event");
-    crate::emit_usb_event(&ctx.app_handle, false, None);
+    // Emit disconnected event with reason when camera loop exits
+    log::info!(
+        "Camera loop exited, emitting disconnect event with reason: {:?}",
+        disconnect_reason
+    );
+    crate::emit_usb_disconnect(&ctx.app_handle, disconnect_reason, None);
 }
 
 /// Result of a streaming session
 #[cfg(target_os = "android")]
 enum StreamResult {
-    /// Streaming ended normally (e.g., device disconnected)
+    /// Streaming ended normally (e.g., user stopped, app closing)
     Normal,
     /// Restart was requested (e.g., format change)
     RestartRequested,
+    /// Device was physically unplugged during streaming
+    DeviceUnplugged,
+    /// Streaming timed out (no frames received)
+    Timeout,
+    /// USB transfer error occurred
+    TransferError(String),
 }
 
 #[cfg(target_os = "android")]
@@ -1567,6 +1632,15 @@ fn stream_frames_yuy2(
                 if iso_stream.is_stopped() {
                     break;
                 }
+                // If stream hasn't stopped but we're timing out, it might be the device
+                // Check again after a brief moment
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if iso_stream.is_stopped() {
+                    break;
+                }
+                // Set timeout as the stop reason if we keep timing out
+                iso_stream.set_stop_reason(crate::libusb_android::StopReason::Timeout);
+                break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 log::info!("Frame channel disconnected, exiting");
@@ -1578,8 +1652,22 @@ fn stream_frames_yuy2(
     iso_stream.stop();
     let _ = event_loop_handle.join();
 
-    log::info!("YUY2 streaming ended after {} frames", frame_count);
-    Ok(StreamResult::Normal)
+    // Determine the result based on why we stopped
+    let stop_reason = iso_stream.get_stop_reason();
+    log::info!(
+        "YUY2 streaming ended after {} frames, stop reason: {:?}",
+        frame_count,
+        stop_reason
+    );
+
+    match stop_reason {
+        crate::libusb_android::StopReason::DeviceUnplugged => Ok(StreamResult::DeviceUnplugged),
+        crate::libusb_android::StopReason::TransferError => Ok(StreamResult::TransferError(
+            "USB transfer failed".to_string(),
+        )),
+        crate::libusb_android::StopReason::Timeout => Ok(StreamResult::Timeout),
+        _ => Ok(StreamResult::Normal),
+    }
 }
 
 /// Start UVC streaming by sending probe/commit control requests

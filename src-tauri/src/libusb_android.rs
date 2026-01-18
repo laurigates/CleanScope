@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::frame_assembler::{is_jpeg_data, validate_uvc_header};
@@ -130,6 +130,28 @@ pub enum TransferStatus {
     NoDevice = 5,
     /// Data overflow (device sent more data than requested)
     Overflow = 6,
+}
+
+/// Reason why streaming stopped
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StopReason {
+    /// Not stopped yet / normal operation
+    NotStopped = 0,
+    /// Stopped normally (user requested, app closing)
+    Normal = 1,
+    /// Device was physically unplugged
+    DeviceUnplugged = 2,
+    /// Transfer error occurred
+    TransferError = 3,
+    /// Timeout - no frames received
+    Timeout = 4,
+}
+
+impl Default for StopReason {
+    fn default() -> Self {
+        StopReason::NotStopped
+    }
 }
 
 impl From<i32> for TransferStatus {
@@ -1125,6 +1147,8 @@ struct IsoCallbackContext {
     frame_sender: std::sync::mpsc::Sender<Vec<u8>>,
     /// Flag to signal when streaming should stop
     stop_flag: Arc<AtomicBool>,
+    /// Reason why streaming stopped
+    stop_reason: Arc<AtomicU8>,
     /// Shared frame state (protected by mutex for thread-safety)
     shared_state: Arc<std::sync::Mutex<SharedFrameState>>,
     /// Max packet size for this endpoint
@@ -1253,6 +1277,8 @@ pub struct IsochronousStream {
     contexts: Vec<Box<IsoCallbackContext>>,
     /// Flag to signal stop (public for external access)
     pub stop_flag: Arc<AtomicBool>,
+    /// Reason why streaming stopped (public for checking after stop)
+    pub stop_reason: Arc<AtomicU8>,
     /// Receiver for completed frames
     frame_receiver: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
 }
@@ -1287,6 +1313,7 @@ impl IsochronousStream {
     ) -> Result<Self, LibusbError> {
         let (frame_sender, frame_receiver) = std::sync::mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_reason = Arc::new(AtomicU8::new(StopReason::NotStopped as u8));
 
         // Use provided expected_frame_size, fall back to 720p if 0
         let frame_size = if expected_frame_size > 0 {
@@ -1340,6 +1367,7 @@ impl IsochronousStream {
             let context = Box::new(IsoCallbackContext {
                 frame_sender: frame_sender.clone(),
                 stop_flag: Arc::clone(&stop_flag),
+                stop_reason: Arc::clone(&stop_reason),
                 shared_state: Arc::clone(&shared_state),
                 max_packet_size,
                 expected_frame_size: frame_size,
@@ -1373,6 +1401,7 @@ impl IsochronousStream {
             buffers,
             contexts,
             stop_flag,
+            stop_reason,
             frame_receiver: Some(frame_receiver),
         })
     }
@@ -1467,6 +1496,23 @@ impl IsochronousStream {
     /// Check if streaming is stopped
     pub fn is_stopped(&self) -> bool {
         self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    /// Get the reason why streaming stopped
+    pub fn get_stop_reason(&self) -> StopReason {
+        let reason_u8 = self.stop_reason.load(Ordering::Relaxed);
+        match reason_u8 {
+            1 => StopReason::Normal,
+            2 => StopReason::DeviceUnplugged,
+            3 => StopReason::TransferError,
+            4 => StopReason::Timeout,
+            _ => StopReason::NotStopped,
+        }
+    }
+
+    /// Set the stop reason (for use by streaming loops)
+    pub fn set_stop_reason(&self, reason: StopReason) {
+        self.stop_reason.store(reason as u8, Ordering::Relaxed);
     }
 }
 
@@ -1604,11 +1650,22 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
         }
         TransferStatus::NoDevice => {
             log::error!("Device disconnected");
+            context
+                .stop_reason
+                .store(StopReason::DeviceUnplugged as u8, Ordering::Relaxed);
+            context.stop_flag.store(true, Ordering::Relaxed);
+            return;
+        }
+        TransferStatus::Error | TransferStatus::Stall | TransferStatus::Overflow => {
+            log::warn!("Transfer error: {:?}", status);
+            context
+                .stop_reason
+                .store(StopReason::TransferError as u8, Ordering::Relaxed);
             context.stop_flag.store(true, Ordering::Relaxed);
             return;
         }
         _ => {
-            log::warn!("Transfer error: {:?}", status);
+            log::warn!("Unexpected transfer status: {:?}", status);
         }
     }
 
