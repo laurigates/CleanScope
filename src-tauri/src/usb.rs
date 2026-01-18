@@ -501,8 +501,8 @@ fn try_mjpeg_streaming(
     format_index: u8,
     streaming_interface: i32,
 ) -> MjpegStreamingResult {
-    // Start UVC streaming with this format index
-    let endpoint = match start_uvc_streaming(dev, Some(ep_info), format_index) {
+    // Start UVC streaming with this format index and frame index 1 (highest resolution)
+    let endpoint = match start_uvc_streaming(dev, Some(ep_info), format_index, 1) {
         Ok(ep) => ep,
         Err(e) => {
             log::warn!(
@@ -624,7 +624,7 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
         // Check if we should stop (app is closing)
         if ctx.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("Stop flag set, exiting camera loop");
-            disconnect_reason = DisconnectReason::Normal;
+            // disconnect_reason already initialized to Normal
             break;
         }
 

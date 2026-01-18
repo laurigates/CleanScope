@@ -1664,9 +1664,6 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
             context.stop_flag.store(true, Ordering::Relaxed);
             return;
         }
-        _ => {
-            log::warn!("Unexpected transfer status: {:?}", status);
-        }
     }
 
     // Resubmit the transfer for continuous streaming
