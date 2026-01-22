@@ -502,8 +502,9 @@ fn try_mjpeg_streaming(
     streaming_interface: i32,
 ) -> MjpegStreamingResult {
     // Start UVC streaming with this format index and frame index 1 (highest resolution)
-    let endpoint = match start_uvc_streaming(dev, Some(ep_info), format_index, 1) {
-        Ok(ep) => ep,
+    // Use _with_resolution to get width/height for correct frame size detection
+    let params = match start_uvc_streaming_with_resolution(dev, Some(ep_info), format_index, 1) {
+        Ok(p) => p,
         Err(e) => {
             log::warn!(
                 "Failed to start streaming with format {}: {}",
@@ -514,9 +515,11 @@ fn try_mjpeg_streaming(
         }
     };
     log::info!(
-        "UVC streaming started on endpoint 0x{:02x} with format {}",
-        endpoint,
-        format_index
+        "UVC streaming started on endpoint 0x{:02x} with format {}, resolution {}x{}",
+        params.endpoint,
+        format_index,
+        params.width,
+        params.height
     );
 
     // Choose streaming method based on endpoint type
@@ -530,13 +533,15 @@ fn try_mjpeg_streaming(
                 stream_ctx.app_handle.clone(),
                 stream_ctx.frame_buffer.clone(),
                 format_index,
+                params.width,
+                params.height,
             )
         }
         TransferType::Bulk => {
             log::info!("Using BULK transfers for video streaming");
             stream_frames(
                 dev,
-                endpoint,
+                ep_info.address,
                 stream_ctx.app_handle.clone(),
                 stream_ctx.frame_buffer.clone(),
             )
@@ -610,21 +615,39 @@ fn start_yuy2_fallback(
     )
 }
 
-/// Run the camera streaming loop with restart support
-/// This outer loop handles restart requests (e.g., when user changes video format)
+/// Reconnection configuration constants
 #[cfg(target_os = "android")]
-fn run_camera_loop(fd: i32, ctx: StreamingContext) {
+mod reconnect_config {
+    /// Maximum number of reconnection attempts (0 = unlimited)
+    pub const MAX_ATTEMPTS: u32 = 0;
+    /// Initial delay before first reconnection attempt (milliseconds)
+    pub const INITIAL_DELAY_MS: u64 = 1000;
+    /// Maximum delay between attempts (milliseconds)
+    pub const MAX_DELAY_MS: u64 = 30000;
+    /// Backoff multiplier for exponential delay
+    pub const BACKOFF_MULTIPLIER: f64 = 1.5;
+}
+
+/// Run the camera streaming loop with restart and reconnection support
+/// This outer loop handles:
+/// - Restart requests (e.g., when user changes video format)
+/// - Automatic reconnection after device disconnection
+#[cfg(target_os = "android")]
+fn run_camera_loop(initial_fd: i32, ctx: StreamingContext) {
     use crate::DisconnectReason;
+    use reconnect_config::*;
 
-    log::info!("Starting camera loop with fd: {}", fd);
+    log::info!("Starting camera loop with fd: {}", initial_fd);
 
-    let mut disconnect_reason = DisconnectReason::Normal;
+    let mut current_fd = initial_fd;
+    let mut disconnect_reason: Option<DisconnectReason> = None;
+    let mut reconnect_attempt: u32 = 0;
+    let mut current_delay_ms = INITIAL_DELAY_MS;
 
     loop {
         // Check if we should stop (app is closing)
         if ctx.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("Stop flag set, exiting camera loop");
-            // disconnect_reason already initialized to Normal
             break;
         }
 
@@ -634,22 +657,24 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
             config.restart_requested = false;
         }
 
-        match run_camera_loop_inner(fd, &ctx) {
+        match run_camera_loop_inner(current_fd, &ctx) {
             Ok(StreamResult::Normal) => {
                 log::info!("Camera loop ended normally");
-                disconnect_reason = DisconnectReason::Normal;
+                disconnect_reason = Some(DisconnectReason::Normal);
                 break;
             }
             Ok(StreamResult::RestartRequested) => {
                 log::info!("Restarting camera loop with new settings...");
+                // Reset reconnect state on successful restart
+                reconnect_attempt = 0;
+                current_delay_ms = INITIAL_DELAY_MS;
                 // Small delay to let things settle
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
             Ok(StreamResult::DeviceUnplugged) => {
                 log::warn!("Device was physically unplugged");
-                disconnect_reason = DisconnectReason::DeviceUnplugged;
-                // Emit error event for immediate feedback
+                disconnect_reason = Some(DisconnectReason::DeviceUnplugged);
                 crate::emit_usb_error(
                     &ctx.app_handle,
                     crate::UsbError {
@@ -658,11 +683,11 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
                         recoverable: true,
                     },
                 );
-                break;
+                // Fall through to reconnection logic below
             }
             Ok(StreamResult::Timeout) => {
                 log::warn!("Streaming timed out - no frames received");
-                disconnect_reason = DisconnectReason::Timeout;
+                disconnect_reason = Some(DisconnectReason::Timeout);
                 crate::emit_usb_error(
                     &ctx.app_handle,
                     crate::UsbError {
@@ -672,11 +697,11 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
                         recoverable: true,
                     },
                 );
-                break;
+                // Fall through to reconnection logic below
             }
             Ok(StreamResult::TransferError(msg)) => {
                 log::error!("USB transfer error: {}", msg);
-                disconnect_reason = DisconnectReason::TransferError;
+                disconnect_reason = Some(DisconnectReason::TransferError);
                 crate::emit_usb_error(
                     &ctx.app_handle,
                     crate::UsbError {
@@ -685,11 +710,11 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
                         recoverable: true,
                     },
                 );
-                break;
+                // Fall through to reconnection logic below
             }
             Err(e) => {
                 log::error!("Camera loop error: {}", e);
-                disconnect_reason = DisconnectReason::Unknown;
+                disconnect_reason = Some(DisconnectReason::Unknown);
                 crate::emit_usb_error(
                     &ctx.app_handle,
                     crate::UsbError {
@@ -698,17 +723,127 @@ fn run_camera_loop(fd: i32, ctx: StreamingContext) {
                         recoverable: true,
                     },
                 );
-                break;
+                // Errors also trigger reconnection
+            }
+        }
+
+        // If we reach here, we need to attempt reconnection
+        // (either from disconnect or error)
+        reconnect_attempt += 1;
+
+        // Check if we've exceeded max attempts (if limit is set)
+        if MAX_ATTEMPTS > 0 && reconnect_attempt > MAX_ATTEMPTS {
+            log::warn!(
+                "Max reconnection attempts ({}) exceeded, giving up",
+                MAX_ATTEMPTS
+            );
+            crate::emit_usb_reconnect_stopped(
+                &ctx.app_handle,
+                Some(format!(
+                    "Gave up after {} reconnection attempts",
+                    MAX_ATTEMPTS
+                )),
+            );
+            break;
+        }
+
+        // Emit disconnect event (first attempt only)
+        if reconnect_attempt == 1 {
+            if let Some(ref reason) = disconnect_reason {
+                crate::emit_usb_disconnect(&ctx.app_handle, reason.clone(), None);
+            }
+        }
+
+        // Emit reconnecting status
+        log::info!(
+            "Reconnection attempt {} (delay: {}ms)",
+            reconnect_attempt,
+            current_delay_ms
+        );
+        crate::emit_usb_reconnecting(
+            &ctx.app_handle,
+            reconnect_attempt,
+            MAX_ATTEMPTS,
+            Some(format!(
+                "Waiting {}s before retry...",
+                current_delay_ms / 1000
+            )),
+        );
+
+        // Wait with exponential backoff
+        let delay = std::time::Duration::from_millis(current_delay_ms);
+        let start = std::time::Instant::now();
+        while start.elapsed() < delay {
+            // Check stop flag during wait
+            if ctx.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                log::info!("Stop flag set during reconnection wait");
+                crate::emit_usb_reconnect_stopped(
+                    &ctx.app_handle,
+                    Some("Stopped by user".to_string()),
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Increase delay for next attempt (exponential backoff)
+        current_delay_ms = ((current_delay_ms as f64) * BACKOFF_MULTIPLIER) as u64;
+        if current_delay_ms > MAX_DELAY_MS {
+            current_delay_ms = MAX_DELAY_MS;
+        }
+
+        // Try to get a new file descriptor
+        log::info!("Attempting to acquire new USB file descriptor...");
+        crate::emit_usb_reconnecting(
+            &ctx.app_handle,
+            reconnect_attempt,
+            MAX_ATTEMPTS,
+            Some("Looking for USB device...".to_string()),
+        );
+
+        match get_usb_file_descriptor() {
+            Some(new_fd) => {
+                log::info!(
+                    "Successfully acquired new USB fd: {} (attempt {})",
+                    new_fd,
+                    reconnect_attempt
+                );
+
+                // Emit connected event
+                crate::emit_usb_event(
+                    &ctx.app_handle,
+                    true,
+                    Some(format!("USB Camera reconnected (fd: {})", new_fd)),
+                );
+
+                // Reset reconnection state
+                current_fd = new_fd;
+                reconnect_attempt = 0;
+                current_delay_ms = INITIAL_DELAY_MS;
+                // Note: disconnect_reason will be set by the next disconnection event
+
+                // Continue the loop to start streaming with new fd
+                continue;
+            }
+            None => {
+                log::info!(
+                    "No USB device available yet (attempt {})",
+                    reconnect_attempt
+                );
+                // Loop back to wait and try again
+                continue;
             }
         }
     }
 
-    // Emit disconnected event with reason when camera loop exits
+    // Emit final disconnected event with reason when camera loop exits
+    let final_reason = disconnect_reason.unwrap_or(DisconnectReason::Normal);
     log::info!(
         "Camera loop exited, emitting disconnect event with reason: {:?}",
-        disconnect_reason
+        final_reason
     );
-    crate::emit_usb_disconnect(&ctx.app_handle, disconnect_reason, None);
+    crate::emit_usb_reconnect_stopped(&ctx.app_handle, None);
+    crate::emit_usb_disconnect(&ctx.app_handle, final_reason, None);
 }
 
 /// Result of a streaming session
@@ -810,11 +945,15 @@ fn run_camera_loop_inner(
 
         if is_mjpeg {
             // Start MJPEG streaming with selected format
-            let endpoint = start_uvc_streaming(&dev, Some(&ep_info), format_idx, frame_idx)?;
+            // Use _with_resolution to get width/height for correct frame size detection
+            let params =
+                start_uvc_streaming_with_resolution(&dev, Some(&ep_info), format_idx, frame_idx)?;
             log::info!(
-                "MJPEG streaming started on endpoint 0x{:02x} with format {}",
-                endpoint,
-                format_idx
+                "MJPEG streaming started on endpoint 0x{:02x} with format {}, resolution {}x{}",
+                params.endpoint,
+                format_idx,
+                params.width,
+                params.height
             );
 
             match ep_info.transfer_type {
@@ -826,12 +965,14 @@ fn run_camera_loop_inner(
                         stream_ctx.app_handle.clone(),
                         stream_ctx.frame_buffer.clone(),
                         format_idx,
+                        params.width,
+                        params.height,
                     )?;
                 }
                 TransferType::Bulk => {
                     stream_frames(
                         &dev,
-                        endpoint,
+                        ep_info.address,
                         stream_ctx.app_handle.clone(),
                         stream_ctx.frame_buffer.clone(),
                     )?;
@@ -944,6 +1085,10 @@ fn detect_yuy2_resolution(frame_size: usize) -> Option<(u32, u32)> {
 /// Stream frames using isochronous transfers with format detection
 /// Returns MjpegFound if JPEG frames are detected and continues streaming,
 /// or NotMjpeg if the format doesn't appear to be MJPEG
+///
+/// The width/height parameters are from UVC descriptor negotiation and are used
+/// to calculate the correct expected frame size for YUY2 format detection.
+/// MJPEG uses EOF markers and doesn't rely on frame size.
 #[cfg(target_os = "android")]
 fn stream_frames_isochronous_with_format_detection(
     ctx: &LibusbContext,
@@ -952,13 +1097,17 @@ fn stream_frames_isochronous_with_format_detection(
     app_handle: AppHandle,
     shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
     format_index: u8,
+    width: u16,
+    height: u16,
 ) -> Result<FormatDetectionResult, LibusbError> {
     use std::time::{Duration, Instant};
     use tauri::Emitter;
 
     log::info!(
-        "Starting isochronous streaming with format detection (format_index={})",
-        format_index
+        "Starting isochronous streaming with format detection (format_index={}, resolution={}x{})",
+        format_index,
+        width,
+        height
     );
 
     // Emit connecting status to update frontend UI during format detection
@@ -970,20 +1119,25 @@ fn stream_frames_isochronous_with_format_detection(
         }),
     );
 
+    // Calculate expected frame size for YUY2 (2 bytes per pixel)
+    // This ensures correct frame boundary detection if the format turns out to be YUY2.
+    // MJPEG uses EOF markers and doesn't rely on this size.
+    let expected_yuy2_frame_size = (width as usize) * (height as usize) * 2;
+
     // Create the isochronous stream
-    // For format detection, we use 0 as expected frame size (MJPEG uses EOF markers, not size)
-    // Validation is Off for MJPEG since we don't do YUY2 row validation on JPEG data
+    // Use calculated frame size so YUY2 detection works correctly
+    // Validation is Off since we're still detecting the format
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
             ep_info.max_packet_size,
-            0,                           // MJPEG uses EOF markers, not frame size
-            None,                        // No packet capture for format detection
-            crate::ValidationLevel::Off, // No YUY2 validation for MJPEG
-            0,                           // Width not used for MJPEG
-            0,                           // Height not used for MJPEG
+            expected_yuy2_frame_size, // Use descriptor-based size for YUY2 detection
+            None,                     // No packet capture for format detection
+            crate::ValidationLevel::Off, // No validation during format detection
+            width as usize,
+            height as usize,
         )?
     };
 
