@@ -1,14 +1,19 @@
 {
-  "format_version": "3.0.0",
+  "format_version": "3.2.0",
   "created_at": "2025-12-21T00:00:00Z",
-  "updated_at": "2026-01-13T00:00:00Z",
+  "updated_at": "2026-02-20T15:44:10Z",
   "created_by": {
     "blueprint_plugin": "3.0.0"
   },
   "project": {
     "name": "CleanScope",
     "type": "team",
-    "detected_stack": ["rust", "tauri", "svelte", "android"]
+    "detected_stack": [
+      "rust",
+      "tauri",
+      "svelte",
+      "android"
+    ]
   },
   "structure": {
     "has_prds": false,
@@ -46,6 +51,98 @@
         "Created docs/blueprint/README.md",
         "Registered existing rules as custom overrides"
       ]
+    },
+    {
+      "from": "3.0.0",
+      "to": "3.2.0",
+      "date": "2026-02-20T15:44:10Z",
+      "changes": [
+        "Added task_registry with scheduling metadata for all maintenance tasks",
+        "Task scheduling mode: prompt-before-running"
+      ]
     }
-  ]
+  ],
+  "task_registry": {
+    "derive-prd": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "on-demand",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "derive-plans": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "weekly",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "derive-rules": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "weekly",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "generate-rules": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "on-change",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "adr-validate": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "weekly",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "feature-tracker-sync": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "daily",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "sync-ids": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "on-change",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "claude-md": {
+      "enabled": true,
+      "auto_run": false,
+      "schedule": "on-change",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    },
+    "curate-docs": {
+      "enabled": false,
+      "auto_run": false,
+      "schedule": "on-demand",
+      "last_completed_at": null,
+      "last_result": null,
+      "stats": {},
+      "context": {}
+    }
+  }
 }
