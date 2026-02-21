@@ -1518,6 +1518,89 @@ fn convert_frame_to_rgb(
     result.map_err(|e| e.0)
 }
 
+/// Log detailed frame analysis for the first few frames to aid debugging.
+#[cfg(target_os = "android")]
+fn log_frame_analysis(
+    frame_count: u32,
+    frame_data: &[u8],
+    base_width: u32,
+    base_height: u32,
+) {
+    let frame_size = frame_data.len();
+    let expected_size = (base_width * base_height * 2) as usize;
+    let calculated_stride = if frame_size > 0 && base_height > 0 {
+        frame_size as u32 / base_height
+    } else {
+        0
+    };
+    let min_stride = base_width * 2;
+    let implied_width = calculated_stride / 2; // YUY2 = 2 bytes per pixel
+
+    log::info!(
+        "Frame {} analysis: size={} bytes, expected={}, stride_calc={} (implies {}px width), descriptor={}x{}",
+        frame_count, frame_size, expected_size, calculated_stride, implied_width, base_width, base_height
+    );
+
+    // Warn if camera is sending more data than expected
+    if frame_size > expected_size {
+        let ratio = frame_size as f32 / expected_size as f32;
+        log::warn!(
+            "Camera sending {}x more data than descriptor! Actual stride={}, expected={}",
+            ratio, calculated_stride, min_stride
+        );
+    }
+
+    // Log first 16 bytes
+    if frame_size >= 16 {
+        log::info!(
+            "Frame {} header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            frame_count,
+            frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+            frame_data[4], frame_data[5], frame_data[6], frame_data[7],
+            frame_data[8], frame_data[9], frame_data[10], frame_data[11],
+            frame_data[12], frame_data[13], frame_data[14], frame_data[15]
+        );
+    }
+}
+
+/// Store a converted RGB frame in the shared buffer and notify the frontend.
+#[cfg(target_os = "android")]
+fn store_frame_and_emit(
+    stream_ctx: &StreamingContext,
+    rgb_data: Vec<u8>,
+    raw_frame_data: &[u8],
+    width: u32,
+    height: u32,
+    is_jpeg: bool,
+) {
+    // Log RGB buffer size once
+    static RGB_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !RGB_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let expected_rgb = (width * height * 3) as usize;
+        log::info!(
+            "RGB buffer: {} bytes (expected {}, {}x{})",
+            rgb_data.len(),
+            expected_rgb,
+            width,
+            height
+        );
+    }
+
+    {
+        let mut buffer = lock_or_recover!(stream_ctx.frame_buffer);
+        buffer.frame = rgb_data;
+        if buffer.capture_raw_frames {
+            buffer.raw_frame = raw_frame_data.to_vec();
+        }
+        buffer.timestamp = std::time::Instant::now();
+        buffer.width = width;
+        buffer.height = height;
+    }
+
+    crate::emit_frame_ready(&stream_ctx.app_handle, width, height, is_jpeg);
+}
+
 /// Stream YUV 4:2:2 frames using isochronous transfers with RGB conversion
 /// Supports both YUYV and UYVY formats based on streaming config
 /// width/height: The negotiated resolution from UVC descriptors
@@ -1626,8 +1709,8 @@ fn stream_frames_yuy2(
     };
 
     loop {
-        // Check if restart was requested (e.g., user changed video format)
-        {
+        // Check restart flag and read current pixel format in a single lock
+        let pixel_format = {
             let config = lock_or_recover!(stream_ctx.streaming_config);
             if config.restart_requested {
                 log::info!("Restart requested, stopping YUY2 streaming");
@@ -1635,7 +1718,8 @@ fn stream_frames_yuy2(
                 let _ = event_loop_handle.join();
                 return Ok(StreamResult::RestartRequested);
             }
-        }
+            config.pixel_format
+        };
 
         match frame_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(frame_data) => {
@@ -1644,40 +1728,7 @@ fn stream_frames_yuy2(
 
                 // Log detailed frame analysis for first few frames
                 if frame_count <= 5 {
-                    let expected_size = (base_width * base_height * 2) as usize;
-                    let calculated_stride = if frame_size > 0 && base_height > 0 {
-                        frame_size as u32 / base_height
-                    } else {
-                        0
-                    };
-                    let min_stride = base_width * 2;
-                    let implied_width = calculated_stride / 2; // YUY2 = 2 bytes per pixel
-
-                    log::info!(
-                        "Frame {} analysis: size={} bytes, expected={}, stride_calc={} (implies {}px width), descriptor={}x{}",
-                        frame_count, frame_size, expected_size, calculated_stride, implied_width, base_width, base_height
-                    );
-
-                    // Warn if camera is sending more data than expected
-                    if frame_size > expected_size {
-                        let ratio = frame_size as f32 / expected_size as f32;
-                        log::warn!(
-                            "Camera sending {}x more data than descriptor! Actual stride={}, expected={}",
-                            ratio, calculated_stride, min_stride
-                        );
-                    }
-
-                    // Log first 16 bytes
-                    if frame_size >= 16 {
-                        log::info!(
-                            "Frame {} header: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            frame_count,
-                            frame_data[0], frame_data[1], frame_data[2], frame_data[3],
-                            frame_data[4], frame_data[5], frame_data[6], frame_data[7],
-                            frame_data[8], frame_data[9], frame_data[10], frame_data[11],
-                            frame_data[12], frame_data[13], frame_data[14], frame_data[15]
-                        );
-                    }
+                    log_frame_analysis(frame_count, &frame_data, base_width, base_height);
                 }
 
                 // Skip incomplete frames - must have at least minimum expected data
@@ -1741,62 +1792,25 @@ fn stream_frames_yuy2(
                     );
                 };
 
-                // Get pixel format from streaming config
-                let pixel_format = {
-                    let config = lock_or_recover!(stream_ctx.streaming_config);
-                    config.pixel_format
-                };
+                // Convert frame to RGB and store in shared buffer
+                match convert_frame_to_rgb(&frame_data, width, height, stride, pixel_format) {
+                    Ok(rgb_data) => {
+                        store_frame_and_emit(
+                            stream_ctx, rgb_data, &frame_data, width, height, false,
+                        );
 
-                // Convert frame to RGB using helper function
-                {
-                    let conversion_result =
-                        convert_frame_to_rgb(&frame_data, width, height, stride, pixel_format);
-                    match conversion_result {
-                        Ok(rgb_data) => {
-                            // Log RGB buffer size once
-                            static RGB_LOGGED: std::sync::atomic::AtomicBool =
-                                std::sync::atomic::AtomicBool::new(false);
-                            if !RGB_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                let expected_rgb = (width * height * 3) as usize;
-                                log::info!(
-                                    "RGB buffer: {} bytes (expected {}, {}x{})",
-                                    rgb_data.len(),
-                                    expected_rgb,
-                                    width,
-                                    height
-                                );
-                            }
-
-                            // Store RGB frame in shared buffer, only clone raw when capturing
-                            {
-                                let mut buffer = lock_or_recover!(stream_ctx.frame_buffer);
-                                buffer.frame = rgb_data;
-                                // Only clone raw frame data when capturing is enabled
-                                // This saves ~54MB/s at 30fps 720p (921,600 bytes/frame)
-                                if buffer.capture_raw_frames {
-                                    buffer.raw_frame = frame_data.clone();
-                                }
-                                buffer.timestamp = Instant::now();
-                                buffer.width = width;
-                                buffer.height = height;
-                            }
-
-                            // Emit frame-ready with metadata (reduces frontend IPC calls)
-                            crate::emit_frame_ready(&stream_ctx.app_handle, width, height, false);
-
-                            if frame_count % 30 == 0 {
-                                log::info!(
-                                    "Converted {} YUY2 frames to RGB ({}x{})",
-                                    frame_count,
-                                    width,
-                                    height
-                                );
-                            }
+                        if frame_count % 30 == 0 {
+                            log::info!(
+                                "Converted {} YUY2 frames to RGB ({}x{})",
+                                frame_count,
+                                width,
+                                height
+                            );
                         }
-                        Err(e) => {
-                            if frame_count <= 5 {
-                                log::error!("YUY2 conversion error: {}", e);
-                            }
+                    }
+                    Err(e) => {
+                        if frame_count <= 5 {
+                            log::error!("YUY2 conversion error: {}", e);
                         }
                     }
                 }
@@ -2062,109 +2076,91 @@ fn stream_frames(
 
     loop {
         // Perform bulk transfer to read data
-        match dev.bulk_transfer(endpoint, &mut packet_buffer, timeout_ms) {
-            Ok(transferred) => {
-                if transferred > 0 {
-                    // UVC payloads have a header (usually 12 bytes)
-                    // The header contains info about frame boundaries
-                    if transferred > 12 {
-                        let header_len = packet_buffer[0] as usize;
-                        let header_flags = packet_buffer[1];
-                        let _pts = if header_len >= 6 {
-                            u32::from_le_bytes([
-                                packet_buffer[2],
-                                packet_buffer[3],
-                                packet_buffer[4],
-                                packet_buffer[5],
-                            ])
-                        } else {
-                            0
-                        };
-
-                        // Check for end of frame (bit 1 of header flags)
-                        let end_of_frame = (header_flags & 0x02) != 0;
-
-                        // Append payload data (skip header)
-                        if header_len < transferred {
-                            local_frame_buffer
-                                .extend_from_slice(&packet_buffer[header_len..transferred]);
-                        }
-
-                        if end_of_frame && !local_frame_buffer.is_empty() {
-                            frame_count += 1;
-
-                            // Check for JPEG markers (SOI: 0xFFD8)
-                            let is_jpeg = local_frame_buffer.len() >= 2
-                                && local_frame_buffer[0] == 0xFF
-                                && local_frame_buffer[1] == 0xD8;
-
-                            if is_jpeg {
-                                jpeg_frames += 1;
-                                log::debug!(
-                                    "MJPEG frame {} received: {} bytes",
-                                    frame_count,
-                                    local_frame_buffer.len()
-                                );
-
-                                // Store frame in shared buffer for frontend retrieval
-                                {
-                                    let mut buffer = lock_or_recover!(shared_frame_buffer);
-                                    buffer.frame = local_frame_buffer.clone();
-                                    buffer.timestamp = Instant::now();
-                                }
-
-                                // Emit lightweight notification to trigger frontend fetch
-                                let _ = app_handle.emit("frame-ready", ());
-
-                                if frame_count % 30 == 0 {
-                                    log::info!(
-                                        "Received {} frames, last frame: {} bytes",
-                                        frame_count,
-                                        local_frame_buffer.len()
-                                    );
-                                }
-                            } else {
-                                log::warn!(
-                                    "Non-JPEG frame received: {} bytes, header: {:02x?}",
-                                    local_frame_buffer.len(),
-                                    &local_frame_buffer
-                                        [..std::cmp::min(16, local_frame_buffer.len())]
-                                );
-                            }
-
-                            // Format detection: check after UVC_CONFIG.frames_to_check_format frames
-                            if !format_confirmed && frame_count >= UVC_CONFIG.frames_to_check_format
-                            {
-                                let is_mjpeg = jpeg_frames > 0 && jpeg_frames >= frame_count / 2;
-                                log::info!(
-                                    "Bulk format detection: {} JPEG / {} total - {}",
-                                    jpeg_frames,
-                                    frame_count,
-                                    if is_mjpeg {
-                                        "MJPEG CONFIRMED"
-                                    } else {
-                                        "NOT MJPEG"
-                                    }
-                                );
-                                if !is_mjpeg {
-                                    return Ok(FormatDetectionResult::NotMjpeg);
-                                }
-                                format_confirmed = true;
-                            }
-
-                            local_frame_buffer.clear();
-                        }
-                    }
-                }
-            }
+        let transferred = match dev.bulk_transfer(endpoint, &mut packet_buffer, timeout_ms) {
+            Ok(n) => n,
             Err(LibusbError::Timeout) => {
-                // Timeout is expected when no data is available
                 log::trace!("Bulk transfer timeout");
+                continue;
             }
             Err(e) => {
                 log::error!("Bulk transfer error: {}", e);
                 return Err(e);
             }
+        };
+
+        // Skip empty or too-small packets (UVC headers are typically 12 bytes)
+        if transferred <= 12 {
+            continue;
+        }
+
+        let header_len = packet_buffer[0] as usize;
+        let header_flags = packet_buffer[1];
+        let end_of_frame = (header_flags & 0x02) != 0;
+
+        // Append payload data (skip header)
+        if header_len < transferred {
+            local_frame_buffer.extend_from_slice(&packet_buffer[header_len..transferred]);
+        }
+
+        if !end_of_frame || local_frame_buffer.is_empty() {
+            continue;
+        }
+
+        frame_count += 1;
+
+        // Check for JPEG markers (SOI: 0xFFD8)
+        let is_jpeg = local_frame_buffer.len() >= 2
+            && local_frame_buffer[0] == 0xFF
+            && local_frame_buffer[1] == 0xD8;
+
+        if is_jpeg {
+            jpeg_frames += 1;
+            log::debug!(
+                "MJPEG frame {} received: {} bytes",
+                frame_count,
+                local_frame_buffer.len()
+            );
+
+            // Store frame in shared buffer - swap to avoid clone inside lock
+            let frame_for_buffer = std::mem::take(&mut local_frame_buffer);
+            {
+                let mut buffer = lock_or_recover!(shared_frame_buffer);
+                buffer.frame = frame_for_buffer;
+                buffer.timestamp = Instant::now();
+            }
+
+            // Emit lightweight notification to trigger frontend fetch
+            let _ = app_handle.emit("frame-ready", ());
+
+            if frame_count % 30 == 0 {
+                log::info!("Received {} frames", frame_count);
+            }
+        } else {
+            log::warn!(
+                "Non-JPEG frame received: {} bytes, header: {:02x?}",
+                local_frame_buffer.len(),
+                &local_frame_buffer[..std::cmp::min(16, local_frame_buffer.len())]
+            );
+            local_frame_buffer.clear();
+        }
+
+        // Format detection: check after UVC_CONFIG.frames_to_check_format frames
+        if !format_confirmed && frame_count >= UVC_CONFIG.frames_to_check_format {
+            let is_mjpeg = jpeg_frames > 0 && jpeg_frames >= frame_count / 2;
+            log::info!(
+                "Bulk format detection: {} JPEG / {} total - {}",
+                jpeg_frames,
+                frame_count,
+                if is_mjpeg {
+                    "MJPEG CONFIRMED"
+                } else {
+                    "NOT MJPEG"
+                }
+            );
+            if !is_mjpeg {
+                return Ok(FormatDetectionResult::NotMjpeg);
+            }
+            format_confirmed = true;
         }
     }
 }
