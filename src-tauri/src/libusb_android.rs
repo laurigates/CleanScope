@@ -1613,11 +1613,7 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
             };
 
             // Extract payload from this URB (always parse UVC headers per spec)
-            let payload = extract_urb_payloads(
-                xfr,
-                context.max_packet_size,
-                context,
-            );
+            let payload = extract_urb_payloads(xfr, context.max_packet_size, context);
 
             log::trace!(
                 "URB completed: transfer_index={}, sequence={}, payload_bytes={}",
