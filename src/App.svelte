@@ -60,6 +60,12 @@ const currentFps = $derived.by(() => {
   return Math.round(((frameTimestamps.length - 1) / timeSpanMs) * 1000);
 });
 
+// --- Constants ---
+const HASH_PREFIX_LENGTH = 6;
+const COLOR_FALLBACK = "#9ca3af";
+const RESOLUTION_FETCH_DELAY_MS = 500;
+const RGB_BYTES_PER_PIXEL = 3;
+
 // Curated color palette - distinct, visible on dark backgrounds
 const BUILD_COLORS = [
   "#f87171",
@@ -77,12 +83,12 @@ const BUILD_COLORS = [
 ];
 
 function hashToColorIndex(hash: string): number {
-  const hexValue = parseInt(hash.slice(0, 6), 16);
+  const hexValue = parseInt(hash.slice(0, HASH_PREFIX_LENGTH), 16);
   return hexValue % BUILD_COLORS.length;
 }
 
 const buildColor = $derived.by(() => {
-  if (!buildInfo?.git_hash) return "#9ca3af";
+  if (!buildInfo?.git_hash) return COLOR_FALLBACK;
   return BUILD_COLORS[hashToColorIndex(buildInfo.git_hash)];
 });
 
@@ -130,7 +136,7 @@ onMount(async () => {
       wasConnected = true;
       lastUsbError = null;
       disconnectReason = null;
-      resolutionTimeoutId = setTimeout(() => fetchCurrentResolution(), 500);
+      resolutionTimeoutId = setTimeout(() => fetchCurrentResolution(), RESOLUTION_FETCH_DELAY_MS);
     } else {
       connectionStatus = "disconnected";
       cameraInfo = "";
@@ -259,7 +265,7 @@ async function renderFrame(
     bitmap.close();
   } else {
     const rgb = new Uint8Array(data);
-    const expectedSize = width * height * 3;
+    const expectedSize = width * height * RGB_BYTES_PER_PIXEL;
 
     if (rgb.length < expectedSize) {
       console.debug(`RGB frame too small: ${rgb.length} < ${expectedSize}`);
@@ -277,7 +283,7 @@ async function renderFrame(
     const pixelCount = width * height;
 
     for (let i = 0; i < pixelCount; i++) {
-      const rgbIdx = i * 3;
+      const rgbIdx = i * RGB_BYTES_PER_PIXEL;
       const rgbaIdx = i * 4;
       rgba[rgbaIdx] = rgb[rgbIdx];
       rgba[rgbaIdx + 1] = rgb[rgbIdx + 1];

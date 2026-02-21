@@ -76,6 +76,71 @@ use crate::yuv_conversion::{
 #[cfg(target_os = "android")]
 const LIBUSB_EVENT_TIMEOUT_USEC: libc::suseconds_t = 100_000;
 
+// --- Streaming constants ---
+
+/// Timeout for receiving frames from the channel (seconds)
+const FRAME_RECV_TIMEOUT_SECS: u64 = 5;
+
+/// Timeout for format detection frame receive (seconds)
+#[cfg(target_os = "android")]
+const FORMAT_DETECTION_TIMEOUT_SECS: u64 = 2;
+
+/// Log frame count progress every N frames
+#[cfg(target_os = "android")]
+const LOG_INTERVAL_FRAMES: u32 = 30;
+
+/// Number of initial frames to log detailed analysis for
+#[cfg(target_os = "android")]
+const INITIAL_FRAMES_TO_LOG: u32 = 5;
+
+/// Number of initial frames to log conversion errors for
+#[cfg(target_os = "android")]
+const INITIAL_FRAMES_TO_LOG_ERRORS: u32 = 5;
+
+/// Settle time after restart or reconnect (milliseconds)
+#[cfg(target_os = "android")]
+const SETTLE_MS: u64 = 100;
+
+/// UVC streaming interface index
+#[cfg(target_os = "android")]
+const UVC_STREAMING_INTERFACE: u16 = 1;
+
+/// UVC control transfer timeout (milliseconds)
+#[cfg(target_os = "android")]
+const CONTROL_TRANSFER_TIMEOUT_MS: u32 = 1000;
+
+/// Size of UVC probe response buffer
+#[cfg(target_os = "android")]
+const UVC_PROBE_RESPONSE_SIZE: usize = 26;
+
+/// Default fallback width when descriptor lookup fails
+#[cfg(target_os = "android")]
+const DEFAULT_WIDTH: u16 = 640;
+
+/// Default fallback height when descriptor lookup fails
+#[cfg(target_os = "android")]
+const DEFAULT_HEIGHT: u16 = 480;
+
+/// Default USB endpoint address for streaming
+#[cfg(target_os = "android")]
+const DEFAULT_ENDPOINT_ADDR: u8 = 0x81;
+
+/// Bulk transfer buffer size (16KB per transfer)
+#[cfg(target_os = "android")]
+const BULK_TRANSFER_BUFFER_SIZE: usize = 16384;
+
+/// Initial capacity for frame accumulation buffer (1MB)
+#[cfg(target_os = "android")]
+const FRAME_ACCUMULATION_CAPACITY: usize = 1024 * 1024;
+
+/// Bulk transfer timeout (milliseconds)
+#[cfg(target_os = "android")]
+const BULK_TRANSFER_TIMEOUT_MS: u32 = 1000;
+
+/// Minimum UVC header size for payload parsing
+#[cfg(target_os = "android")]
+const UVC_HEADER_MIN_SIZE: usize = 12;
+
 /// Spawns a thread that runs the libusb event loop.
 ///
 /// The event loop processes asynchronous USB transfers (isochronous callbacks).
@@ -689,7 +754,7 @@ fn run_camera_loop(initial_fd: i32, ctx: StreamingContext) {
                 reconnect_attempt = 0;
                 current_delay_ms = INITIAL_DELAY_MS;
                 // Small delay to let things settle
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
                 continue;
             }
             Ok(StreamResult::DeviceUnplugged) => {
@@ -803,7 +868,7 @@ fn run_camera_loop(initial_fd: i32, ctx: StreamingContext) {
                 );
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
         }
 
         // Increase delay for next attempt (exponential backoff)
@@ -1195,7 +1260,7 @@ fn stream_frames_isochronous_with_format_detection(
             break;
         }
 
-        match frame_receiver.recv_timeout(Duration::from_secs(2)) {
+        match frame_receiver.recv_timeout(Duration::from_secs(FORMAT_DETECTION_TIMEOUT_SECS)) {
             Ok(frame_data) => {
                 frames_checked += 1;
 
@@ -1280,7 +1345,7 @@ fn stream_frames_isochronous_with_format_detection(
     let mut frame_count = frames_checked;
 
     loop {
-        match frame_receiver.recv_timeout(Duration::from_secs(5)) {
+        match frame_receiver.recv_timeout(Duration::from_secs(FRAME_RECV_TIMEOUT_SECS)) {
             Ok(frame_data) => {
                 frame_count += 1;
 
@@ -1294,12 +1359,12 @@ fn stream_frames_isochronous_with_format_detection(
                 // Emit notification to trigger frontend fetch
                 let _ = app_handle.emit("frame-ready", ());
 
-                if frame_count % 30 == 0 {
+                if frame_count % LOG_INTERVAL_FRAMES == 0 {
                     log::info!("Received {} frames via isochronous transfer", frame_count);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                log::warn!("No frames received in 5 seconds");
+                log::warn!("No frames received in {} seconds", FRAME_RECV_TIMEOUT_SECS);
                 if iso_stream.is_stopped() {
                     break;
                 }
@@ -1316,104 +1381,6 @@ fn stream_frames_isochronous_with_format_detection(
 
     log::info!("Streaming ended after {} total frames", frame_count);
     Ok(FormatDetectionResult::MjpegFound)
-}
-
-/// Stream frames using isochronous transfers (legacy, for backwards compatibility)
-#[cfg(target_os = "android")]
-#[allow(dead_code)]
-fn stream_frames_isochronous(
-    ctx: &LibusbContext,
-    dev: &LibusbDeviceHandle,
-    ep_info: &EndpointInfo,
-    app_handle: AppHandle,
-    shared_frame_buffer: Arc<Mutex<FrameBuffer>>,
-) -> Result<(), LibusbError> {
-    use std::time::Instant;
-    use tauri::Emitter;
-
-    log::info!(
-        "Starting isochronous streaming on endpoint 0x{:02x}, max_packet={}",
-        ep_info.address,
-        ep_info.max_packet_size
-    );
-
-    // Create the isochronous stream
-    // SAFETY: We hold references to ctx and dev for the duration of streaming
-    // For legacy MJPEG streaming, we use 0 as expected frame size (MJPEG uses EOF markers)
-    // Validation is Off for MJPEG since we don't do YUY2 row validation on JPEG data
-    let mut iso_stream = unsafe {
-        IsochronousStream::new(
-            ctx.get_context_ptr(),
-            dev.get_handle_ptr(),
-            ep_info.address,
-            ep_info.max_packet_size,
-            0,                           // MJPEG uses EOF markers, not frame size
-            None,                        // No packet capture for legacy streaming
-            crate::ValidationLevel::Off, // No YUY2 validation for MJPEG
-            0,                           // Width not used for MJPEG
-            0,                           // Height not used for MJPEG
-        )?
-    };
-
-    // Get the frame receiver before starting
-    let frame_receiver = iso_stream.take_frame_receiver().ok_or(LibusbError::Other)?;
-
-    // Start the transfers
-    iso_stream.start()?;
-
-    // Spawn a thread to run the libusb event loop
-    let event_loop_handle = spawn_libusb_event_loop(
-        SendableContextPtr::new(ctx.get_context_ptr()),
-        iso_stream.stop_flag.clone(),
-        "legacy-streaming",
-        true, // Enable debug logging for legacy streaming path
-    );
-
-    // Process received frames and emit to frontend
-    let mut frame_count = 0u32;
-
-    loop {
-        match frame_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(frame_data) => {
-                frame_count += 1;
-
-                // Store frame in shared buffer
-                {
-                    let mut buffer = lock_or_recover!(shared_frame_buffer);
-                    buffer.frame = frame_data;
-                    buffer.timestamp = Instant::now();
-                }
-
-                // Emit lightweight notification to trigger frontend fetch
-                let _ = app_handle.emit("frame-ready", ());
-
-                if frame_count % 30 == 0 {
-                    log::info!("Received {} frames via isochronous transfer", frame_count);
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                log::warn!("No frames received in 5 seconds");
-                // Check if we should continue
-                if iso_stream.is_stopped() {
-                    log::info!("Stream stopped, exiting frame loop");
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                log::info!("Frame channel disconnected, exiting");
-                break;
-            }
-        }
-    }
-
-    // Stop the stream
-    iso_stream.stop();
-
-    // Wait for event loop thread to finish
-    let _ = event_loop_handle.join();
-
-    log::info!("Isochronous streaming ended after {} frames", frame_count);
-    Ok(())
 }
 
 /// Calculated frame dimensions from raw frame data
@@ -1572,11 +1539,11 @@ fn store_frame_and_emit(
     width: u32,
     height: u32,
     is_jpeg: bool,
+    rgb_logged: &mut bool,
 ) {
-    // Log RGB buffer size once
-    static RGB_LOGGED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if !RGB_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Log RGB buffer size once per session
+    if !*rgb_logged {
+        *rgb_logged = true;
         let expected_rgb = (width * height * 3) as usize;
         log::info!(
             "RGB buffer: {} bytes (expected {}, {}x{})",
@@ -1635,18 +1602,9 @@ fn stream_frames_yuy2(
     let expected_frame_size =
         ((descriptor_width * descriptor_height) as f64 * bytes_per_pixel) as usize;
 
-    let format_name = match pixel_format {
-        PixelFormat::Yuyv => "YUYV",
-        PixelFormat::Uyvy => "UYVY",
-        PixelFormat::I420 => "I420",
-        PixelFormat::Nv12 => "NV12",
-        PixelFormat::Rgb888 => "RGB24",
-        PixelFormat::Bgr888 => "BGR24",
-    };
-
     log::info!(
         "Starting {} streaming with RGB conversion, descriptor resolution: {}x{}, expected frame size: {} bytes",
-        format_name,
+        pixel_format,
         descriptor_width,
         descriptor_height,
         expected_frame_size
@@ -1656,7 +1614,7 @@ fn stream_frames_yuy2(
     crate::emit_usb_event(
         &stream_ctx.app_handle,
         true,
-        Some(format!("{} Camera", format_name)),
+        Some(format!("{} Camera", pixel_format)),
     );
 
     // Create the isochronous stream with descriptor-based frame size
@@ -1695,6 +1653,10 @@ fn stream_frames_yuy2(
     );
 
     let mut frame_count = 0u32;
+    // Session-scoped one-shot flags (reset each streaming session)
+    let mut rgb_logged = false;
+    let mut resolution_logged = false;
+    let mut last_settings_hash: u64 = 0;
 
     // Use descriptor resolution - this is the authoritative source
     let base_width = descriptor_width;
@@ -1721,13 +1683,13 @@ fn stream_frames_yuy2(
             config.pixel_format
         };
 
-        match frame_receiver.recv_timeout(Duration::from_secs(5)) {
+        match frame_receiver.recv_timeout(Duration::from_secs(FRAME_RECV_TIMEOUT_SECS)) {
             Ok(frame_data) => {
                 frame_count += 1;
                 let frame_size = frame_data.len();
 
                 // Log detailed frame analysis for first few frames
-                if frame_count <= 5 {
+                if frame_count <= INITIAL_FRAMES_TO_LOG {
                     log_frame_analysis(frame_count, &frame_data, base_width, base_height);
                 }
 
@@ -1764,11 +1726,8 @@ fn stream_frames_yuy2(
                 } = dims;
 
                 // Log when we detect camera sending different resolution than descriptor
-                static RESOLUTION_LOGGED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if actual_width != base_width
-                    && !RESOLUTION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
+                if actual_width != base_width && !resolution_logged {
+                    resolution_logged = true;
                     log::warn!(
                         "Camera sending {}x{} (stride={}) but descriptor says {}x{}. Using actual dimensions.",
                         actual_width, height, actual_stride, base_width, base_height
@@ -1776,12 +1735,10 @@ fn stream_frames_yuy2(
                 }
 
                 // Log settings changes
-                static LAST_SETTINGS: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
                 let settings_hash =
                     ((width as u64) << 48) | ((height as u64) << 32) | ((stride as u64) << 16);
-                let last = LAST_SETTINGS.swap(settings_hash, std::sync::atomic::Ordering::Relaxed);
-                if last != settings_hash {
+                if last_settings_hash != settings_hash {
+                    last_settings_hash = settings_hash;
                     log::info!("Display settings: {}x{} stride={}", width, height, stride);
                     let _ = stream_ctx.app_handle.emit(
                         "usb-status",
@@ -1797,9 +1754,10 @@ fn stream_frames_yuy2(
                     Ok(rgb_data) => {
                         store_frame_and_emit(
                             stream_ctx, rgb_data, &frame_data, width, height, false,
+                            &mut rgb_logged,
                         );
 
-                        if frame_count % 30 == 0 {
+                        if frame_count % LOG_INTERVAL_FRAMES == 0 {
                             log::info!(
                                 "Converted {} YUY2 frames to RGB ({}x{})",
                                 frame_count,
@@ -1809,20 +1767,20 @@ fn stream_frames_yuy2(
                         }
                     }
                     Err(e) => {
-                        if frame_count <= 5 {
+                        if frame_count <= INITIAL_FRAMES_TO_LOG_ERRORS {
                             log::error!("YUY2 conversion error: {}", e);
                         }
                     }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                log::warn!("No frames received in 5 seconds");
+                log::warn!("No frames received in {} seconds", FRAME_RECV_TIMEOUT_SECS);
                 if iso_stream.is_stopped() {
                     break;
                 }
                 // If stream hasn't stopped but we're timing out, it might be the device
                 // Check again after a brief moment
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
                 if iso_stream.is_stopped() {
                     break;
                 }
@@ -1900,7 +1858,7 @@ fn start_uvc_streaming_with_resolution(
     let request_type_out = uvc::USB_TYPE_CLASS | uvc::USB_RECIP_INTERFACE | uvc::USB_DIR_OUT;
     let request_type_in = uvc::USB_TYPE_CLASS | uvc::USB_RECIP_INTERFACE | uvc::USB_DIR_IN;
 
-    let streaming_interface: u16 = 1;
+    let streaming_interface: u16 = UVC_STREAMING_INTERFACE;
     let control_selector = uvc::UVC_VS_PROBE_CONTROL << 8;
 
     // SAFETY: UvcStreamControl is #[repr(C, packed)] with no padding or invariants.
@@ -1921,19 +1879,19 @@ fn start_uvc_streaming_with_resolution(
         control_selector,
         streaming_interface,
         probe_bytes,
-        1000,
+        CONTROL_TRANSFER_TIMEOUT_MS,
     )?;
 
     // GET_CUR probe control - camera returns its chosen parameters
     log::debug!("Sending UVC GET_CUR PROBE");
-    let mut response = [0u8; 26];
+    let mut response = [0u8; UVC_PROBE_RESPONSE_SIZE];
     dev.control_transfer(
         request_type_in,
         uvc::UVC_GET_CUR,
         control_selector,
         streaming_interface,
         &mut response,
-        1000,
+        CONTROL_TRANSFER_TIMEOUT_MS,
     )?;
 
     log::info!("Camera probe response received");
@@ -1960,8 +1918,8 @@ fn start_uvc_streaming_with_resolution(
     );
 
     // Look up resolution from frame descriptors
-    let mut width: u16 = 640; // Default fallback
-    let mut height: u16 = 480;
+    let mut width: u16 = DEFAULT_WIDTH;
+    let mut height: u16 = DEFAULT_HEIGHT;
     let mut found_descriptor = false;
 
     // Find the format that matches the negotiated format_index
@@ -2012,7 +1970,7 @@ fn start_uvc_streaming_with_resolution(
     }
 
     // Log raw probe response for debugging
-    log::debug!("Raw probe response: {:02x?}", &response[..26]);
+    log::debug!("Raw probe response: {:02x?}", &response[..UVC_PROBE_RESPONSE_SIZE]);
 
     // Commit the negotiated parameters
     let commit_control = uvc::UVC_VS_COMMIT_CONTROL << 8;
@@ -2023,7 +1981,7 @@ fn start_uvc_streaming_with_resolution(
         commit_control,
         streaming_interface,
         &mut response,
-        1000,
+        CONTROL_TRANSFER_TIMEOUT_MS,
     )?;
 
     log::info!("UVC streaming committed");
@@ -2035,7 +1993,7 @@ fn start_uvc_streaming_with_resolution(
     dev.set_interface_alt_setting(streaming_interface_i32, alt_setting)?;
 
     // Return the streaming endpoint address from descriptor, or default to 0x81
-    let endpoint_addr = endpoint_info.map(|ep| ep.address).unwrap_or(0x81);
+    let endpoint_addr = endpoint_info.map(|ep| ep.address).unwrap_or(DEFAULT_ENDPOINT_ADDR);
 
     Ok(UvcNegotiatedParams {
         endpoint: endpoint_addr,
@@ -2066,10 +2024,10 @@ fn stream_frames(
     // Buffer for receiving USB data
     // USB packets are typically up to 512 bytes (full-speed) or 1024 bytes (high-speed)
     // MJPEG frames can be several KB, so we need to accumulate packets
-    let mut packet_buffer = vec![0u8; 16384]; // 16KB per transfer
-    let mut local_frame_buffer = Vec::with_capacity(1024 * 1024); // 1MB for frame accumulation
+    let mut packet_buffer = vec![0u8; BULK_TRANSFER_BUFFER_SIZE];
+    let mut local_frame_buffer = Vec::with_capacity(FRAME_ACCUMULATION_CAPACITY);
 
-    let timeout_ms = 1000;
+    let timeout_ms = BULK_TRANSFER_TIMEOUT_MS;
     let mut frame_count = 0u32;
     let mut jpeg_frames = 0u32;
     let mut format_confirmed = false;
@@ -2089,7 +2047,7 @@ fn stream_frames(
         };
 
         // Skip empty or too-small packets (UVC headers are typically 12 bytes)
-        if transferred <= 12 {
+        if transferred <= UVC_HEADER_MIN_SIZE {
             continue;
         }
 
@@ -2132,7 +2090,7 @@ fn stream_frames(
             // Emit lightweight notification to trigger frontend fetch
             let _ = app_handle.emit("frame-ready", ());
 
-            if frame_count % 30 == 0 {
+            if frame_count % LOG_INTERVAL_FRAMES == 0 {
                 log::info!("Received {} frames", frame_count);
             }
         } else {
@@ -2268,7 +2226,7 @@ fn replay_frame_loop(
 
     // Process frames from the replay channel
     loop {
-        match frame_rx.recv_timeout(Duration::from_secs(5)) {
+        match frame_rx.recv_timeout(Duration::from_secs(FRAME_RECV_TIMEOUT_SECS)) {
             Ok(frame_data) => {
                 frame_count += 1;
 
@@ -2290,7 +2248,7 @@ fn replay_frame_loop(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // No frames for 5 seconds - replay might have ended or stalled
-                log::warn!("Replay timeout - no frames received for 5 seconds");
+                log::warn!("Replay timeout - no frames received for {} seconds", FRAME_RECV_TIMEOUT_SECS);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed - replay thread ended

@@ -156,6 +156,19 @@ pub enum PixelFormat {
     Bgr888,
 }
 
+impl std::fmt::Display for PixelFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PixelFormat::Yuyv => write!(f, "YUYV"),
+            PixelFormat::Uyvy => write!(f, "UYVY"),
+            PixelFormat::Nv12 => write!(f, "NV12"),
+            PixelFormat::I420 => write!(f, "I420"),
+            PixelFormat::Rgb888 => write!(f, "RGB24"),
+            PixelFormat::Bgr888 => write!(f, "BGR24"),
+        }
+    }
+}
+
 /// Streaming configuration options
 #[derive(Debug, Clone, Default)]
 pub struct StreamingConfig {
