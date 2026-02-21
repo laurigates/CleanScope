@@ -13,6 +13,22 @@ use tauri::Emitter;
 use crate::frame_assembler::is_jpeg_data;
 use crate::{DisplayConfig, FrameBuffer, StreamingConfig, ValidationLevel};
 
+/// Lock a mutex with poison recovery.
+///
+/// If the mutex is poisoned (a thread panicked while holding it), recovers the
+/// inner value and logs a warning instead of panicking.
+macro_rules! lock_or_recover {
+    ($mutex:expr) => {
+        match $mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::error!("Mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        }
+    };
+}
+
 #[cfg(target_os = "android")]
 use crate::{DisplaySettings, PixelFormat};
 
@@ -377,6 +393,10 @@ struct UvcStreamControl {
     dw_max_payload_transfer_size: u32,
 }
 
+// Compile-time check: UvcStreamControl must fit in a 26-byte UVC probe/commit control transfer
+#[cfg(target_os = "android")]
+const _: () = assert!(std::mem::size_of::<UvcStreamControl>() <= 26);
+
 /// Negotiated UVC stream parameters
 #[cfg(target_os = "android")]
 #[derive(Debug, Clone, Copy)]
@@ -441,7 +461,7 @@ fn discover_and_store_formats(
 ) -> Vec<uvc::UvcFormatInfo> {
     let formats = dev.get_format_descriptors().unwrap_or_default();
     {
-        let mut config = streaming_config.lock().unwrap();
+        let mut config = lock_or_recover!(streaming_config);
         config.available_formats = formats
             .iter()
             .map(|f| {
@@ -653,7 +673,7 @@ fn run_camera_loop(initial_fd: i32, ctx: StreamingContext) {
 
         // Clear any pending restart request before starting
         {
-            let mut config = ctx.streaming_config.lock().unwrap();
+            let mut config = lock_or_recover!(ctx.streaming_config);
             config.restart_requested = false;
         }
 
@@ -921,7 +941,7 @@ fn run_camera_loop_inner(
 
     // Get user's format selection and MJPEG skip preference
     let (selected_format, selected_frame, skip_mjpeg) = {
-        let config = stream_ctx.streaming_config.lock().unwrap();
+        let config = lock_or_recover!(stream_ctx.streaming_config);
         (
             config.selected_format_index,
             config.selected_frame_index,
@@ -1266,7 +1286,7 @@ fn stream_frames_isochronous_with_format_detection(
 
                 // Store frame in shared buffer
                 {
-                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                    let mut buffer = lock_or_recover!(shared_frame_buffer);
                     buffer.frame = frame_data;
                     buffer.timestamp = Instant::now();
                 }
@@ -1359,7 +1379,7 @@ fn stream_frames_isochronous(
 
                 // Store frame in shared buffer
                 {
-                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                    let mut buffer = lock_or_recover!(shared_frame_buffer);
                     buffer.frame = frame_data;
                     buffer.timestamp = Instant::now();
                 }
@@ -1516,7 +1536,7 @@ fn stream_frames_yuy2(
 
     // Get current pixel format to determine expected frame size
     let pixel_format = {
-        let config = stream_ctx.streaming_config.lock().unwrap();
+        let config = lock_or_recover!(stream_ctx.streaming_config);
         config.pixel_format
     };
 
@@ -1608,7 +1628,7 @@ fn stream_frames_yuy2(
     loop {
         // Check if restart was requested (e.g., user changed video format)
         {
-            let config = stream_ctx.streaming_config.lock().unwrap();
+            let config = lock_or_recover!(stream_ctx.streaming_config);
             if config.restart_requested {
                 log::info!("Restart requested, stopping YUY2 streaming");
                 iso_stream.stop();
@@ -1674,7 +1694,7 @@ fn stream_frames_yuy2(
 
                 // Calculate frame dimensions using helper function
                 let dims = {
-                    let display = stream_ctx.display.lock().unwrap();
+                    let display = lock_or_recover!(stream_ctx.display);
                     calculate_frame_dimensions(
                         frame_size,
                         base_width,
@@ -1723,7 +1743,7 @@ fn stream_frames_yuy2(
 
                 // Get pixel format from streaming config
                 let pixel_format = {
-                    let config = stream_ctx.streaming_config.lock().unwrap();
+                    let config = lock_or_recover!(stream_ctx.streaming_config);
                     config.pixel_format
                 };
 
@@ -1749,7 +1769,7 @@ fn stream_frames_yuy2(
 
                             // Store RGB frame in shared buffer, only clone raw when capturing
                             {
-                                let mut buffer = stream_ctx.frame_buffer.lock().unwrap();
+                                let mut buffer = lock_or_recover!(stream_ctx.frame_buffer);
                                 buffer.frame = rgb_data;
                                 // Only clone raw frame data when capturing is enabled
                                 // This saves ~54MB/s at 30fps 720p (921,600 bytes/frame)
@@ -1869,7 +1889,9 @@ fn start_uvc_streaming_with_resolution(
     let streaming_interface: u16 = 1;
     let control_selector = uvc::UVC_VS_PROBE_CONTROL << 8;
 
-    // Convert struct to bytes for transfer
+    // SAFETY: UvcStreamControl is #[repr(C, packed)] with no padding or invariants.
+    // The mutable borrow of `probe` is not used again while `probe_bytes` is live,
+    // so there is no aliasing violation.
     let probe_bytes: &mut [u8] = unsafe {
         std::slice::from_raw_parts_mut(
             &mut probe as *mut UvcStreamControl as *mut u8,
@@ -2086,7 +2108,7 @@ fn stream_frames(
 
                                 // Store frame in shared buffer for frontend retrieval
                                 {
-                                    let mut buffer = shared_frame_buffer.lock().unwrap();
+                                    let mut buffer = lock_or_recover!(shared_frame_buffer);
                                     buffer.frame = local_frame_buffer.clone();
                                     buffer.timestamp = Instant::now();
                                 }
@@ -2256,7 +2278,7 @@ fn replay_frame_loop(
 
                 // Store frame in shared buffer
                 {
-                    let mut buffer = frame_buffer.lock().unwrap();
+                    let mut buffer = lock_or_recover!(frame_buffer);
                     buffer.frame = frame_data;
                     buffer.timestamp = Instant::now();
                 }
