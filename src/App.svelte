@@ -2,30 +2,25 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onDestroy, onMount } from "svelte";
+// biome-ignore lint/correctness/noUnusedImports: used in Svelte template
+import CaptureInfo from "./lib/CaptureInfo.svelte";
+// biome-ignore lint/correctness/noUnusedImports: used in Svelte template
+import ConnectionOverlay from "./lib/ConnectionOverlay.svelte";
+// biome-ignore lint/correctness/noUnusedImports: used in Svelte template
+import DebugControls from "./lib/DebugControls.svelte";
+// biome-ignore lint/correctness/noUnusedImports: used in Svelte template
+import StatusBar from "./lib/StatusBar.svelte";
+import type {
+  BuildInfo,
+  CaptureResult,
+  ConnectionStatus,
+  ReconnectStatus,
+  ResolutionInfo,
+  UsbError,
+  UsbStatusExtended,
+} from "./lib/types";
 
-// Resolution info from the backend
-interface ResolutionInfo {
-  width: number;
-  height: number;
-  frame_index: number;
-  available_count: number;
-}
-
-// USB error event from backend
-interface UsbError {
-  error_type: "normal" | "device_unplugged" | "transfer_error" | "timeout" | "unknown";
-  message: string;
-  recoverable: boolean;
-}
-
-// Extended USB status with disconnect reason
-interface UsbStatusExtended {
-  connected: boolean;
-  info?: string;
-  disconnect_reason?: "normal" | "device_unplugged" | "transfer_error" | "timeout" | "unknown";
-}
-
-let connectionStatus = $state<"disconnected" | "connecting" | "connected">("disconnected");
+let connectionStatus = $state<ConnectionStatus>("disconnected");
 let cameraInfo = $state<string>("");
 let currentResolution = $state<string>("");
 let resolutionInfo = $state<ResolutionInfo | null>(null);
@@ -33,18 +28,11 @@ let isCyclingResolution = $state<boolean>(false);
 let errorMessage = $state<string>("");
 let lastUsbError = $state<UsbError | null>(null);
 let disconnectReason = $state<string | null>(null);
+let reconnectAttempt = $state<number>(0);
+let reconnectMessage = $state<string | null>(null);
 let frameCount = $state<number>(0);
-let buildInfo = $state<{ version: string; git_hash: string; build_time: string } | null>(null);
-let captureResult = $state<{
-  path: string;
-  raw_path: string | null;
-  size: number;
-  raw_size: number;
-  header_hex: string;
-  format_hint: string;
-  width: number;
-  height: number;
-} | null>(null);
+let buildInfo = $state<BuildInfo | null>(null);
+let captureResult = $state<CaptureResult | null>(null);
 
 // Display settings for debugging (width, height, stride)
 let widthSetting = $state<string>("W:Auto");
@@ -61,7 +49,7 @@ let streamingStatus = $state<string>("Waiting for device...");
 let wasConnected = $state<boolean>(false);
 
 // FPS calculation - track timestamps of recent frames
-const FPS_SAMPLE_SIZE = 30; // Number of frames to average over
+const FPS_SAMPLE_SIZE = 30;
 let frameTimestamps = $state<number[]>([]);
 const currentFps = $derived.by(() => {
   if (frameTimestamps.length < 2) return 0;
@@ -69,44 +57,47 @@ const currentFps = $derived.by(() => {
   const newestTimestamp = frameTimestamps[frameTimestamps.length - 1];
   const timeSpanMs = newestTimestamp - oldestTimestamp;
   if (timeSpanMs <= 0) return 0;
-  // FPS = (number of intervals) / (time span in seconds)
   return Math.round(((frameTimestamps.length - 1) / timeSpanMs) * 1000);
 });
 
+// --- Constants ---
+const HASH_PREFIX_LENGTH = 6;
+const COLOR_FALLBACK = "#9ca3af";
+const RESOLUTION_FETCH_DELAY_MS = 500;
+const RGB_BYTES_PER_PIXEL = 3;
+
 // Curated color palette - distinct, visible on dark backgrounds
-// Colors chosen to be maximally distinguishable from each other
 const BUILD_COLORS = [
-  "#f87171", // red-400
-  "#fb923c", // orange-400
-  "#fbbf24", // amber-400
-  "#a3e635", // lime-400
-  "#4ade80", // green-400
-  "#2dd4bf", // teal-400
-  "#22d3ee", // cyan-400
-  "#60a5fa", // blue-400
-  "#a78bfa", // violet-400
-  "#f472b6", // pink-400
-  "#e879f9", // fuchsia-400
-  "#c084fc", // purple-400
+  "#f87171",
+  "#fb923c",
+  "#fbbf24",
+  "#a3e635",
+  "#4ade80",
+  "#2dd4bf",
+  "#22d3ee",
+  "#60a5fa",
+  "#a78bfa",
+  "#f472b6",
+  "#e879f9",
+  "#c084fc",
 ];
 
-// Hash a git hash string to a color index
 function hashToColorIndex(hash: string): number {
-  // Use first 6 chars of hash, parse as hex, mod by palette size
-  const hexValue = parseInt(hash.slice(0, 6), 16);
+  const hexValue = parseInt(hash.slice(0, HASH_PREFIX_LENGTH), 16);
   return hexValue % BUILD_COLORS.length;
 }
 
-// Get color for current build
 const buildColor = $derived.by(() => {
-  if (!buildInfo?.git_hash) return "#9ca3af"; // gray fallback
+  if (!buildInfo?.git_hash) return COLOR_FALLBACK;
   return BUILD_COLORS[hashToColorIndex(buildInfo.git_hash)];
 });
 
-// Derived streaming status message
 const displayStatus = $derived.by(() => {
   if (connectionStatus === "disconnected") {
     return wasConnected ? "Connection lost" : "Waiting for device...";
+  }
+  if (connectionStatus === "reconnecting") {
+    return `Reconnecting (attempt ${reconnectAttempt})...`;
   }
   if (connectionStatus === "connecting") {
     return "Device connected, initializing...";
@@ -127,13 +118,17 @@ let ctx: CanvasRenderingContext2D | null = null;
 // Event listener cleanup functions
 const unlistenFns: UnlistenFn[] = [];
 
+// Timer cleanup
+let resolutionTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+// Rendering backpressure guard
+let rendering = false;
+
 onMount(async () => {
-  // Initialize canvas context
   if (canvas) {
     ctx = canvas.getContext("2d");
   }
 
-  // Listen for USB device events from Rust backend
   const unlistenUsb = await listen<UsbStatusExtended>("usb-device-event", async (event) => {
     if (event.payload.connected) {
       connectionStatus = "connected";
@@ -141,21 +136,18 @@ onMount(async () => {
       wasConnected = true;
       lastUsbError = null;
       disconnectReason = null;
-      // Fetch current resolution after a brief delay to let streaming initialize
-      setTimeout(() => fetchCurrentResolution(), 500);
+      resolutionTimeoutId = setTimeout(() => fetchCurrentResolution(), RESOLUTION_FETCH_DELAY_MS);
     } else {
       connectionStatus = "disconnected";
       cameraInfo = "";
       frameCount = 0;
       frameTimestamps = [];
       resolutionInfo = null;
-      // Store disconnect reason for UI feedback
       disconnectReason = event.payload.disconnect_reason || null;
     }
   });
   unlistenFns.push(unlistenUsb);
 
-  // Listen for USB error events from Rust backend
   const unlistenUsbError = await listen<UsbError>("usb-error", (event) => {
     console.log("USB error received:", event.payload);
     lastUsbError = event.payload;
@@ -163,12 +155,23 @@ onMount(async () => {
   });
   unlistenFns.push(unlistenUsbError);
 
-  // Listen for detailed USB status updates from Rust backend
+  const unlistenReconnect = await listen<ReconnectStatus>("usb-reconnecting", (event) => {
+    console.log("Reconnection status:", event.payload);
+    if (event.payload.reconnecting) {
+      connectionStatus = "reconnecting";
+      reconnectAttempt = event.payload.attempt;
+      reconnectMessage = event.payload.message || null;
+    } else {
+      reconnectAttempt = 0;
+      reconnectMessage = null;
+    }
+  });
+  unlistenFns.push(unlistenReconnect);
+
   const unlistenUsbStatus = await listen<{ status: string; detail?: string }>(
     "usb-status",
     (event) => {
       streamingStatus = event.payload.detail || event.payload.status;
-      // Update connection status based on status string
       if (event.payload.status === "connecting") {
         connectionStatus = "connecting";
       } else if (event.payload.status === "error") {
@@ -178,19 +181,16 @@ onMount(async () => {
   );
   unlistenFns.push(unlistenUsbStatus);
 
-  // Listen for frame-ready events and fetch frame data
-  // The event payload may contain frame info (when available from backend)
-  // or be empty (legacy paths), in which case we fetch info separately
   const unlistenFrame = await listen<{ width: number; height: number; format: string } | null>(
     "frame-ready",
     async (event) => {
+      if (rendering) return;
       try {
-        // Get frame info from event payload if available, otherwise fetch it
+        rendering = true;
         const frameInfoPromise = event.payload?.width
           ? Promise.resolve(event.payload)
           : invoke<{ width: number; height: number; format: string }>("get_frame_info");
 
-        // Fetch frame data (always needed)
         const [frameInfo, frameData] = await Promise.all([
           frameInfoPromise,
           invoke<ArrayBuffer>("get_frame"),
@@ -199,18 +199,17 @@ onMount(async () => {
         await renderFrame(frameData, frameInfo.format, frameInfo.width, frameInfo.height);
         frameCount++;
 
-        // Track timestamp for FPS calculation
         const now = performance.now();
         frameTimestamps = [...frameTimestamps.slice(-(FPS_SAMPLE_SIZE - 1)), now];
       } catch (e) {
-        // Silently ignore frame fetch errors (e.g., no frame available yet)
         console.debug("Frame fetch error:", e);
+      } finally {
+        rendering = false;
       }
     },
   );
   unlistenFns.push(unlistenFrame);
 
-  // Check initial connection status
   try {
     const status = await invoke<{ connected: boolean; info?: string }>("check_usb_status");
     if (status.connected) {
@@ -221,16 +220,12 @@ onMount(async () => {
     console.log("No USB device on startup");
   }
 
-  // Get build info
   try {
-    buildInfo = await invoke<{ version: string; git_hash: string; build_time: string }>(
-      "get_build_info",
-    );
+    buildInfo = await invoke<BuildInfo>("get_build_info");
   } catch (e) {
     console.log("Could not get build info:", e);
   }
 
-  // Get initial video format setting
   try {
     videoFormatSetting = await invoke<string>("get_video_format");
   } catch (e) {
@@ -239,16 +234,15 @@ onMount(async () => {
 });
 
 onDestroy(() => {
-  // Clean up event listeners
   for (const unlisten of unlistenFns) {
     unlisten();
   }
+  if (resolutionTimeoutId !== null) {
+    clearTimeout(resolutionTimeoutId);
+  }
+  ctx = null;
 });
 
-/**
- * Render a frame to the canvas
- * Supports both JPEG (from MJPEG cameras) and RGB24 (from YUY2 cameras)
- */
 async function renderFrame(
   data: ArrayBuffer,
   format: string,
@@ -258,11 +252,9 @@ async function renderFrame(
   if (!ctx || !canvas) return;
 
   if (format === "jpeg") {
-    // JPEG: Use browser-native decoding via createImageBitmap
     const blob = new Blob([data], { type: "image/jpeg" });
     const bitmap = await createImageBitmap(blob);
 
-    // Resize canvas to match frame dimensions (only if changed)
     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
@@ -272,34 +264,31 @@ async function renderFrame(
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
   } else {
-    // RGB24: Convert to RGBA and use putImageData
     const rgb = new Uint8Array(data);
-    const expectedSize = width * height * 3;
+    const expectedSize = width * height * RGB_BYTES_PER_PIXEL;
 
     if (rgb.length < expectedSize) {
       console.debug(`RGB frame too small: ${rgb.length} < ${expectedSize}`);
       return;
     }
 
-    // Resize canvas if needed
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
       currentResolution = `${width}x${height}`;
     }
 
-    // Convert RGB24 to RGBA32 (canvas requires alpha channel)
     const imageData = ctx.createImageData(width, height);
     const rgba = imageData.data;
     const pixelCount = width * height;
 
     for (let i = 0; i < pixelCount; i++) {
-      const rgbIdx = i * 3;
+      const rgbIdx = i * RGB_BYTES_PER_PIXEL;
       const rgbaIdx = i * 4;
-      rgba[rgbaIdx] = rgb[rgbIdx]; // R
-      rgba[rgbaIdx + 1] = rgb[rgbIdx + 1]; // G
-      rgba[rgbaIdx + 2] = rgb[rgbIdx + 2]; // B
-      rgba[rgbaIdx + 3] = 255; // A (fully opaque)
+      rgba[rgbaIdx] = rgb[rgbIdx];
+      rgba[rgbaIdx + 1] = rgb[rgbIdx + 1];
+      rgba[rgbaIdx + 2] = rgb[rgbIdx + 2];
+      rgba[rgbaIdx + 3] = 255;
     }
 
     ctx.putImageData(imageData, 0, 0);
@@ -382,30 +371,10 @@ async function cycleVideoFormat() {
 
 async function captureFrame() {
   try {
-    captureResult = await invoke<{
-      path: string;
-      raw_path: string | null;
-      size: number;
-      raw_size: number;
-      header_hex: string;
-      format_hint: string;
-      width: number;
-      height: number;
-    }>("dump_frame");
+    captureResult = await invoke<CaptureResult>("dump_frame");
     console.log("Frame captured:", captureResult);
   } catch (e) {
     errorMessage = `Failed to capture frame: ${e}`;
-  }
-}
-
-function getStatusColor(): string {
-  switch (connectionStatus) {
-    case "connected":
-      return "#4ade80";
-    case "connecting":
-      return "#fbbf24";
-    default:
-      return "#ef4444";
   }
 }
 </script>
@@ -415,130 +384,49 @@ function getStatusColor(): string {
     <!-- Video Display Area -->
     <div class="video-container">
       <canvas bind:this={canvas} id="camera-canvas"></canvas>
-      {#if connectionStatus === "disconnected"}
-        <div class="overlay">
-          <div class="waiting-message">
-            {#if disconnectReason === "device_unplugged"}
-              <!-- Device was unplugged -->
-              <div class="camera-icon error">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                  <line x1="1" y1="1" x2="23" y2="23"/>
-                </svg>
-              </div>
-              <p>Camera Disconnected</p>
-              <span class="hint">The USB camera was unplugged. Reconnect to continue.</span>
-            {:else if disconnectReason === "timeout"}
-              <!-- Streaming timed out -->
-              <div class="camera-icon warning">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <polyline points="12,6 12,12 16,14"/>
-                </svg>
-              </div>
-              <p>Connection Timeout</p>
-              <span class="hint">No video frames received. Check camera connection.</span>
-            {:else if disconnectReason === "transfer_error"}
-              <!-- USB transfer error -->
-              <div class="camera-icon error">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <line x1="12" y1="8" x2="12" y2="12"/>
-                  <line x1="12" y1="16" x2="12.01" y2="16"/>
-                </svg>
-              </div>
-              <p>USB Transfer Error</p>
-              <span class="hint">A USB communication error occurred. Try reconnecting the camera.</span>
-            {:else}
-              <!-- Default: waiting for device -->
-              <div class="camera-icon">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                  <circle cx="12" cy="13" r="4"/>
-                </svg>
-              </div>
-              <p>Connect USB Endoscope</p>
-              <span class="hint">Plug in your USB-C camera to start</span>
-            {/if}
-          </div>
-        </div>
-      {/if}
+      <ConnectionOverlay
+        {connectionStatus}
+        {disconnectReason}
+        {reconnectAttempt}
+        {reconnectMessage}
+      />
     </div>
 
-    <!-- Status Bar -->
-    <div class="status-bar">
-      <div class="status-indicator">
-        <span class="dot" style="background-color: {getStatusColor()}"></span>
-        <span class="status-text">
-          {displayStatus}
-        </span>
-        {#if connectionStatus === "connected" && cameraInfo}
-          <span class="camera-name">{cameraInfo}</span>
-        {/if}
-      </div>
+    <StatusBar
+      {connectionStatus}
+      {displayStatus}
+      {cameraInfo}
+      {frameCount}
+      {buildInfo}
+      {buildColor}
+    />
 
-      <div class="status-right">
-        {#if frameCount > 0}
-          <span class="frame-count">{frameCount.toLocaleString()} frames</span>
-        {/if}
-        {#if buildInfo}
-          <span class="build-info" style="color: {buildColor}">v{buildInfo.version} ({buildInfo.git_hash})</span>
-        {/if}
-      </div>
-    </div>
-
-    <!-- Debug controls row -->
-    <div class="debug-controls">
-      <button class="debug-btn" onclick={cycleWidth}>{widthSetting}</button>
-      <button class="debug-btn" onclick={cycleHeight}>{heightSetting}</button>
-      <button class="debug-btn" onclick={cycleStride}>{strideSetting}</button>
-      <button class="debug-btn format" onclick={cycleVideoFormat}>{videoFormatSetting}</button>
-      <button class="debug-btn format" onclick={toggleMjpeg}>{mjpegSetting}</button>
-      <button class="debug-btn format" onclick={cyclePixelFormat}>{pixelFormatSetting}</button>
-      <button class="debug-btn capture" onclick={captureFrame}>Capture</button>
-      <!-- Resolution cycling button -->
-      <button
-        class="debug-btn resolution"
-        onclick={cycleResolution}
-        disabled={connectionStatus !== "connected" || isCyclingResolution}
-        title={resolutionInfo && resolutionInfo.available_count > 1
-          ? `Tap to cycle (${resolutionInfo.available_count} available)`
-          : "Resolution"}
-      >
-        {#if isCyclingResolution}
-          Changing...
-        {:else if currentResolution}
-          {currentResolution}
-          {#if resolutionInfo && resolutionInfo.available_count > 1}
-            <span class="resolution-count">({resolutionInfo.available_count})</span>
-          {/if}
-        {:else}
-          Resolution
-        {/if}
-      </button>
-    </div>
+    <DebugControls
+      {widthSetting}
+      {heightSetting}
+      {strideSetting}
+      {videoFormatSetting}
+      {mjpegSetting}
+      {pixelFormatSetting}
+      {currentResolution}
+      {resolutionInfo}
+      {connectionStatus}
+      {isCyclingResolution}
+      oncyclewidth={cycleWidth}
+      oncycleheight={cycleHeight}
+      oncyclestride={cycleStride}
+      oncyclevideoformat={cycleVideoFormat}
+      ontogglemjpeg={toggleMjpeg}
+      oncyclepixelformat={cyclePixelFormat}
+      oncapture={captureFrame}
+      oncycleresolution={cycleResolution}
+    />
 
     {#if captureResult}
-      <div class="capture-info">
-        <div class="capture-header">
-          <span class="capture-title">Captured Frame</span>
-          <button class="dismiss-btn" onclick={() => captureResult = null}>×</button>
-        </div>
-        <div class="capture-details">
-          <div><strong>Dimensions:</strong> {captureResult.width}x{captureResult.height}</div>
-          <div><strong>Processed:</strong> {captureResult.size.toLocaleString()} bytes (RGB)</div>
-          {#if captureResult.raw_size > 0}
-            <div><strong>Raw:</strong> {captureResult.raw_size.toLocaleString()} bytes ({captureResult.format_hint})</div>
-          {/if}
-          <div class="hex-dump"><strong>Raw header:</strong> <code>{captureResult.header_hex}</code></div>
-        </div>
-        <div class="capture-hint">
-          {#if captureResult.raw_path}
-            <div>Raw: <code>adb shell run-as com.cleanscope.app cat "{captureResult.raw_path}" > raw.yuy2</code></div>
-          {/if}
-          <div>RGB: <code>adb shell run-as com.cleanscope.app cat "{captureResult.path}" > frame.rgb</code></div>
-        </div>
-      </div>
+      <CaptureInfo
+        {captureResult}
+        ondismiss={() => captureResult = null}
+      />
     {/if}
 
     {#if errorMessage}
@@ -588,245 +476,6 @@ function getStatusColor(): string {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
-  }
-
-  .overlay {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.8);
-  }
-
-  .waiting-message {
-    text-align: center;
-    padding: 2rem;
-  }
-
-  .camera-icon {
-    width: 64px;
-    height: 64px;
-    margin: 0 auto 1rem;
-    color: #9ca3af;
-  }
-
-  .camera-icon.error {
-    color: #f87171; /* red-400 */
-  }
-
-  .camera-icon.warning {
-    color: #fbbf24; /* amber-400 */
-  }
-
-  .camera-icon svg {
-    width: 100%;
-    height: 100%;
-  }
-
-  .waiting-message p {
-    font-size: 1.25rem;
-    margin: 0 0 0.5rem;
-    color: #ccc;
-  }
-
-  .hint {
-    font-size: 0.875rem;
-    color: #9ca3af;
-  }
-
-  .status-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1rem;
-    background: #1a1a1a;
-    border-top: 1px solid #333;
-  }
-
-  .status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    animation: pulse 2s infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-
-  .status-text {
-    font-size: 0.875rem;
-  }
-
-  .camera-name {
-    font-size: 0.75rem;
-    color: #a1a1aa;
-    margin-left: 0.5rem;
-    padding-left: 0.5rem;
-    border-left: 1px solid #444;
-  }
-
-  .frame-count {
-    font-size: 0.75rem;
-    color: #a1a1aa;
-    font-family: monospace;
-  }
-
-  .status-right {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-
-  .build-info {
-    font-size: 0.75rem;
-    color: #9ca3af;
-    font-family: monospace;
-  }
-
-  .debug-controls {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    padding: 0.5rem 1rem;
-    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
-    background: #111;
-    border-top: 1px solid #333;
-    justify-content: center;
-  }
-
-  .debug-btn {
-    background: #2563eb;
-    border: none;
-    color: white;
-    padding: 0.75rem;
-    border-radius: 8px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    min-width: 48px;
-    min-height: 48px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .debug-btn:hover {
-    background: #3b82f6;
-  }
-
-  .debug-btn.format {
-    background: #0891b2;
-  }
-
-  .debug-btn.format:hover {
-    background: #06b6d4;
-  }
-
-  .debug-btn.capture {
-    background: #7c3aed;
-  }
-
-  .debug-btn.capture:hover {
-    background: #8b5cf6;
-  }
-
-  .debug-btn.resolution {
-    background: #059669;
-  }
-
-  .debug-btn.resolution:hover:not(:disabled) {
-    background: #10b981;
-  }
-
-  .debug-btn.resolution:disabled {
-    background: #374151;
-    cursor: not-allowed;
-    opacity: 0.7;
-  }
-
-  .resolution-count {
-    font-size: 0.65rem;
-    opacity: 0.8;
-    margin-left: 0.25rem;
-  }
-
-  .capture-info {
-    background: #1e1b4b;
-    border: 1px solid #4c1d95;
-    border-radius: 8px;
-    padding: 0.75rem;
-    margin: 0 1rem 0.5rem;
-    font-size: 0.75rem;
-  }
-
-  .capture-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.5rem;
-  }
-
-  .capture-title {
-    font-weight: 600;
-    color: #a78bfa;
-  }
-
-  .dismiss-btn {
-    background: transparent;
-    border: none;
-    color: #9ca3af;
-    font-size: 1.25rem;
-    cursor: pointer;
-    padding: 0;
-    line-height: 1;
-  }
-
-  .capture-details {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    color: #e2e8f0;
-  }
-
-  .capture-details code {
-    background: #312e81;
-    padding: 0.125rem 0.25rem;
-    border-radius: 3px;
-    font-size: 0.7rem;
-    word-break: break-all;
-  }
-
-  .hex-dump code {
-    display: block;
-    margin-top: 0.25rem;
-    padding: 0.375rem;
-    font-family: monospace;
-    overflow-x: auto;
-    white-space: nowrap;
-  }
-
-  .capture-hint {
-    margin-top: 0.5rem;
-    padding-top: 0.5rem;
-    border-top: 1px solid #4c1d95;
-    color: #9ca3af;
-    font-size: 0.7rem;
-  }
-
-  .capture-hint code {
-    background: #312e81;
-    padding: 0.125rem 0.25rem;
-    border-radius: 3px;
   }
 
   .error-banner {

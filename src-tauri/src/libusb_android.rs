@@ -108,7 +108,8 @@ impl SendableContextPtr {
     }
 }
 
-// SAFETY: The libusb context is thread-safe for event handling
+// SAFETY: SendableContextPtr stores a usize (not a raw pointer), and the underlying
+// libusb_context is thread-safe for concurrent event handling via libusb_handle_events.
 unsafe impl Send for SendableContextPtr {}
 unsafe impl Sync for SendableContextPtr {}
 
@@ -222,7 +223,8 @@ pub struct LibusbContext {
     ctx: *mut libusb1_sys::libusb_context,
 }
 
-// SAFETY: The libusb context is thread-safe when used properly
+// SAFETY: LibusbContext wraps a libusb_context pointer. libusb contexts are thread-safe:
+// all libusb functions that accept a context use internal locking for concurrent access.
 unsafe impl Send for LibusbContext {}
 unsafe impl Sync for LibusbContext {}
 
@@ -319,7 +321,8 @@ pub struct LibusbDeviceHandle {
     handle: *mut libusb1_sys::libusb_device_handle,
 }
 
-// SAFETY: The device handle is thread-safe when used properly
+// SAFETY: LibusbDeviceHandle wraps a libusb_device_handle pointer. libusb device handles
+// are thread-safe: libusb serializes access to the underlying device internally.
 unsafe impl Send for LibusbDeviceHandle {}
 unsafe impl Sync for LibusbDeviceHandle {}
 
@@ -1568,7 +1571,16 @@ extern "system" fn iso_transfer_callback(transfer: *mut libusb1_sys::libusb_tran
 unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfer) {
     log::debug!(">>> ISO CALLBACK INVOKED <<<");
 
+    if transfer.is_null() {
+        log::error!("iso_transfer_callback: transfer pointer is null");
+        return;
+    }
     let xfr = &mut *transfer;
+
+    if xfr.user_data.is_null() {
+        log::error!("iso_transfer_callback: user_data pointer is null");
+        return;
+    }
     let context = &mut *(xfr.user_data as *mut IsoCallbackContext);
 
     // Check if we should stop
@@ -1600,24 +1612,14 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
                 }
             };
 
-            // Check if format is confirmed as YUY2 (not MJPEG)
-            // is_mjpeg == Some(false) means YUY2 format is confirmed
-            let skip_header_validation = state.is_mjpeg == Some(false);
-
-            // Extract payload from this URB (skip header validation for YUY2)
-            let payload = extract_urb_payloads(
-                xfr,
-                context.max_packet_size,
-                context,
-                skip_header_validation,
-            );
+            // Extract payload from this URB (always parse UVC headers per spec)
+            let payload = extract_urb_payloads(xfr, context.max_packet_size, context);
 
             log::trace!(
-                "URB completed: transfer_index={}, sequence={}, payload_bytes={}, skip_headers={}",
+                "URB completed: transfer_index={}, sequence={}, payload_bytes={}",
                 context.transfer_index,
                 sequence,
-                payload.data.len(),
-                skip_header_validation
+                payload.data.len()
             );
 
             // Store in pending URBs map
@@ -1664,9 +1666,6 @@ unsafe fn iso_transfer_callback_inner(transfer: *mut libusb1_sys::libusb_transfe
             context.stop_flag.store(true, Ordering::Relaxed);
             return;
         }
-        _ => {
-            log::warn!("Unexpected transfer status: {:?}", status);
-        }
     }
 
     // Resubmit the transfer for continuous streaming
@@ -1702,11 +1701,20 @@ struct PacketMeta {
 /// Extract payload data from a completed URB without processing frame logic.
 /// This allows us to buffer URBs for in-order processing.
 ///
+/// Per USB Video Class 1.5 Specification, Section 2.4.3.3 "Video and Still Image Payload Headers":
+/// "Every Payload Transfer containing video or still-image sample data must start with a
+/// Payload Header."
+///
+/// This applies to ALL formats (MJPEG, YUY2/uncompressed, H.264, etc.). The header contains
+/// frame boundary information (FID, EOF) and must always be stripped before extracting
+/// pixel/image data.
+///
+/// Reference: https://www.usb.org/document-library/video-class-v15-document-set
+///
 /// # Arguments
 /// * `xfr` - The completed USB transfer
 /// * `max_packet_size` - Maximum packet size for this endpoint
 /// * `context` - Callback context with capture state
-/// * `skip_header_validation` - If true, treat all packet data as pure payload (for YUY2 format)
 ///
 /// # Safety
 /// The transfer pointer must be valid.
@@ -1714,7 +1722,6 @@ unsafe fn extract_urb_payloads(
     xfr: &mut libusb1_sys::libusb_transfer,
     max_packet_size: u16,
     context: &IsoCallbackContext,
-    skip_header_validation: bool,
 ) -> UrbPayload {
     let num_packets = xfr.num_iso_packets as usize;
     let mut data = Vec::with_capacity(num_packets * max_packet_size as usize);
@@ -1744,21 +1751,12 @@ unsafe fn extract_urb_payloads(
             }
         }
 
-        // UVC payloads have a header (typically 2-12 bytes)
-        // Use validate_uvc_header() to properly detect headers with all valid lengths
-        // (2, 6, 8, or 12 bytes depending on PTS/SCR flags)
-        //
-        // IMPORTANT: For YUY2 format, skip header validation entirely to avoid
-        // false positives where pixel data (e.g., Y=2, U=128) matches header patterns.
-        // UVC headers only appear at the start of isochronous packets, not mid-stream,
-        // and once we've confirmed YUY2 format, we know the data layout.
-        let (is_uvc_header, header_len) = if skip_header_validation {
-            // YUY2 format confirmed - treat all data as pure payload
-            (false, 0)
-        } else {
-            let validated = validate_uvc_header(pkt_data);
-            (validated.is_some(), validated.unwrap_or(0))
-        };
+        // Per UVC 1.5 spec Section 2.4.3.3: Every payload transfer starts with a header.
+        // Headers are 2-12 bytes depending on PTS/SCR flags. The header length is in byte 0.
+        // We MUST always parse and strip headers regardless of video format (MJPEG, YUY2, etc.)
+        // because header bytes included as pixel data cause row misalignment and visual artifacts.
+        let validated = validate_uvc_header(pkt_data);
+        let (is_uvc_header, header_len) = (validated.is_some(), validated.unwrap_or(0));
 
         // Extract flags from header (if present)
         let (end_of_frame, frame_id, error) = if is_uvc_header {
@@ -1904,46 +1902,58 @@ fn process_pending_urbs_in_order(state: &mut SharedFrameState, context: &IsoCall
 mod tests {
     use super::validate_uvc_header;
 
+    // Tests for UVC header validation
+    // Per libuvc/Linux kernel approach: we trust HLE (byte 0) if in range 2-12,
+    // without requiring EOH bit. This matches real-world camera behavior.
+
     #[test]
     fn test_2_byte_header_minimal() {
-        // Minimal header: len=2, EOH set (0x80), no PTS/SCR flags
+        // Minimal header: len=2, with typical flags
         let data = [0x02, 0x80, 0xAB, 0xCD];
         assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
     #[test]
     fn test_2_byte_header_with_fid_eof() {
-        // 2-byte header with FID and EOF flags set: 0x83 = EOH + EOF + FID
+        // 2-byte header with FID and EOF flags set
         let data = [0x02, 0x83, 0xAB, 0xCD];
         assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
     #[test]
     fn test_6_byte_header_pts_only() {
-        // PTS header: len=6, EOH set, PTS flag set (0x84 = 0x80 | 0x04)
+        // PTS header: len=6
         let data = [0x06, 0x84, 0x00, 0x00, 0x00, 0x00, 0xAB, 0xCD];
         assert_eq!(validate_uvc_header(&data), Some(6));
     }
 
     #[test]
     fn test_8_byte_header_scr_only() {
-        // SCR header: len=8, EOH set, SCR flag set (0x88 = 0x80 | 0x08)
+        // SCR header: len=8
         let data = [0x08, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAB];
         assert_eq!(validate_uvc_header(&data), Some(8));
     }
 
     #[test]
     fn test_12_byte_header_pts_and_scr() {
-        // Full header: len=12, EOH set, PTS+SCR flags (0x8C = 0x80 | 0x04 | 0x08)
+        // Full header: len=12, PTS+SCR
         let data = [0x0C, 0x8C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB];
         assert_eq!(validate_uvc_header(&data), Some(12));
     }
 
     #[test]
-    fn test_reject_no_eoh_bit() {
-        // EOH bit not set - should reject
+    fn test_accept_no_eoh_bit() {
+        // EOH bit not set - per libuvc approach, we accept this
+        // Many cheap cameras don't set EOH correctly
         let data = [0x02, 0x00, 0xAB, 0xCD];
-        assert_eq!(validate_uvc_header(&data), None);
+        assert_eq!(validate_uvc_header(&data), Some(2));
+    }
+
+    #[test]
+    fn test_accept_header_with_only_fid() {
+        // Only FID bit set (0x01), no EOH - should still accept
+        let data = [0x02, 0x01, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
     #[test]
@@ -1964,8 +1974,8 @@ mod tests {
 
     #[test]
     fn test_allow_reserved_bit_set() {
-        // Reserved bit (0x10) set - with relaxed validation, we accept this
-        let data = [0x02, 0x90, 0xAB, 0xCD]; // 0x90 = EOH + reserved
+        // Reserved bit (0x10) set - we accept this
+        let data = [0x02, 0x90, 0xAB, 0xCD];
         assert_eq!(validate_uvc_header(&data), Some(2));
     }
 
@@ -1990,18 +2000,30 @@ mod tests {
     }
 
     #[test]
-    fn test_yuy2_false_positive_protection() {
-        // YUY2 data that might look like a header:
-        // Y=2 (could be header_len=2), U=128 (has EOH bit set)
-        // This will actually be accepted as a valid 2-byte header because
-        // the relaxed validation only checks EOH bit and length range.
+    fn test_reject_invalid_header_length() {
+        // Header length outside valid range (must be 2-12)
+        let data_len_0 = [0x00, 0x80, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data_len_0), None);
+
+        let data_len_1 = [0x01, 0x80, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data_len_1), None);
+
+        let data_len_13 = [0x0D, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAB];
+        assert_eq!(validate_uvc_header(&data_len_13), None);
+    }
+
+    #[test]
+    fn test_yuy2_pixel_data_as_header() {
+        // YUY2 data that looks like a header:
+        // Y=2 (valid header_len), any byte 1 value
+        // Per libuvc approach, this IS accepted as a header at packet boundaries.
+        // This is intentional - UVC headers always appear at packet start,
+        // not randomly in pixel data stream.
         let data = [0x02, 0x80, 0xAB, 0xCD];
-        // This is actually a valid 2-byte header pattern
         assert_eq!(validate_uvc_header(&data), Some(2));
 
-        // With reserved bit set (0x90), relaxed validation still accepts it
-        // because it only requires EOH bit and valid length range
-        let data_with_reserved = [0x02, 0x90, 0xAB, 0xCD];
-        assert_eq!(validate_uvc_header(&data_with_reserved), Some(2));
+        // Even with no flags set
+        let data_no_flags = [0x02, 0x00, 0xAB, 0xCD];
+        assert_eq!(validate_uvc_header(&data_no_flags), Some(2));
     }
 }
