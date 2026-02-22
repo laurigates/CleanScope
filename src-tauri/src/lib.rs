@@ -1049,6 +1049,51 @@ pub fn emit_usb_disconnect(app: &AppHandle, reason: DisconnectReason, info: Opti
     );
 }
 
+/// Payload for reconnection status events
+#[derive(Clone, serde::Serialize)]
+pub struct ReconnectStatus {
+    /// Current reconnection attempt number (0 when stopped)
+    pub attempt: u32,
+    /// Maximum attempts before giving up (0 = unlimited)
+    pub max_attempts: u32,
+    /// Whether reconnection is actively in progress
+    pub reconnecting: bool,
+    /// Human-readable status message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Emit a USB reconnecting event to the frontend
+pub fn emit_usb_reconnecting(
+    app: &AppHandle,
+    attempt: u32,
+    max_attempts: u32,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        "usb-reconnecting",
+        ReconnectStatus {
+            attempt,
+            max_attempts,
+            reconnecting: true,
+            message,
+        },
+    );
+}
+
+/// Emit a USB reconnection stopped event to the frontend
+pub fn emit_usb_reconnect_stopped(app: &AppHandle, message: Option<String>) {
+    let _ = app.emit(
+        "usb-reconnecting",
+        ReconnectStatus {
+            attempt: 0,
+            max_attempts: 0,
+            reconnecting: false,
+            message,
+        },
+    );
+}
+
 /// Emit a USB error event to the frontend
 pub fn emit_usb_error(app: &AppHandle, error: UsbError) {
     let _ = app.emit("usb-error", error);

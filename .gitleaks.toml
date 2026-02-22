@@ -1,0 +1,13 @@
+# Gitleaks configuration for CleanScope
+# Whitelists false positives that are safe to ignore
+
+[allowlist]
+description = "Allowlist for CleanScope false positives"
+regexes = [
+  "sk_live_abc123def456ghi789",  # Test Stripe token in SKILL.md docs
+  "shift\\+alt\\+KeyQ",           # Keyboard shortcut in compiled Rust deps
+]
+paths = [
+  ".claude/skills/git-security-checks/SKILL.md",
+  "src-tauri/target",
+]

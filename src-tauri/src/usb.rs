@@ -976,13 +976,14 @@ fn run_camera_loop_inner(
     let ep_info = match endpoint_info {
         Some(info) => {
             log::info!(
-                "Selected streaming endpoint: 0x{:02x} ({:?}) on interface {}.{}, maxPacket={} x{}",
+                "Selected streaming endpoint: 0x{:02x} ({:?}) on interface {}.{}, maxPacket={} x{} (effective={})",
                 info.address,
                 info.transfer_type,
                 info.interface_number,
                 info.alt_setting,
                 info.max_packet_size,
-                info.transactions_per_microframe
+                info.transactions_per_microframe,
+                info.max_packet_size * info.transactions_per_microframe
             );
             info
         }
@@ -1195,6 +1196,12 @@ fn stream_frames_isochronous_with_format_detection(
         height
     );
 
+    // For high-bandwidth isochronous endpoints, the effective packet size includes
+    // the transactions-per-microframe multiplier (e.g., 1024 x3 = 3072 bytes).
+    // Using only the base max_packet_size causes buffer overlap and frame corruption
+    // at higher resolutions where the camera needs full bandwidth.
+    let effective_packet_size = ep_info.max_packet_size * ep_info.transactions_per_microframe;
+
     // Emit connecting status to update frontend UI during format detection
     let _ = app_handle.emit(
         "usb-status",
@@ -1217,7 +1224,7 @@ fn stream_frames_isochronous_with_format_detection(
             ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
-            ep_info.max_packet_size,
+            effective_packet_size,
             expected_yuy2_frame_size, // Use descriptor-based size for YUY2 detection
             None,                     // No packet capture for format detection
             crate::ValidationLevel::Off, // No validation during format detection
@@ -1487,12 +1494,7 @@ fn convert_frame_to_rgb(
 
 /// Log detailed frame analysis for the first few frames to aid debugging.
 #[cfg(target_os = "android")]
-fn log_frame_analysis(
-    frame_count: u32,
-    frame_data: &[u8],
-    base_width: u32,
-    base_height: u32,
-) {
+fn log_frame_analysis(frame_count: u32, frame_data: &[u8], base_width: u32, base_height: u32) {
     let frame_size = frame_data.len();
     let expected_size = (base_width * base_height * 2) as usize;
     let calculated_stride = if frame_size > 0 && base_height > 0 {
@@ -1513,7 +1515,9 @@ fn log_frame_analysis(
         let ratio = frame_size as f32 / expected_size as f32;
         log::warn!(
             "Camera sending {}x more data than descriptor! Actual stride={}, expected={}",
-            ratio, calculated_stride, min_stride
+            ratio,
+            calculated_stride,
+            min_stride
         );
     }
 
@@ -1581,7 +1585,7 @@ fn stream_frames_yuy2(
     descriptor_width: u32,
     descriptor_height: u32,
 ) -> Result<StreamResult, LibusbError> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tauri::Emitter;
 
     // Get current pixel format to determine expected frame size
@@ -1623,7 +1627,7 @@ fn stream_frames_yuy2(
             usb_ctx.get_context_ptr(),
             dev.get_handle_ptr(),
             ep_info.address,
-            ep_info.max_packet_size,
+            effective_packet_size,
             expected_frame_size,
             None, // No packet capture (can be enabled for E2E testing)
             stream_ctx.validation_level,
@@ -1753,7 +1757,12 @@ fn stream_frames_yuy2(
                 match convert_frame_to_rgb(&frame_data, width, height, stride, pixel_format) {
                     Ok(rgb_data) => {
                         store_frame_and_emit(
-                            stream_ctx, rgb_data, &frame_data, width, height, false,
+                            stream_ctx,
+                            rgb_data,
+                            &frame_data,
+                            width,
+                            height,
+                            false,
                             &mut rgb_logged,
                         );
 
@@ -1970,7 +1979,10 @@ fn start_uvc_streaming_with_resolution(
     }
 
     // Log raw probe response for debugging
-    log::debug!("Raw probe response: {:02x?}", &response[..UVC_PROBE_RESPONSE_SIZE]);
+    log::debug!(
+        "Raw probe response: {:02x?}",
+        &response[..UVC_PROBE_RESPONSE_SIZE]
+    );
 
     // Commit the negotiated parameters
     let commit_control = uvc::UVC_VS_COMMIT_CONTROL << 8;
@@ -1993,7 +2005,9 @@ fn start_uvc_streaming_with_resolution(
     dev.set_interface_alt_setting(streaming_interface_i32, alt_setting)?;
 
     // Return the streaming endpoint address from descriptor, or default to 0x81
-    let endpoint_addr = endpoint_info.map(|ep| ep.address).unwrap_or(DEFAULT_ENDPOINT_ADDR);
+    let endpoint_addr = endpoint_info
+        .map(|ep| ep.address)
+        .unwrap_or(DEFAULT_ENDPOINT_ADDR);
 
     Ok(UvcNegotiatedParams {
         endpoint: endpoint_addr,
@@ -2248,7 +2262,10 @@ fn replay_frame_loop(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // No frames for 5 seconds - replay might have ended or stalled
-                log::warn!("Replay timeout - no frames received for {} seconds", FRAME_RECV_TIMEOUT_SECS);
+                log::warn!(
+                    "Replay timeout - no frames received for {} seconds",
+                    FRAME_RECV_TIMEOUT_SECS
+                );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed - replay thread ended

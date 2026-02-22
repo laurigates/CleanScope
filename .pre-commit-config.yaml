@@ -23,12 +23,10 @@ repos:
         stages: [commit-msg]
 
   # Secret detection
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.5.0
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
     hooks:
-      - id: detect-secrets
-        args: ["--baseline", ".secrets.baseline"]
-        exclude: package-lock.json
+      - id: gitleaks
 
   # Biome for TypeScript/Svelte
   - repo: https://github.com/biomejs/pre-commit

@@ -5,7 +5,7 @@
 //!
 //! # File Format
 //!
-//! Supports the legacy capture format from [`crate::capture::write_capture_files`]:
+//! Supports the legacy capture format from `capture::write_capture_files`:
 //! ```text
 //! [u64 LE: timestamp_us][u32 LE: length][u8: endpoint][data bytes]...
 //! ```
