@@ -1621,6 +1621,10 @@ fn stream_frames_yuy2(
         Some(format!("{} Camera", pixel_format)),
     );
 
+    // For high-bandwidth isochronous endpoints, the effective packet size includes
+    // the transactions-per-microframe multiplier (e.g., 1024 x3 = 3072 bytes).
+    let effective_packet_size = ep_info.max_packet_size * ep_info.transactions_per_microframe;
+
     // Create the isochronous stream with descriptor-based frame size
     let mut iso_stream = unsafe {
         IsochronousStream::new(
