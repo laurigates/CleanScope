@@ -38,6 +38,14 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Signing keystores
+*.jks
+*.keystore
+*.b64
+
+# Google Play service account credentials
+service-account-play.json
+
 # MCP configuration (contains project-specific server setup)
 .mcp.json
 
