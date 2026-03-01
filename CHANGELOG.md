@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.1...clean-scope-v0.2.2) (2026-03-01)
+
+
+### Bug Fixes
+
+* **ci:** pass explicit value to --aab flag in Tauri Android build ([#42](https://github.com/laurigates/CleanScope/issues/42)) ([83c0fb5](https://github.com/laurigates/CleanScope/commit/83c0fb5222f83ae1d7e0852a31e7f0754392aced))
+
 ## [0.2.1](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.0...clean-scope-v0.2.1) (2026-03-01)
 
 
