@@ -62,7 +62,7 @@ jobs:
           echo "storeFile=$RUNNER_TEMP/keystore.jks" >> src-tauri/gen/android/keystore.properties
 
       - name: Build Android AAB
-        run: npm run tauri android build -- --aab --ci
+        run: npm run tauri android build -- --aab true --ci
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
