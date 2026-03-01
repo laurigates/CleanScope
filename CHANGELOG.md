@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.0...clean-scope-v0.2.1) (2026-03-01)
+
+
+### Bug Fixes
+
+* **ci:** chain Android release into release-please workflow ([#40](https://github.com/laurigates/CleanScope/issues/40)) ([252ce57](https://github.com/laurigates/CleanScope/commit/252ce5703b2fec36fdc70013869340f0fef1e8e0))
+
 ## [0.2.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.1.0...clean-scope-v0.2.0) (2026-03-01)
 
 
