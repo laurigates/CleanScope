@@ -94,6 +94,12 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab
           retention-days: 7
 
+      - name: Attach AAB to GitHub release
+        run: gh release upload "$TAG_NAME" src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+
   publish:
     name: Publish to Google Play
     runs-on: ubuntu-latest
