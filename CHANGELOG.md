@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.2...clean-scope-v0.3.0) (2026-03-01)
+
+
+### Features
+
+* **ci:** attach AAB to GitHub release ([#44](https://github.com/laurigates/CleanScope/issues/44)) ([5bb9c1e](https://github.com/laurigates/CleanScope/commit/5bb9c1e450472b17807164d73501cf33955a9441))
+
 ## [0.2.2](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.1...clean-scope-v0.2.2) (2026-03-01)
 
 
