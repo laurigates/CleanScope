@@ -18,4 +18,4 @@ This directory contains the blueprint state and documentation for CleanScope.
 
 ## Blueprint Version
 
-Format version: 3.0.0
+Format version: 3.2.0
