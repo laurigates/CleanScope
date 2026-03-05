@@ -2,6 +2,7 @@
 # Run `just` or `just --list` to see available recipes
 
 set shell := ["bash", "-uc"]
+set dotenv-load
 
 # Default recipe - show help
 default:
@@ -139,6 +140,215 @@ setup-rust-targets:
     rustup target add i686-linux-android
     rustup target add x86_64-linux-android
     echo "Rust Android targets installed."
+
+# Generate Android upload keystore for Play Store signing (one-time setup)
+keystore-generate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    KEYSTORE="upload-keystore.jks"
+
+    if [[ -f "$KEYSTORE" ]]; then
+        echo "Keystore already exists: $KEYSTORE"
+        echo "Delete it first if you want to regenerate:"
+        echo "  rm $KEYSTORE"
+        exit 1
+    fi
+
+    if ! command -v keytool &>/dev/null; then
+        echo "ERROR: keytool not found. Install a JDK:"
+        echo "  brew install --cask temurin"
+        exit 1
+    fi
+
+    echo "Generating upload keystore..."
+    echo "You will be prompted for a keystore password — choose a strong one and save it securely."
+    echo ""
+    keytool -genkeypair -v \
+        -keystore "$KEYSTORE" \
+        -alias upload \
+        -keyalg RSA -keysize 2048 -validity 10000 \
+        -dname "CN=CleanScope, O=CleanScope, C=FI"
+
+    echo ""
+    echo "Encoding keystore for GitHub secret..."
+    base64 -i "$KEYSTORE" > upload-keystore.b64
+
+    echo ""
+    echo "=== NEXT STEPS ==="
+    echo ""
+    echo "1. Back up $KEYSTORE securely (password manager or encrypted storage)."
+    echo "   If lost, you cannot update the app on Play Store."
+    echo ""
+    echo "2. Add these GitHub Actions secrets (Settings → Secrets → Actions):"
+    echo "   ANDROID_KEY_BASE64     ← contents of upload-keystore.b64"
+    echo "   ANDROID_KEY_ALIAS      ← upload"
+    echo "   ANDROID_KEY_PASSWORD   ← password you entered above"
+    echo ""
+    echo "3. For local release builds, create src-tauri/gen/android/keystore.properties:"
+    echo "   just keystore-properties /absolute/path/to/$KEYSTORE"
+    echo ""
+    echo "See docs/PUBLISHING.md for the full setup guide."
+
+# Write keystore.properties for local release builds (gitignored)
+keystore-properties path password="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PROPS="src-tauri/gen/android/keystore.properties"
+    KEYSTORE_PATH="{{path}}"
+    PASSWORD="{{password}}"
+
+    if [[ ! -f "$KEYSTORE_PATH" ]]; then
+        echo "ERROR: Keystore not found at: $KEYSTORE_PATH"
+        exit 1
+    fi
+
+    if [[ -z "$PASSWORD" ]]; then
+        read -r -s -p "Keystore password: " PASSWORD
+        echo ""
+    fi
+
+    mkdir -p "$(dirname "$PROPS")"
+    printf 'keyAlias=upload\npassword=%s\nstoreFile=%s\n' "$PASSWORD" "$KEYSTORE_PATH" > "$PROPS"
+
+    echo "Written: $PROPS"
+    echo "You can now run: npm run tauri android build -- --aab"
+
+# Set Android signing secrets in GitHub Actions using gh CLI
+keystore-secrets password="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    B64="upload-keystore.b64"
+
+    if [[ ! -f "$B64" ]]; then
+        echo "ERROR: $B64 not found. Run 'just keystore-generate' first."
+        exit 1
+    fi
+
+    if ! command -v gh &>/dev/null; then
+        echo "ERROR: gh CLI not found. Install it: brew install gh"
+        exit 1
+    fi
+
+    PASSWORD="{{password}}"
+    if [[ -z "$PASSWORD" ]]; then
+        read -r -s -p "Keystore password: " PASSWORD
+        echo ""
+    fi
+
+    echo "Setting ANDROID_KEY_BASE64..."
+    gh secret set ANDROID_KEY_BASE64 < "$B64"
+
+    echo "Setting ANDROID_KEY_ALIAS..."
+    gh secret set ANDROID_KEY_ALIAS --body "upload"
+
+    echo "Setting ANDROID_KEY_PASSWORD..."
+    printf '%s' "$PASSWORD" | gh secret set ANDROID_KEY_PASSWORD
+
+    echo ""
+    echo "Secrets set: ANDROID_KEY_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD"
+    echo ""
+    echo "Remaining: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON — run: just play-service-account"
+
+# Create a GCP service account for Play Store publishing, export JSON key, and set GitHub secret
+play-service-account:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if ! command -v gcloud &>/dev/null; then
+        echo "ERROR: gcloud CLI not found. Install it:"
+        echo "  brew install --cask google-cloud-sdk"
+        exit 1
+    fi
+
+    if ! command -v gh &>/dev/null; then
+        echo "ERROR: gh CLI not found. Install it: brew install gh"
+        exit 1
+    fi
+
+    ACCOUNT="${PLAY_ACCOUNT:-}"
+    PROJECT="${PLAY_PROJECT:-}"
+    if [[ -z "$ACCOUNT" || -z "$PROJECT" ]]; then
+        echo "ERROR: PLAY_ACCOUNT and PLAY_PROJECT must be set in .env"
+        echo "  cp .env.example .env && \$EDITOR .env"
+        exit 1
+    fi
+
+    SA_NAME="github-play-deploy"
+    SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+    KEY_FILE="service-account-play.json"
+
+    # Set env vars so all gcloud calls use the right account/project without flag conflicts
+    export CLOUDSDK_CORE_ACCOUNT="$ACCOUNT"
+    export CLOUDSDK_CORE_PROJECT="$PROJECT"
+
+    echo "Account: $ACCOUNT"
+    echo "Project: $PROJECT"
+    echo ""
+
+    echo "=== Step 1: Service account ==="
+    if gcloud iam service-accounts describe "$SA_EMAIL" &>/dev/null; then
+        echo "Already exists: $SA_EMAIL"
+    else
+        echo "Creating: $SA_EMAIL"
+        gcloud iam service-accounts create "$SA_NAME" \
+            --display-name "GitHub Play Deploy"
+        echo "Waiting for IAM to propagate..."
+        sleep 10
+    fi
+
+    echo ""
+    echo "=== Step 2: JSON key ==="
+    if [[ -f "$KEY_FILE" ]]; then
+        echo "WARNING: $KEY_FILE already exists — overwriting."
+        rm "$KEY_FILE"
+    fi
+    gcloud iam service-accounts keys create "$KEY_FILE" \
+        --iam-account "$SA_EMAIL"
+    echo "Key written: $KEY_FILE"
+
+    echo ""
+    echo "=== Step 3: GitHub secret ==="
+    gh secret set GOOGLE_PLAY_SERVICE_ACCOUNT_JSON < "$KEY_FILE"
+    echo "Secret set: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+
+    echo ""
+    echo "=== Step 4: Enable Android Publisher API ==="
+    gcloud services enable androidpublisher.googleapis.com \
+        --project "$PROJECT"
+    echo "API enabled: androidpublisher.googleapis.com"
+
+    echo ""
+    echo "Run 'just play-console-setup' to complete the remaining Play Console step."
+
+# Open Play Console to grant the service account release permissions
+play-console-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    ACCOUNT="${PLAY_ACCOUNT:-}"
+    PROJECT="${PLAY_PROJECT:-}"
+    if [[ -z "$ACCOUNT" || -z "$PROJECT" ]]; then
+        echo "ERROR: PLAY_ACCOUNT and PLAY_PROJECT must be set in .env"
+        exit 1
+    fi
+
+    SA_EMAIL="github-play-deploy@${PROJECT}.iam.gserviceaccount.com"
+
+    echo "=== Grant service account release permissions ==="
+    echo ""
+    echo "Opening Play Console users & permissions page..."
+    echo "Select: Invite new user"
+    echo "Email:      $SA_EMAIL"
+    echo "Permission: Releases → Release to testing tracks (internal)"
+    echo ""
+    open "https://play.google.com/console/developers/users-and-permissions"
+
+    echo "Press Enter once the service account has been invited..."
+    read -r
+
+    echo ""
+    echo "Play Console setup complete. The pipeline is ready."
+    echo "See docs/PUBLISHING.md for the full release workflow."
 
 # Install Android emulator and system image
 setup-emulator:
