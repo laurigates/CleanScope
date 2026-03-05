@@ -1,0 +1,61 @@
+version: 2
+updates:
+  # npm dependencies in root directory
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+    pull-request-branch-name:
+      separator: "/"
+    reviewers:
+      - laurigates
+    labels:
+      - dependencies
+      - npm
+    open-pull-requests-limit: 5
+    rebase-strategy: disabled
+    commit-message:
+      prefix: "chore(deps):"
+      include: "scope"
+
+  # GitHub Actions workflows
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+    pull-request-branch-name:
+      separator: "/"
+    reviewers:
+      - laurigates
+    labels:
+      - dependencies
+      - ci
+    open-pull-requests-limit: 5
+    rebase-strategy: disabled
+    commit-message:
+      prefix: "chore(ci):"
+      include: "scope"
+
+  # Rust/Cargo dependencies in src-tauri directory
+  - package-ecosystem: cargo
+    directory: "src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    pull-request-branch-name:
+      separator: "/"
+    reviewers:
+      - laurigates
+    labels:
+      - dependencies
+      - rust
+    open-pull-requests-limit: 5
+    rebase-strategy: disabled
+    commit-message:
+      prefix: "chore(deps):"
+      include: "scope"
