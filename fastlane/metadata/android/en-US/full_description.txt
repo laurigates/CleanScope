@@ -1,0 +1,31 @@
+CleanScope lets you view live video from USB-C endoscope cameras directly on your Android phone — with zero data leaving your device.
+
+No account required. No cloud uploads. No analytics or tracking. Just plug in your USB endoscope and start viewing.
+
+<b>FEATURES</b>
+
+• Plug-and-play USB camera support — auto-launches when you connect an endoscope
+• Live video feed with automatic format detection (MJPEG and YUY2/YUYV)
+• Manual display controls for width, height, stride, and pixel format adjustment
+• Works with standard UVC-compliant USB-C endoscopes
+• Completely offline — all processing happens on-device
+• No permissions beyond USB access — no camera, no storage, no internet
+
+<b>PRIVACY BY DESIGN</b>
+
+CleanScope is built for users who care about where their data goes. Video frames are processed entirely in Rust on your device. There are no servers, no telemetry, and no third-party SDKs. What your camera sees stays on your phone.
+
+<b>IDEAL FOR</b>
+
+• Home inspections (pipes, drains, vents, walls)
+• Automotive and mechanical inspection
+• Electronics repair and PCB inspection
+• Hobbyist and DIY projects
+• Anyone who wants a simple, private endoscope viewer
+
+<b>REQUIREMENTS</b>
+
+• Android device with USB-C port and USB OTG support
+• A UVC-compliant USB-C endoscope camera
+
+CleanScope is free and open source.

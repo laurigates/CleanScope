@@ -2,6 +2,10 @@ name: Android Release
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'fastlane/metadata/**'
 
 permissions:
   contents: read
@@ -97,3 +101,25 @@ jobs:
           track: internal
           status: completed
           whatsNewDirectory: distribution/whatsnew
+
+  update-listing:
+    name: Update Play Store Listing
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+
+      - name: Install Fastlane
+        run: gem install fastlane
+
+      - name: Sync store listing metadata
+        run: fastlane supply --metadata_path fastlane/metadata/android --skip_upload_apk --skip_upload_aab --skip_upload_images --skip_upload_screenshots
+        env:
+          SUPPLY_PACKAGE_NAME: com.cleanscope.app
+          SUPPLY_JSON_KEY_DATA: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
