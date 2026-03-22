@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CleanScope - Privacy Policy</title>
+    <style>
+        :root {
+            --bg: #ffffff;
+            --text: #1a1a1a;
+            --muted: #555;
+            --accent: #2563eb;
+            --border: #e5e7eb;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1a1a2e;
+                --text: #e0e0e0;
+                --muted: #a0a0a0;
+                --accent: #60a5fa;
+                --border: #2d2d44;
+            }
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+            padding: 2rem 1rem;
+        }
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 0.25rem;
+        }
+        .subtitle {
+            color: var(--muted);
+            margin-bottom: 2rem;
+        }
+        h2 {
+            font-size: 1.25rem;
+            margin-top: 2rem;
+            margin-bottom: 0.5rem;
+        }
+        p, ul {
+            margin-bottom: 1rem;
+        }
+        ul {
+            padding-left: 1.5rem;
+        }
+        li {
+            margin-bottom: 0.25rem;
+        }
+        a {
+            color: var(--accent);
+        }
+        .highlight {
+            background: color-mix(in srgb, var(--accent) 10%, transparent);
+            border-left: 3px solid var(--accent);
+            padding: 1rem 1.25rem;
+            border-radius: 0 6px 6px 0;
+            margin: 1.5rem 0;
+        }
+        footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--border);
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Privacy Policy</h1>
+        <p class="subtitle">CleanScope &mdash; Last updated: March 22, 2026</p>
+
+        <div class="highlight">
+            <strong>Summary:</strong> CleanScope does not collect, store, transmit, or share any personal data. The app runs entirely on your device with no network communication.
+        </div>
+
+        <h2>What CleanScope Does</h2>
+        <p>CleanScope is a video viewer for USB-C endoscope cameras (UVC devices). It displays a live video feed from a USB-connected camera directly on your Android device. That is its sole function.</p>
+
+        <h2>Data Collection</h2>
+        <p>CleanScope collects <strong>no data whatsoever</strong>. Specifically:</p>
+        <ul>
+            <li>No personal information is collected, stored, or transmitted</li>
+            <li>No usage analytics or telemetry</li>
+            <li>No crash reporting sent to external services</li>
+            <li>No cookies, identifiers, or tracking of any kind</li>
+            <li>No account creation or sign-in</li>
+            <li>No advertising or ad-related tracking</li>
+        </ul>
+
+        <h2>Network Access</h2>
+        <p>CleanScope does <strong>not access the internet</strong>. The app requires no network permissions and makes no network requests. All processing happens locally on your device.</p>
+
+        <h2>Camera and USB Access</h2>
+        <p>CleanScope accesses USB devices connected to your phone's USB-C port. This is used exclusively to receive video data from USB endoscope cameras (UVC-compliant devices). The app does <strong>not</strong> access your phone's built-in cameras, microphone, or any other sensors.</p>
+        <p>Video frames from the USB camera are displayed on screen in real time and are not recorded or saved unless you explicitly use the capture feature, which saves files only to your device's local storage.</p>
+
+        <h2>Data Storage</h2>
+        <p>If you use the frame capture feature, captured images are saved locally on your device. No captured data is transmitted anywhere. You have full control over these files through your device's file manager.</p>
+
+        <h2>Third-Party Services</h2>
+        <p>CleanScope uses <strong>no third-party services</strong>, SDKs, or libraries that collect data. There are no embedded analytics, advertising frameworks, or external dependencies that communicate over the network.</p>
+
+        <h2>Children's Privacy</h2>
+        <p>Since CleanScope collects no data from any user, it does not knowingly collect information from children under 13 (or any applicable age threshold).</p>
+
+        <h2>Changes to This Policy</h2>
+        <p>If this privacy policy is updated, the changes will be posted on this page with an updated revision date. Since CleanScope collects no data, changes would only reflect new features or clarifications.</p>
+
+        <h2>Contact</h2>
+        <p>If you have questions about this privacy policy, you can open an issue on the <a href="https://github.com/laurigates/CleanScope">CleanScope GitHub repository</a>.</p>
+
+        <footer>
+            <p>&copy; 2026 CleanScope. This app is open source and available on <a href="https://github.com/laurigates/CleanScope">GitHub</a>.</p>
+        </footer>
+    </div>
+</body>
+</html>
