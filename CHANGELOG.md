@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.3.0...clean-scope-v0.4.0) (2026-03-22)
+
+
+### Features
+
+* add privacy policy page and GitHub Pages deployment ([#62](https://github.com/laurigates/CleanScope/issues/62)) ([cf0c078](https://github.com/laurigates/CleanScope/commit/cf0c0783074c71f3c80043e46dca862ca413d9b0))
+
 ## [0.3.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.2.2...clean-scope-v0.3.0) (2026-03-01)
 
 
