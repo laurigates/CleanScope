@@ -171,6 +171,8 @@ fn spawn_libusb_event_loop(
 
             let mut iteration = 0u32;
             while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: ctx_ptr is a valid libusb context pointer obtained from
+                // LibusbContext, and timeval is a valid stack-allocated timeout struct.
                 unsafe {
                     let ret =
                         libusb1_sys::libusb_handle_events_timeout(ctx_ptr.as_ptr(), &mut timeval);
@@ -376,7 +378,9 @@ fn get_usb_file_descriptor() -> Option<i32> {
 
     // Get the Android context
     let ctx = android_context();
+    // SAFETY: ctx.vm() returns a valid JNI JavaVM pointer from the Android runtime.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    // SAFETY: ctx.context() returns a valid Android Activity jobject reference.
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     let mut env = vm.attach_current_thread().ok()?;
@@ -674,10 +678,7 @@ fn start_yuy2_fallback(
     stream_ctx: &StreamingContext,
 ) -> Result<StreamResult, LibusbError> {
     // Get selected frame index from config, default to 1
-    let frame_idx = stream_ctx
-        .streaming_config
-        .lock()
-        .unwrap()
+    let frame_idx = lock_or_recover!(stream_ctx.streaming_config)
         .selected_frame_index
         .unwrap_or(1);
 
@@ -1219,6 +1220,7 @@ fn stream_frames_isochronous_with_format_detection(
     // Create the isochronous stream
     // Use calculated frame size so YUY2 detection works correctly
     // Validation is Off since we're still detecting the format
+    // SAFETY: ctx/dev pointers are valid libusb handles obtained from LibusbContext/LibusbDeviceHandle.
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             ctx.get_context_ptr(),
@@ -1626,6 +1628,7 @@ fn stream_frames_yuy2(
     let effective_packet_size = ep_info.max_packet_size * ep_info.transactions_per_microframe;
 
     // Create the isochronous stream with descriptor-based frame size
+    // SAFETY: ctx/dev pointers are valid libusb handles from LibusbContext/LibusbDeviceHandle.
     let mut iso_stream = unsafe {
         IsochronousStream::new(
             usb_ctx.get_context_ptr(),
@@ -1874,7 +1877,7 @@ fn start_uvc_streaming_with_resolution(
     let streaming_interface: u16 = UVC_STREAMING_INTERFACE;
     let control_selector = uvc::UVC_VS_PROBE_CONTROL << 8;
 
-    // SAFETY: UvcStreamControl is #[repr(C, packed)] with no padding or invariants.
+    // SAFETY: UvcStreamControl is a #[repr(C, packed)] struct with no padding.
     // The mutable borrow of `probe` is not used again while `probe_bytes` is live,
     // so there is no aliasing violation.
     let probe_bytes: &mut [u8] = unsafe {
@@ -1910,7 +1913,8 @@ fn start_uvc_streaming_with_resolution(
     log::info!("Camera probe response received");
 
     // Parse the response to get the negotiated parameters
-    // Use read_unaligned because UvcStreamControl is packed
+    // SAFETY: response contains a valid UvcStreamControl reply from the device.
+    // read_unaligned is required because UvcStreamControl is #[repr(C, packed)].
     let negotiated: UvcStreamControl =
         unsafe { std::ptr::read_unaligned(response.as_ptr() as *const _) };
 

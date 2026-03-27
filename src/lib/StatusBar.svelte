@@ -17,7 +17,7 @@ const {
   buildColor: string;
 } = $props();
 
-function getStatusColor(): string {
+const statusColor = $derived.by(() => {
   switch (connectionStatus) {
     case "connected":
       return "#4ade80";
@@ -27,12 +27,12 @@ function getStatusColor(): string {
     default:
       return "#ef4444";
   }
-}
+});
 </script>
 
 <div class="status-bar">
   <div class="status-indicator">
-    <span class="dot" style="background-color: {getStatusColor()}"></span>
+    <span class="dot" style="background-color: {statusColor}"></span>
     <span class="status-text">
       {displayStatus}
     </span>
