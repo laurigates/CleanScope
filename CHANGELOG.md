@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.4.0...clean-scope-v0.5.0) (2026-03-27)
+
+
+### Features
+
+* add Play Store listing metadata with auto-sync ([#64](https://github.com/laurigates/CleanScope/issues/64)) ([3c36120](https://github.com/laurigates/CleanScope/commit/3c361203313f3969c98357ed3f4d4c21a92d0f57))
+
 ## [0.4.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.3.0...clean-scope-v0.4.0) (2026-03-22)
 
 
