@@ -323,7 +323,7 @@ fn get_build_info() -> BuildInfo {
 
 /// Check the current USB device status
 #[tauri::command]
-fn check_usb_status() -> Result<UsbStatus, String> {
+fn check_usb_status() -> Result<UsbStatus, AppError> {
     // TODO: Implement actual USB status check via JNI on Android
     log::info!("Checking USB status");
     Ok(UsbStatus {
@@ -533,27 +533,26 @@ struct CapturedFrame {
 /// Returns information about the captured frames including file paths.
 /// Automatically disables raw frame capture after dumping to save memory bandwidth.
 #[tauri::command]
-fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<CapturedFrame, String> {
+fn dump_frame(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CapturedFrame, AppError> {
     use std::io::Write;
 
-    let mut buffer = state
-        .frame_buffer
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+    let mut buffer = lock_or_err!(&state.frame_buffer)?;
 
     if buffer.frame.is_empty() {
-        return Err("No frame available to dump".to_string());
+        return Err(AppError::NoFrame);
     }
 
     // Get app cache directory (works on Android)
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| format!("Could not get cache dir: {}", e))?;
+        .map_err(|e| AppError::PathError(e.to_string()))?;
 
     // Create directory if it doesn't exist
-    std::fs::create_dir_all(&cache_dir)
-        .map_err(|e| format!("Could not create cache dir: {}", e))?;
+    std::fs::create_dir_all(&cache_dir)?;
 
     // Generate filename with timestamp
     let timestamp = std::time::SystemTime::now()
@@ -600,10 +599,8 @@ fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Captu
     );
     let processed_filepath = cache_dir.join(&processed_filename);
 
-    let mut file = std::fs::File::create(&processed_filepath)
-        .map_err(|e| format!("Could not create file: {}", e))?;
-    file.write_all(&buffer.frame)
-        .map_err(|e| format!("Could not write frame: {}", e))?;
+    let mut file = std::fs::File::create(&processed_filepath)?;
+    file.write_all(&buffer.frame)?;
 
     log::info!(
         "Dumped processed frame to {}: {} bytes",
@@ -619,10 +616,8 @@ fn dump_frame(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Captu
         );
         let raw_filepath = cache_dir.join(&raw_filename);
 
-        let mut file = std::fs::File::create(&raw_filepath)
-            .map_err(|e| format!("Could not create raw file: {}", e))?;
-        file.write_all(&buffer.raw_frame)
-            .map_err(|e| format!("Could not write raw frame: {}", e))?;
+        let mut file = std::fs::File::create(&raw_filepath)?;
+        file.write_all(&buffer.raw_frame)?;
 
         log::info!(
             "Dumped raw frame to {}: {} bytes, format: {}",
@@ -770,11 +765,8 @@ fn get_display_settings(state: State<'_, AppState>) -> Result<String, AppError> 
 /// Toggle MJPEG detection skip
 /// When enabled, skips MJPEG format probing and goes straight to YUV streaming
 #[tauri::command]
-fn toggle_skip_mjpeg(state: State<'_, AppState>) -> Result<String, String> {
-    let mut config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn toggle_skip_mjpeg(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut config = lock_or_err!(&state.streaming_config)?;
     config.skip_mjpeg_detection = !config.skip_mjpeg_detection;
     log::info!("MJPEG skip: {}", config.skip_mjpeg_detection);
     Ok(if config.skip_mjpeg_detection {
@@ -789,11 +781,8 @@ fn toggle_skip_mjpeg(state: State<'_, AppState>) -> Result<String, String> {
 /// After the frame is captured, call `dump_frame` to save it.
 /// Automatically disables after `dump_frame` is called.
 #[tauri::command]
-fn enable_raw_capture(state: State<'_, AppState>) -> Result<String, String> {
-    let mut buffer = state
-        .frame_buffer
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+fn enable_raw_capture(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut buffer = lock_or_err!(&state.frame_buffer)?;
     buffer.capture_raw_frames = true;
     log::info!("Raw frame capture enabled");
     Ok("Raw capture enabled".to_string())
@@ -801,21 +790,15 @@ fn enable_raw_capture(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Check if raw frame capture is enabled
 #[tauri::command]
-fn is_raw_capture_enabled(state: State<'_, AppState>) -> Result<bool, String> {
-    let buffer = state
-        .frame_buffer
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
+fn is_raw_capture_enabled(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let buffer = lock_or_err!(&state.frame_buffer)?;
     Ok(buffer.capture_raw_frames)
 }
 
 /// Cycle through pixel format options (YUYV / UYVY / NV12 / I420 / RGB888 / BGR888)
 #[tauri::command]
-fn cycle_pixel_format(state: State<'_, AppState>) -> Result<String, String> {
-    let mut config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn cycle_pixel_format(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut config = lock_or_err!(&state.streaming_config)?;
     config.pixel_format = match config.pixel_format {
         PixelFormat::Yuyv => PixelFormat::Uyvy,
         PixelFormat::Uyvy => PixelFormat::Nv12,
@@ -842,11 +825,8 @@ fn format_pixel_display(format: &PixelFormat) -> String {
 
 /// Get current streaming configuration
 #[tauri::command]
-fn get_streaming_config(state: State<'_, AppState>) -> Result<(String, String), String> {
-    let config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn get_streaming_config(state: State<'_, AppState>) -> Result<(String, String), AppError> {
+    let config = lock_or_err!(&state.streaming_config)?;
     let mjpeg = if config.skip_mjpeg_detection {
         "MJPEG:Skip".to_string()
     } else {
@@ -859,11 +839,8 @@ fn get_streaming_config(state: State<'_, AppState>) -> Result<(String, String), 
 /// Cycle through available video formats
 /// Returns the new format setting as a display string
 #[tauri::command]
-fn cycle_video_format(state: State<'_, AppState>) -> Result<String, String> {
-    let mut config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn cycle_video_format(state: State<'_, AppState>) -> Result<String, AppError> {
+    let mut config = lock_or_err!(&state.streaming_config)?;
 
     if config.available_formats.is_empty() {
         // No formats discovered yet
@@ -909,21 +886,15 @@ fn cycle_video_format(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Get available video formats discovered from camera
 #[tauri::command]
-fn get_available_formats(state: State<'_, AppState>) -> Result<Vec<DiscoveredFormat>, String> {
-    let config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn get_available_formats(state: State<'_, AppState>) -> Result<Vec<DiscoveredFormat>, AppError> {
+    let config = lock_or_err!(&state.streaming_config)?;
     Ok(config.available_formats.clone())
 }
 
 /// Get current video format setting
 #[tauri::command]
-fn get_video_format(state: State<'_, AppState>) -> Result<String, String> {
-    let config = state
-        .streaming_config
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
+fn get_video_format(state: State<'_, AppState>) -> Result<String, AppError> {
+    let config = lock_or_err!(&state.streaming_config)?;
 
     Ok(match config.selected_format_index {
         None => "FMT:Auto".to_string(),

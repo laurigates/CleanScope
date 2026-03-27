@@ -17,6 +17,7 @@ import type {
   ReconnectStatus,
   ResolutionInfo,
   UsbError,
+  UsbStatusEvent,
   UsbStatusExtended,
 } from "./lib/types";
 
@@ -65,6 +66,8 @@ const HASH_PREFIX_LENGTH = 6;
 const COLOR_FALLBACK = "#9ca3af";
 const RESOLUTION_FETCH_DELAY_MS = 500;
 const RGB_BYTES_PER_PIXEL = 3;
+const RGBA_BYTES_PER_PIXEL = 4;
+const ALPHA_OPAQUE = 255;
 
 // Curated color palette - distinct, visible on dark backgrounds
 const BUILD_COLORS = [
@@ -149,14 +152,14 @@ onMount(async () => {
   unlistenFns.push(unlistenUsb);
 
   const unlistenUsbError = await listen<UsbError>("usb-error", (event) => {
-    console.log("USB error received:", event.payload);
+    console.debug("USB error received:", event.payload);
     lastUsbError = event.payload;
     errorMessage = event.payload.message;
   });
   unlistenFns.push(unlistenUsbError);
 
   const unlistenReconnect = await listen<ReconnectStatus>("usb-reconnecting", (event) => {
-    console.log("Reconnection status:", event.payload);
+    console.debug("Reconnection status:", event.payload);
     if (event.payload.reconnecting) {
       connectionStatus = "reconnecting";
       reconnectAttempt = event.payload.attempt;
@@ -168,7 +171,7 @@ onMount(async () => {
   });
   unlistenFns.push(unlistenReconnect);
 
-  const unlistenUsbStatus = await listen<{ status: string; detail?: string }>(
+  const unlistenUsbStatus = await listen<UsbStatusEvent>(
     "usb-status",
     (event) => {
       streamingStatus = event.payload.detail || event.payload.status;
@@ -217,19 +220,19 @@ onMount(async () => {
       cameraInfo = status.info || "USB Camera";
     }
   } catch (e) {
-    console.log("No USB device on startup");
+    console.debug("No USB device on startup");
   }
 
   try {
     buildInfo = await invoke<BuildInfo>("get_build_info");
   } catch (e) {
-    console.log("Could not get build info:", e);
+    console.debug("Could not get build info:", e);
   }
 
   try {
     videoFormatSetting = await invoke<string>("get_video_format");
   } catch (e) {
-    console.log("Could not get video format:", e);
+    console.debug("Could not get video format:", e);
   }
 });
 
@@ -284,11 +287,11 @@ async function renderFrame(
 
     for (let i = 0; i < pixelCount; i++) {
       const rgbIdx = i * RGB_BYTES_PER_PIXEL;
-      const rgbaIdx = i * 4;
+      const rgbaIdx = i * RGBA_BYTES_PER_PIXEL;
       rgba[rgbaIdx] = rgb[rgbIdx];
       rgba[rgbaIdx + 1] = rgb[rgbIdx + 1];
       rgba[rgbaIdx + 2] = rgb[rgbIdx + 2];
-      rgba[rgbaIdx + 3] = 255;
+      rgba[rgbaIdx + 3] = ALPHA_OPAQUE;
     }
 
     ctx.putImageData(imageData, 0, 0);
@@ -372,7 +375,7 @@ async function cycleVideoFormat() {
 async function captureFrame() {
   try {
     captureResult = await invoke<CaptureResult>("dump_frame");
-    console.log("Frame captured:", captureResult);
+    console.debug("Frame captured:", captureResult);
   } catch (e) {
     errorMessage = `Failed to capture frame: ${e}`;
   }

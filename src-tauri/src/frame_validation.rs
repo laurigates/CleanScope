@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// These values control how strictly frames are validated for corruption.
 /// Lower thresholds catch more artifacts but may reject valid frames.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ValidationConfig {
     /// Maximum allowed average Y-channel row difference (Strict mode).
     /// Values above this threshold indicate horizontal banding.
@@ -30,22 +30,18 @@ pub struct ValidationConfig {
     pub size_tolerance_minimal: f32,
 }
 
-impl Default for ValidationConfig {
-    fn default() -> Self {
-        Self {
-            row_diff_threshold: 40.0,
-            size_tolerance_moderate: 1.1,
-            size_tolerance_minimal: 2.0,
-        }
-    }
-}
-
-/// Default validation configuration
+/// Default validation configuration (compile-time constant)
 const VALIDATION_CONFIG: ValidationConfig = ValidationConfig {
     row_diff_threshold: 40.0,
     size_tolerance_moderate: 1.1,
     size_tolerance_minimal: 2.0,
 };
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        VALIDATION_CONFIG
+    }
+}
 
 /// Frame validation strictness levels
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
