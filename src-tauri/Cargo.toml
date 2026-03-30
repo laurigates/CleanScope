@@ -44,7 +44,7 @@ ndk = { version = "0.9", features = ["api-level-24"] }
 ndk-context = "0.1"
 
 # Android-specific logging
-android_logger = "0.14"
+android_logger = "0.15"
 
 # Image decoding for MJPEG streams
 jpeg-decoder = "0.3"
