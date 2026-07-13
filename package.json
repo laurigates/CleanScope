@@ -38,7 +38,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/cli": "^2.10.1",
-    "@tsconfig/svelte": "^5.0.0",
+    "@tsconfig/svelte": "^5.0.8",
     "svelte": "^5.0.0",
     "svelte-check": "^4.4.4",
     "typedoc": "^0.27.6",
