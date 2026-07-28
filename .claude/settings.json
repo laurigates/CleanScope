@@ -1,5 +1,15 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "PushNotification",
+      "RemoteTrigger",
+      "ScheduleWakeup"
+    ]
+  },
 
   "extraKnownMarketplaces": {
     "laurigates-claude-plugins": {
