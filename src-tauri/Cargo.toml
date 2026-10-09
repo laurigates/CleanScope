@@ -12,55 +12,55 @@ name = "clean_scope_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
-chrono = "0.4"
+tauri-build = { version = "=2.5.3", features = [] }
+chrono = "=0.4.42"
 
 [dependencies]
 # Tauri framework
-tauri = { version = "2", features = [] }
-tauri-plugin-shell = "2"
+tauri = { version = "=2.9.5", features = [] }
+tauri-plugin-shell = "=2.3.3"
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
 
 # Logging
-log = "0.4"
-env_logger = "0.11"
+log = "=0.4.29"
+env_logger = "=0.11.8"
 
 # Error handling
-thiserror = "2"
-anyhow = "1"
+thiserror = "=2.0.18"
+anyhow = "=1.0.102"
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "=1.50.0", features = ["sync", "rt"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # JNI bridge for Android
-jni = "0.21"
+jni = "=0.21.1"
 
 # NDK bindings
-ndk = { version = "0.9", features = ["api-level-24"] }
-ndk-context = "0.1"
+ndk = { version = "=0.9.0", features = ["api-level-24"] }
+ndk-context = "=0.1.1"
 
 # Android-specific logging
-android_logger = "0.15"
+android_logger = "=0.15.1"
 
 # Image decoding for MJPEG streams
-jpeg-decoder = "0.3"
+jpeg-decoder = "=0.3.2"
 
 # YUV to RGB conversion for raw video formats
-yuvutils-rs = "0.7"
+yuvutils-rs = "=0.7.0"
 
 # Low-level USB access via libusb
 # Using vendored libusb to avoid system dependency issues on Android
-libusb1-sys = { version = "0.7", features = ["vendored"] }
+libusb1-sys = { version = "=0.7.0", features = ["vendored"] }
 
 # libc for raw pointer types used in libusb FFI
-libc = "0.2"
+libc = "=0.2.182"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.24.0"
 
 [features]
 default = ["custom-protocol"]
