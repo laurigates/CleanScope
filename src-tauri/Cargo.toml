@@ -37,7 +37,7 @@ tokio = { version = "1", features = ["sync", "rt"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # JNI bridge for Android
-jni = "0.21"
+jni = "0.22"
 
 # NDK bindings
 ndk = { version = "0.9", features = ["api-level-24"] }
@@ -50,7 +50,7 @@ android_logger = "0.15"
 jpeg-decoder = "0.3"
 
 # YUV to RGB conversion for raw video formats
-yuvutils-rs = "0.7"
+yuvutils-rs = "0.8"
 
 # Low-level USB access via libusb
 # Using vendored libusb to avoid system dependency issues on Android
