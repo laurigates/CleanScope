@@ -11,7 +11,7 @@ git commit -m "feat: ..."
   → push to main
   → release-please.yml bumps versions and opens a PR
   → PR merged → GitHub release created
-  → android-release.yml builds signed AAB and uploads to Play Store internal track
+  → the same release-please.yml run builds a signed AAB and uploads it to the Play Store internal track
 ```
 
 Version files updated automatically by release-please:
@@ -69,7 +69,7 @@ Upload this AAB through Play Console → Testing → Internal testing → Create
 2. Create a service account (e.g., `github-play-deploy`).
 3. Create a JSON key for the service account and download it.
 4. In Play Console: Setup → API access → link to your Google Cloud project.
-5. In Play Console: Users and permissions → Invite new users → enter the service account email → grant **Release to internal testing track** for CleanScope.
+5. In Play Console: Users and permissions → Invite new users → enter the service account email → grant, for CleanScope: **View app information**, **Release apps to testing tracks** and **Manage store presence** (listing sync). Verify with `just play-status` — a 403 means this step is missing.
 
 ### 4. GitHub Secrets
 
@@ -86,8 +86,9 @@ In the repository Settings → Secrets and variables → Actions, add:
 
 | File | Purpose |
 |------|---------|
-| `.github/workflows/release-please.yml` | Runs on push to main; creates version bump PRs and GitHub releases |
-| `.github/workflows/android-release.yml` | Runs when a GitHub release is published; builds and uploads AAB |
+| `.github/workflows/release-please.yml` | Runs on push to main; creates version bump PRs and GitHub releases, then builds the AAB and uploads it when a release is created |
+| `.github/workflows/android-release.yml` | Manual `workflow_dispatch` build + upload; on pushes touching `fastlane/metadata/**` it also syncs the store listing |
+| `.github/workflows/play-status.yml` | Weekly Play status + policy-deadline report (see `docs/PLAY_STORE_STATUS.md`) |
 | `release-please-config.json` | release-please configuration |
 | `.release-please-manifest.json` | Current version state tracked by release-please |
 | `distribution/whatsnew/whatsnew-en-US` | Release notes shown in Play Store (update before each release) |
@@ -97,7 +98,7 @@ In the repository Settings → Secrets and variables → Actions, add:
 `src-tauri/gen/android/app/build.gradle.kts` reads signing credentials from `src-tauri/gen/android/keystore.properties` at build time. This file is gitignored and must be created:
 
 - **Locally**: Create manually for local release builds (see step 2 above).
-- **CI**: Written by the `android-release.yml` workflow from GitHub Secrets.
+- **CI**: Written by the `release-please.yml` and `android-release.yml` build jobs from GitHub Secrets.
 
 ## Releasing
 
@@ -109,7 +110,7 @@ In the repository Settings → Secrets and variables → Actions, add:
    - `feat!: ...` or `BREAKING CHANGE:` → major version bump
 2. release-please opens a PR when it detects releasable commits.
 3. Review the PR (check version bump and CHANGELOG entries), then merge.
-4. release-please creates a GitHub release → `android-release.yml` triggers automatically.
+4. release-please creates a GitHub release; the build and publish jobs in the same `release-please.yml` run upload it.
 5. Check Play Console → Testing → Internal testing for the new release.
 
 ### Manual (workflow_dispatch)
@@ -136,7 +137,7 @@ After setup, verify the full pipeline:
 1. Make a conventional commit and push to `main`.
 2. Confirm release-please opens a PR that bumps all three version files.
 3. Merge the PR; confirm a GitHub release is created.
-4. Confirm `android-release.yml` triggers and completes successfully.
+4. Confirm the `Build Android AAB` and `Publish to Google Play` jobs of that `release-please.yml` run succeed.
 5. Check Play Console internal track for the new release.
 
 Verify local signing:
