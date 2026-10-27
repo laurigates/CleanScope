@@ -76,7 +76,8 @@ def get_json(session: AuthorizedSession, url: str) -> dict:
     resp = session.get(url)
     if not resp.ok:
         raise RuntimeError(api_error(resp))
-    return resp.json()
+    # tracks/{track}/releases answers 204 with an empty body for a track with no releases
+    return resp.json() if resp.content else {}
 
 
 def collect_play_state(session: AuthorizedSession, package: str) -> dict:
@@ -96,9 +97,18 @@ def collect_play_state(session: AuthorizedSession, package: str) -> dict:
     finally:
         session.delete(edit)
 
-    releases = {
-        t["track"]: get_json(session, f"{base}/tracks/{t['track']}/releases").get("releases", []) for t in tracks
-    }
+    # The edit's track list carries name/status/versionCodes; releases.list adds the review
+    # lifecycle state but has a tight per-app quota, so call it only for non-empty tracks
+    # and fall back to the edit's status when it is rate-limited.
+    lifecycle, warnings = {}, []
+    for t in tracks:
+        if not t.get("releases"):
+            continue
+        try:
+            for r in get_json(session, f"{base}/tracks/{t['track']}/releases").get("releases", []):
+                lifecycle[(t["track"], r.get("releaseName"))] = r.get("releaseLifecycleState")
+        except RuntimeError as exc:
+            warnings.append(f"{t['track']}: lifecycle state unavailable ({exc})")
     return {
         "details": details,
         "listings": [{k: lst.get(k) for k in ("language", "title", "shortDescription")} for lst in listings],
@@ -107,16 +117,18 @@ def collect_play_state(session: AuthorizedSession, package: str) -> dict:
                 "track": t["track"],
                 "releases": [
                     {
-                        "name": r.get("releaseName"),
-                        "state": r.get("releaseLifecycleState"),
-                        "version_codes": [a.get("bundleArtifact", a) for a in r.get("activeArtifacts", [])],
+                        "name": r.get("name"),
+                        "status": r.get("status"),
+                        "state": lifecycle.get((t["track"], r.get("name"))),
+                        "version_codes": r.get("versionCodes", []),
                     }
-                    for r in releases.get(t["track"], [])
+                    for r in t.get("releases", [])
                 ],
             }
             for t in tracks
         ],
         "testers": testers,
+        "warnings": warnings,
     }
 
 
@@ -250,12 +262,16 @@ def to_markdown(report: dict) -> str:
     if play["error"]:
         lines += [f"**Play API error:** {play['error']}", ""]
     else:
-        lines += ["| Track | Release | State |", "|---|---|---|"]
+        lines += ["| Track | Release | Version codes | Status | Review state |", "|---|---|---|---|---|"]
         for t in play["tracks"]:
-            for r in t["releases"] or [{"name": "—", "state": "no releases"}]:
-                lines.append(f"| {t['track']} | {r['name']} | {r['state']} |")
+            if not t["releases"]:
+                lines.append(f"| {t['track']} | — | — | no releases | — |")
+            for r in t["releases"]:
+                codes = ", ".join(map(str, r["version_codes"]))
+                lines.append(f"| {t['track']} | {r['name']} | {codes} | {r['status']} | {r['state'] or '—'} |")
         languages = ", ".join(lst["language"] for lst in play["listings"]) or "none"
         lines += ["", f"Default language: `{play['details'].get('defaultLanguage')}`; listings: {languages}", ""]
+        lines += [f"> {w}" for w in play["warnings"]]
     lines += ["### Findings", ""]
     lines += [f"- **{f['severity']}** {f['message']}" for f in report["findings"]] or ["- none"]
     lines += [
@@ -298,7 +314,10 @@ def main() -> int:
     report = {
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "package": args.package,
-        "play_api": {"error": error, **(play or {"details": {}, "listings": [], "tracks": [], "testers": {}})},
+        "play_api": {
+            "error": error,
+            **(play or {"details": {}, "listings": [], "tracks": [], "testers": {}, "warnings": []}),
+        },
         "policy_deadlines": {"source": DEADLINES_URL, "entries": deadlines},
         "findings": findings(play, deadlines),
         "console_only_checks": CONSOLE_ONLY_CHECKS,
