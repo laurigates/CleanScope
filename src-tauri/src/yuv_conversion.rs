@@ -698,7 +698,7 @@ pub fn convert_bgr888_to_rgb(
 
     // Swap B and R channels: BGR -> RGB
     let mut rgb = Vec::with_capacity(expected);
-    for chunk in data[..expected].chunks_exact(3) {
+    for chunk in data[..expected].as_chunks::<3>().0 {
         rgb.push(chunk[2]); // R (was at position 2 in BGR)
         rgb.push(chunk[1]); // G (stays in middle)
         rgb.push(chunk[0]); // B (was at position 0 in BGR)
@@ -1141,7 +1141,7 @@ mod tests {
         let rgb = result.unwrap();
 
         // Check that each pixel has similar R, G, B values (grayscale)
-        for pixel in rgb.chunks_exact(3) {
+        for pixel in rgb.as_chunks::<3>().0 {
             let r = pixel[0] as i32;
             let g = pixel[1] as i32;
             let b = pixel[2] as i32;
