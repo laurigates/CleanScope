@@ -360,6 +360,29 @@ pub fn validate_uvc_header(data: &[u8]) -> Option<usize> {
     Some(header_len)
 }
 
+/// Consecutive FID periods that must equal the expected frame size before FID toggles are
+/// trusted to re-align uncompressed (YUY2) frames.
+pub const FID_TRUST_PERIODS: u8 = 2;
+
+/// Update the count of consecutive FID periods whose byte count equals one frame.
+///
+/// Size-based YUY2 assembly never re-aligns once its start is off, so every displayed frame
+/// straddles two camera frames. Cameras whose FID marks real boundaries produce periods of
+/// exactly `expected_frame_size` bytes; cameras that toggle FID mid-frame never reach
+/// [`FID_TRUST_PERIODS`] matches and keep pure size-based assembly.
+#[inline]
+pub fn update_fid_period_matches(
+    period_bytes: usize,
+    expected_frame_size: usize,
+    matches: u8,
+) -> u8 {
+    if period_bytes == expected_frame_size {
+        matches.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 /// Check if data starts with JPEG SOI marker (0xFFD8)
 ///
 /// JPEG images always begin with the Start Of Image marker: 0xFF 0xD8.
@@ -396,6 +419,38 @@ pub fn round_to_yuy2_frame_size(actual_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // FID period tracking (YUY2 re-alignment)
+    // =========================================================================
+
+    #[test]
+    fn test_fid_periods_matching_frame_size_build_trust() {
+        let m = update_fid_period_matches(614_400, 614_400, 0);
+        let m = update_fid_period_matches(614_400, 614_400, m);
+        assert_eq!(m, FID_TRUST_PERIODS);
+    }
+
+    #[test]
+    fn test_fid_period_mismatch_resets_trust() {
+        // A camera toggling FID mid-frame never accumulates trust
+        let m = update_fid_period_matches(614_400, 614_400, 5);
+        assert_eq!(update_fid_period_matches(307_200, 614_400, m), 0);
+    }
+
+    #[test]
+    fn test_first_partial_period_does_not_count() {
+        // Bytes before the first observed toggle are a partial frame
+        assert_eq!(update_fid_period_matches(542_232, 614_400, 0), 0);
+    }
+
+    #[test]
+    fn test_fid_period_matches_saturates() {
+        assert_eq!(
+            update_fid_period_matches(614_400, 614_400, u8::MAX),
+            u8::MAX
+        );
+    }
 
     // =========================================================================
     // UVC Header Validation Tests (migrated from libusb_android.rs)

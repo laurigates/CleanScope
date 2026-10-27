@@ -15,10 +15,12 @@
 
 use std::collections::BTreeMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::frame_assembler::{is_jpeg_data, validate_uvc_header};
+use crate::frame_assembler::{
+    is_jpeg_data, update_fid_period_matches, validate_uvc_header, FID_TRUST_PERIODS,
+};
 
 /// libusb error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +250,14 @@ impl LibusbContext {
                 return Err(LibusbError::from(ret));
             }
 
+            // Route libusb's own warnings/errors to logcat (tag "libusb"); without this a
+            // failed URB submit surfaces only as LIBUSB_ERROR_IO with the kernel errno lost.
+            libusb1_sys::libusb_set_option(
+                ctx,
+                libusb1_sys::constants::LIBUSB_OPTION_LOG_LEVEL,
+                libusb1_sys::constants::LIBUSB_LOG_LEVEL_WARNING,
+            );
+
             log::info!("libusb context initialized for Android");
             Ok(LibusbContext { ctx })
         }
@@ -301,7 +311,10 @@ impl LibusbContext {
             }
 
             log::info!("Successfully wrapped Android FD {} as libusb device", fd);
-            Ok(LibusbDeviceHandle { handle: dev_handle })
+            Ok(LibusbDeviceHandle {
+                handle: dev_handle,
+                claimed_interfaces: AtomicU32::new(0),
+            })
         }
     }
 }
@@ -319,6 +332,8 @@ impl Drop for LibusbContext {
 /// Wrapper around libusb device handle
 pub struct LibusbDeviceHandle {
     handle: *mut libusb1_sys::libusb_device_handle,
+    /// Bitmask of interfaces claimed through this handle, released on drop.
+    claimed_interfaces: AtomicU32,
 }
 
 // SAFETY: LibusbDeviceHandle wraps a libusb_device_handle pointer. libusb device handles
@@ -376,6 +391,8 @@ impl LibusbDeviceHandle {
                 return Err(LibusbError::from(ret));
             }
             log::info!("Claimed interface {}", interface_number);
+            self.claimed_interfaces
+                .fetch_or(1 << interface_number, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -388,6 +405,8 @@ impl LibusbDeviceHandle {
                 log::error!("libusb_release_interface failed: {}", ret);
                 return Err(LibusbError::from(ret));
             }
+            self.claimed_interfaces
+                .fetch_and(!(1 << interface_number), Ordering::SeqCst);
             Ok(())
         }
     }
@@ -727,6 +746,14 @@ impl Drop for LibusbDeviceHandle {
     fn drop(&mut self) {
         unsafe {
             if !self.handle.is_null() {
+                // libusb_close() leaves a wrapped Android fd open, and usbfs keeps interface
+                // claims until the fd closes. Release them explicitly so the next connection
+                // can claim the same interfaces instead of failing with EBUSY.
+                let claimed = self.claimed_interfaces.load(Ordering::SeqCst);
+                for iface in (0..32).filter(|i| claimed & (1 << i) != 0) {
+                    let ret = libusb1_sys::libusb_release_interface(self.handle, iface);
+                    log::info!("Released interface {} on close (ret {})", iface, ret);
+                }
                 libusb1_sys::libusb_close(self.handle);
             }
         }
@@ -1056,12 +1083,12 @@ pub mod uvc {
 pub struct IsoTransferConfig {
     /// Number of isochronous packets per transfer.
     /// Higher values = better throughput, lower values = lower latency.
-    /// Default: 32 (balanced for USB endoscopes)
+    /// Default: 8 (keeps each URB buffer small; see `ISO_CONFIG`)
     pub packets_per_transfer: i32,
 
     /// Number of transfers to keep in flight simultaneously.
     /// More transfers = continuous streaming without gaps.
-    /// Default: 4 (allows overlapped processing)
+    /// Default: 16 (allows overlapped processing)
     pub num_transfers: usize,
 
     /// Timeout for event handling in milliseconds.
@@ -1072,18 +1099,20 @@ pub struct IsoTransferConfig {
 
 impl Default for IsoTransferConfig {
     fn default() -> Self {
-        Self {
-            packets_per_transfer: 32,
-            num_transfers: 4,
-            event_timeout_ms: 100,
-        }
+        ISO_CONFIG
     }
 }
 
-/// Default isochronous transfer configuration
+/// Default isochronous transfer configuration.
+///
+/// usbfs allocates each isochronous URB's buffer as one contiguous kernel block. At
+/// high-bandwidth packet sizes (3 × 1024 bytes) a 32-packet transfer needs ~96 KB, and on
+/// Android 16 (Galaxy S24+) that allocation failed intermittently with ENOMEM, surfacing
+/// as LIBUSB_ERROR_IO on submit. 16 × 8 packets keeps the same ~384 KB in flight in
+/// ~24 KB buffers.
 const ISO_CONFIG: IsoTransferConfig = IsoTransferConfig {
-    packets_per_transfer: 32,
-    num_transfers: 4,
+    packets_per_transfer: 8,
+    num_transfers: 16,
     event_timeout_ms: 100,
 };
 
@@ -1139,6 +1168,10 @@ struct SharedFrameState {
     pending_urbs: BTreeMap<u64, UrbPayload>,
     /// Next expected URB sequence number for in-order processing
     next_expected_sequence: u64,
+    /// Payload bytes received since the last FID toggle
+    bytes_since_fid: usize,
+    /// Consecutive FID periods that equalled one frame (see `update_fid_period_matches`)
+    fid_period_matches: u8,
 }
 
 // Forward declaration for capture module
@@ -1330,6 +1363,15 @@ impl IsochronousStream {
             frame_size
         );
 
+        let device = libusb1_sys::libusb_get_device(handle);
+        log::info!(
+            "Link speed {} (1=low 2=full 3=high 4=super 5=super+); libusb max iso packet for 0x{:02x}: {}; requested {}",
+            libusb1_sys::libusb_get_device_speed(device),
+            endpoint,
+            libusb1_sys::libusb_get_max_iso_packet_size(device, endpoint),
+            max_packet_size
+        );
+
         // Create shared state for frame accumulation (shared across all transfers)
         let shared_state = Arc::new(std::sync::Mutex::new(SharedFrameState {
             frame_buffer: Vec::with_capacity(frame_size + 1024), // Frame size + margin
@@ -1340,6 +1382,8 @@ impl IsochronousStream {
             validation_warning_count: 0,
             pending_urbs: BTreeMap::new(),
             next_expected_sequence: 0,
+            bytes_since_fid: 0,
+            fid_period_matches: 0,
         }));
 
         // Global sequence counter for URB ordering (shared across all transfers)
@@ -1848,12 +1892,33 @@ fn process_urb_payload_in_order(
                         }
                         state.frame_buffer.clear();
                     }
-                    // For YUY2: FID toggle is unreliable, don't use for frame boundaries
+                    // For YUY2, FID is only trusted once its periods match the frame size
+                    // (many cheap cameras toggle it mid-frame). When trusted, a toggle with
+                    // a partial buffer means size-based assembly started off-boundary:
+                    // drop the partial frame so the next one starts at the camera's boundary.
+                    if !is_mjpeg {
+                        state.fid_period_matches = update_fid_period_matches(
+                            state.bytes_since_fid,
+                            state.expected_frame_size,
+                            state.fid_period_matches,
+                        );
+                        if state.fid_period_matches >= FID_TRUST_PERIODS
+                            && !state.frame_buffer.is_empty()
+                        {
+                            log::info!(
+                                "Re-aligning YUY2 frame to FID boundary (dropped {} partial bytes)",
+                                state.frame_buffer.len()
+                            );
+                            state.frame_buffer.clear();
+                        }
+                    }
+                    state.bytes_since_fid = 0;
                     state.synced = true;
                 }
             }
             state.last_frame_id = Some(pkt.frame_id);
         }
+        state.bytes_since_fid += pkt.payload_len;
 
         // Only accumulate data if we're synced
         if !state.synced {
