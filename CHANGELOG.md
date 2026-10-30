@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.5.0...clean-scope-v0.5.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **ci:** pass --aab as a flag to tauri android build ([#108](https://github.com/laurigates/CleanScope/issues/108)) ([e4f687e](https://github.com/laurigates/CleanScope/commit/e4f687e08680d2ad1774fdafb7b1ea2f792d1868))
+* **usb:** stream YUY2 from the HD camera endoscope on Android 16 ([215bf9f](https://github.com/laurigates/CleanScope/commit/215bf9fe851f563b9542b5f2a28fa6dac92a5150))
+
 ## [0.5.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.4.0...clean-scope-v0.5.0) (2026-03-27)
 
 
