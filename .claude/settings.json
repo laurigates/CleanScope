@@ -10,17 +10,16 @@
       "ScheduleWakeup"
     ]
   },
-
   "extraKnownMarketplaces": {
     "laurigates-claude-plugins": {
       "source": {
         "source": "github",
         "repo": "laurigates/claude-plugins",
         "ref": "main"
-      }
+      },
+      "autoUpdate": true
     }
   },
-
   "enabledPlugins": {
     "rust-plugin@laurigates-claude-plugins": true,
     "typescript-plugin@laurigates-claude-plugins": true,
@@ -35,6 +34,10 @@
     "blueprint-plugin@laurigates-claude-plugins": true,
     "api-plugin@laurigates-claude-plugins": true
   },
-
-  "enableAllProjectMcpServers": true
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "pal",
+    "context7",
+    "sequential-thinking"
+  ]
 }
