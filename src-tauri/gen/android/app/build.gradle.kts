@@ -60,11 +60,14 @@ android {
             )
         }
     }
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
     buildFeatures {
         buildConfig = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
     }
 }
 
