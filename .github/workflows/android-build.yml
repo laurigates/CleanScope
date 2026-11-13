@@ -1,0 +1,84 @@
+name: Android Build
+
+# Builds a debug APK on pull requests that touch an input of the Android
+# build. test.yml never invokes Gradle, so without this job a Gradle, Kotlin
+# or androidx bump is first compiled by the release build.
+on:
+  pull_request:
+    paths:
+      - 'src-tauri/gen/android/**'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/build.rs'
+      - 'src-tauri/tauri.conf.json'
+      - 'rust-toolchain.toml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/check-elf-alignment.sh'
+      - '.github/workflows/android-build.yml'
+      - '.github/workflows/android-release.yml'
+      - '.github/workflows/release-please.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android debug build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Setup Android SDK components
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "build-tools;34.0.0" \
+            "platforms;android-36"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28c
+          add-to-path: false
+
+      - name: Install Rust toolchain
+        # Runners ship rustup; with no arguments this installs the toolchain
+        # pinned in rust-toolchain.toml, including its components.
+        run: rustup toolchain install
+
+      - name: Add Android Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # One ABI and a debug-signed APK: no keystore, no Play upload.
+      - name: Build Android debug APK
+        run: npm run tauri android build -- --debug --apk --target aarch64 --ci
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Check 16 KB page alignment of native libraries
+        run: scripts/check-elf-alignment.sh src-tauri/gen/android/app/build/outputs
