@@ -37,7 +37,9 @@ jobs:
           add-to-path: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Runners ship rustup; with no arguments this installs the toolchain
+        # pinned in rust-toolchain.toml, including its components.
+        run: rustup toolchain install
 
       - name: Add Android Rust targets
         run: |
@@ -115,7 +117,7 @@ jobs:
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4.12'
           bundler-cache: true
 
       - name: Install Fastlane
