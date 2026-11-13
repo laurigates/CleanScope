@@ -72,10 +72,17 @@ Covers these scenarios:
 - **Resolution display updates** - Shows detected resolution (e.g., "800x600")
 
 ### UI Controls
-- **Debug controls present** - Width, Height, Stride, Offset, Capture buttons
 - **Frame count increments** - Tracks incoming frames
-- **Build info displays** - Shows version and git hash
+- **Build info displays** - Shows version
 - **Error banner dismisses** - Cleanup of error notifications
+
+## Test Suite: debug-controls.spec.ts
+
+Runs against the vite dev server with a stubbed Tauri backend (`mockTauriBackend` in `e2e/helpers.ts`).
+
+- **Release build** - Debug buttons hidden, resolution button kept, label is the version alone
+- **Hidden gesture** - Seven taps on the version label toggle the debug buttons
+- **Debug build** - Debug buttons shown, label includes the git hash
 
 ## Running Tests
 

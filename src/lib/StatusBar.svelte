@@ -8,6 +8,7 @@ const {
   frameCount,
   buildInfo,
   buildColor,
+  onversiontap,
 }: {
   connectionStatus: ConnectionStatus;
   displayStatus: string;
@@ -15,7 +16,16 @@ const {
   frameCount: number;
   buildInfo: BuildInfo | null;
   buildColor: string;
+  onversiontap: () => void;
 } = $props();
+
+// Release builds show the version alone; the commit hash is a development detail.
+const buildLabel = $derived.by(() => {
+  if (!buildInfo) return "";
+  return buildInfo.debug
+    ? `v${buildInfo.version} (${buildInfo.git_hash})`
+    : `v${buildInfo.version}`;
+});
 
 const statusColor = $derived.by(() => {
   switch (connectionStatus) {
@@ -46,7 +56,7 @@ const statusColor = $derived.by(() => {
       <span class="frame-count">{frameCount.toLocaleString()} frames</span>
     {/if}
     {#if buildInfo}
-      <span class="build-info" style="color: {buildColor}">v{buildInfo.version} ({buildInfo.git_hash})</span>
+      <button class="build-info" style="color: {buildColor}" onclick={onversiontap}>{buildLabel}</button>
     {/if}
   </div>
 </div>
@@ -107,5 +117,9 @@ const statusColor = $derived.by(() => {
     font-size: 0.75rem;
     color: #9ca3af;
     font-family: monospace;
+    background: none;
+    border: none;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
   }
 </style>

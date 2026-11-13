@@ -309,15 +309,18 @@ pub struct BuildInfo {
     pub git_hash: String,
     /// Build timestamp
     pub build_time: String,
+    /// True for a debug build; the UI shows debug controls and the git hash only then
+    pub debug: bool,
 }
 
-/// Get build information (version, git hash, build time)
+/// Get build information (version, git hash, build time, debug flag)
 #[tauri::command]
 fn get_build_info() -> BuildInfo {
     BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         git_hash: env!("BUILD_GIT_HASH").to_string(),
         build_time: env!("BUILD_TIMESTAMP").to_string(),
+        debug: cfg!(debug_assertions),
     }
 }
 
@@ -1211,6 +1214,14 @@ mod command_tests {
             usb_stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             validation_level: ValidationLevel::default(),
         }
+    }
+
+    /// The frontend reads `debug` from the serialized payload to decide whether to
+    /// show the debug controls and the git hash.
+    #[test]
+    fn test_build_info_serializes_debug_flag_for_build_profile() {
+        let json = serde_json::to_value(get_build_info()).expect("BuildInfo serializes");
+        assert_eq!(json["debug"], serde_json::json!(cfg!(debug_assertions)));
     }
 
     // ========================================================================

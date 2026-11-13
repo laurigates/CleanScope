@@ -148,3 +148,47 @@ export async function isWaitingForDevice(page: Page): Promise<boolean> {
   const waitingMsg = page.locator(".waiting-message");
   return await waitingMsg.isVisible().catch(() => false);
 }
+
+/**
+ * Build info as returned by the `get_build_info` Tauri command.
+ */
+export interface MockBuildInfo {
+  version: string;
+  git_hash: string;
+  build_time: string;
+  debug: boolean;
+}
+
+/**
+ * Install a minimal Tauri IPC stub before the app loads, so the frontend can be
+ * exercised against the vite dev server without the Rust backend.
+ *
+ * Only the commands the app calls on mount are answered; any other command rejects.
+ */
+export async function mockTauriBackend(page: Page, buildInfo: MockBuildInfo): Promise<void> {
+  await page.addInitScript((info) => {
+    let nextId = 1;
+    Object.assign(window, {
+      __TAURI_INTERNALS__: {
+        transformCallback: () => nextId++,
+        invoke: async (cmd: string) => {
+          switch (cmd) {
+            case "plugin:event|listen":
+              return nextId++;
+            case "plugin:event|unlisten":
+              return null;
+            case "get_build_info":
+              return info;
+            case "check_usb_status":
+              return { connected: false };
+            case "get_video_format":
+              return "FMT:Auto";
+            default:
+              throw new Error(`unmocked Tauri command: ${cmd}`);
+          }
+        },
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+    });
+  }, buildInfo);
+}

@@ -39,6 +39,8 @@ export interface BuildInfo {
   version: string;
   git_hash: string;
   build_time: string;
+  /** True for a debug build of the Rust backend, false for a release build. */
+  debug: boolean;
 }
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "reconnecting";

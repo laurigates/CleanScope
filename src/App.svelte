@@ -90,10 +90,31 @@ function hashToColorIndex(hash: string): number {
   return hexValue % BUILD_COLORS.length;
 }
 
+// The per-commit colour identifies a development build; release builds use the neutral colour.
 const buildColor = $derived.by(() => {
-  if (!buildInfo?.git_hash) return COLOR_FALLBACK;
+  if (!buildInfo?.debug || !buildInfo.git_hash) return COLOR_FALLBACK;
   return BUILD_COLORS[hashToColorIndex(buildInfo.git_hash)];
 });
+
+// Debug buttons show in debug builds. In a release build, tapping the version label
+// DEBUG_UNLOCK_TAPS times in a row toggles them for the session, for field diagnosis.
+const DEBUG_UNLOCK_TAPS = 7;
+const DEBUG_UNLOCK_TAP_WINDOW_MS = 2000;
+let debugUnlocked = $state<boolean>(false);
+let versionTapCount = 0;
+let lastVersionTapMs = 0;
+const showDebugControls = $derived(buildInfo?.debug === true || debugUnlocked);
+
+function handleVersionTap() {
+  const now = performance.now();
+  const withinWindow = now - lastVersionTapMs <= DEBUG_UNLOCK_TAP_WINDOW_MS;
+  versionTapCount = withinWindow ? versionTapCount + 1 : 1;
+  lastVersionTapMs = now;
+  if (versionTapCount >= DEBUG_UNLOCK_TAPS) {
+    versionTapCount = 0;
+    debugUnlocked = !debugUnlocked;
+  }
+}
 
 const displayStatus = $derived.by(() => {
   if (connectionStatus === "disconnected") {
@@ -399,9 +420,11 @@ async function captureFrame() {
       {frameCount}
       {buildInfo}
       {buildColor}
+      onversiontap={handleVersionTap}
     />
 
     <DebugControls
+      showDebug={showDebugControls}
       {widthSetting}
       {heightSetting}
       {strideSetting}
