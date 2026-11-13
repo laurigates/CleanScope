@@ -172,16 +172,12 @@ pub fn validate_yuy2_frame(
         };
 
     let row_diff_valid = match (level, avg_row_diff) {
-        (ValidationLevel::Strict, Some(diff)) => {
-            if diff > VALIDATION_CONFIG.row_diff_threshold {
-                failure_reasons.push(format!(
-                    "High row difference: {:.1} (threshold {})",
-                    diff, VALIDATION_CONFIG.row_diff_threshold
-                ));
-                false
-            } else {
-                true
-            }
+        (ValidationLevel::Strict, Some(diff)) if diff > VALIDATION_CONFIG.row_diff_threshold => {
+            failure_reasons.push(format!(
+                "High row difference: {:.1} (threshold {})",
+                diff, VALIDATION_CONFIG.row_diff_threshold
+            ));
+            false
         }
         _ => true,
     };
