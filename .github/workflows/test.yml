@@ -136,6 +136,9 @@ jobs:
         # reports "no leaks found" on anything. Scan a generated AWS-shaped
         # key with the repo config; exit code 3 means it was detected.
         # GITLEAKS_CONFIG makes this check and the scan load the same file.
+        # The aws-access-token rule skips matches with Shannon entropy <= 3,
+        # which about 1 in 5,000 random keys hit, so up to five fresh keys
+        # are tried; a config with no rules misses all five.
         run: |
           set -euo pipefail
           if [ -f .gitleaks.toml ]; then
@@ -144,10 +147,14 @@ jobs:
           fi
           d="$RUNNER_TEMP/gitleaks-canary"
           mkdir -p "$d"
-          rand=$(head -c 20 /dev/urandom | base32)
-          printf 'aws_access_key_id = "AKIA%s"\n' "${rand:0:16}" > "$d/canary.env"
           rc=0
-          gitleaks dir "$d" --no-banner --redact --exit-code 3 >/dev/null 2>&1 || rc=$?
+          for _ in 1 2 3 4 5; do
+            rand=$(head -c 20 /dev/urandom | base32)
+            printf 'aws_access_key_id = "AKIA%s"\n' "${rand:0:16}" > "$d/canary.env"
+            rc=0
+            gitleaks dir "$d" --no-banner --redact --exit-code 3 >/dev/null 2>&1 || rc=$?
+            [ "$rc" -eq 3 ] && break
+          done
           if [ "$rc" -ne 3 ]; then
             echo "::error file=.gitleaks.toml::the gitleaks config detected nothing (exit $rc); add [extend] useDefault = true"
             exit 1
@@ -164,10 +171,11 @@ jobs:
             pull_request)
               range="origin/${BASE_REF}..HEAD" ;;
             push)
+              # Without the old tip (force-push, new branch) scan full history.
               if git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
                 range="${BEFORE_SHA}..HEAD"
               else
-                range="HEAD~1..HEAD"
+                range="HEAD"
               fi ;;
             *)
               range="HEAD" ;;
