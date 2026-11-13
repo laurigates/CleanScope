@@ -28,7 +28,7 @@ CleanScope lets you view video feeds from USB-C endoscopes (UVC devices) on Andr
 
 Before you can build and run CleanScope:
 
-- **Rust** - Latest stable (install from [rustup.rs](https://rustup.rs/))
+- **Rust** - Install [rustup](https://rustup.rs/); it installs the version pinned in `rust-toolchain.toml`, which CI uses too. To move to a newer Rust, change `channel` in that file (Renovate's `rust-toolchain` manager proposes the bump) and fix any new clippy lints in the same PR.
 - **Rust Android targets** - Run `rustup target add aarch64-linux-android`
 - **Android SDK** - API level 34 or higher
 - **Android NDK** - Version 26+ (set `NDK_HOME` environment variable)
