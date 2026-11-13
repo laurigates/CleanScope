@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "clean-scope"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "android_logger",
  "anyhow",
