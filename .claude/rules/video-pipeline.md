@@ -17,8 +17,14 @@ Each stage can introduce artifacts. Debug systematically from left to right.
 
 **Frame boundary detection for YUY2:**
 - Uses size-based detection: `buffer_size >= expected_frame_size`
-- FID toggle is unreliable on cheap cameras (toggles mid-frame)
+- FID toggle is unreliable on cheap cameras (toggles mid-frame), so it is trusted only after two consecutive FID periods equal exactly one frame (`update_fid_period_matches`). A trusted toggle with a partial buffer drops that partial frame to re-align.
 - After `drain()`, do NOT `clear()` the buffer - remaining bytes are next frame's data
+- Constant non-zero "overflow bytes preserved" means the cut is off the camera's frame boundary, not that headers leaked in. Every payload here is a multiple of 12 bytes, so a multiple-of-12 overflow proves nothing about headers.
+
+**Isochronous transfers (Android usbfs):**
+- usbfs allocates each URB buffer as one contiguous kernel block. 32 × 3072-byte packets (~96 KB) intermittently failed with `errno=12` (ENOMEM) on Android 16, which libusb reports only as `LIBUSB_ERROR_IO` (-1) on submit. Keep URBs small (`ISO_CONFIG`: 16 transfers × 8 packets) and add transfers, not packets, for throughput.
+- libusb's own log level is set to warning at init, so the kernel errno appears in logcat as `libusb: error [submit_iso_transfer] submiturb failed, errno=N`. Look there before theorising about a `-1`.
+- `libusb_close()` leaves a wrapped Android fd open, and usbfs keeps interface claims until that fd closes. `LibusbDeviceHandle` therefore releases its claims on drop; without that, every reconnect fails with `libusb_claim_interface failed: -6` (EBUSY).
 
 **UVC header parsing:**
 - Every isochronous packet starts with 2-12 byte header
@@ -79,3 +85,5 @@ process_iso_packets() → drain frame → validate_yuy2_frame() → log if inval
 - Ignoring stride_index in streaming code → UI button does nothing
 - Not setting buffer.width/height → frontend uses wrong dimensions
 - High validation warnings → check frame boundary detection, not conversion
+- Reinstalling the app (`just wifi-deploy`) can drop the USB permission grant ("User has not given … permission to access device"). Unplug and replug the camera to re-trigger `USB_DEVICE_ATTACHED`.
+- Android-only code (`libusb_android.rs` and its `#[cfg(test)]` module) is not compiled by desktop `cargo test`/`cargo clippy`. Only an Android build (`just wifi-deploy`) checks it.
