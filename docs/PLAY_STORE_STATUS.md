@@ -40,11 +40,11 @@ between internal testing and production. The live, machine-readable version is
 
 ## Settings to review
 
-- **Listing language mismatch** — Play's default listing is `en-GB`, while
-  `fastlane/metadata/android/` only has `en-US`. Once the sync job has
-  permission it will create a separate `en-US` listing instead of updating the
-  default one. Either rename the directory to `en-GB` or switch Play's default
-  language to English (United States).
+- **Listing language** — Play's default listing is `en-GB`, and the listing
+  text lives in `fastlane/metadata/android/en-GB/` to match, so the sync job
+  updates the default listing. After the first successful sync, confirm with
+  `just play-status` that `details.defaultLanguage` is `en-GB` and that it is
+  the only listing language.
 - **Contact website** is empty; `https://laurigates.github.io/CleanScope/`
   (which already hosts the privacy policy) is the obvious value.
 - **`INTERNET` permission** is declared in the manifest. The app is
