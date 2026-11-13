@@ -1,6 +1,11 @@
 # Gitleaks configuration for CleanScope
 # Whitelists false positives that are safe to ignore
 
+# Load gitleaks' built-in rules. A file holding only [allowlist] loads zero
+# rules, and every scan then reports "no leaks found".
+[extend]
+useDefault = true
+
 [allowlist]
 description = "Allowlist for CleanScope false positives"
 regexes = [
