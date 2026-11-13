@@ -8,7 +8,7 @@
 #
 # Usage: scripts/check-elf-alignment.sh <path>...
 #   <path> is an .aab/.apk (extracted to a temp dir), a directory searched
-#   recursively for *.so, or a single .so file.
+#   recursively for *.so, *.aab and *.apk, or a single .so file.
 #
 # Exits 1 if any LOAD segment is below 16384, or if no .so file was found
 # (an empty check must not pass). Set READELF to override the readelf binary.
@@ -37,18 +37,28 @@ trap 'rm -rf "$workdir"' EXIT
 libs_file="$workdir/libs.txt"
 : > "$libs_file"
 index=0
+
+# Extract the .so files of one .aab/.apk and record them.
+collect_archive() {
+  index=$((index + 1))
+  local extract_dir="$workdir/extract-$index"
+  mkdir -p "$extract_dir"
+  unzip -q -o "$1" '*.so' -d "$extract_dir"
+  find "$extract_dir" -type f -name '*.so' >> "$libs_file"
+}
+
 for input in "$@"; do
   if [[ -d "$input" ]]; then
     find "$input" -type f -name '*.so' >> "$libs_file"
+    # Gradle's outputs directory holds packaged artifacts, not loose libraries.
+    while IFS= read -r archive; do
+      collect_archive "$archive"
+    done < <(find "$input" -type f \( -name '*.aab' -o -name '*.apk' \))
   elif [[ "$input" == *.so ]]; then
     [[ -f "$input" ]] || { echo "error: $input not found" >&2; exit 2; }
     echo "$input" >> "$libs_file"
   elif [[ -f "$input" ]]; then
-    index=$((index + 1))
-    extract_dir="$workdir/extract-$index"
-    mkdir -p "$extract_dir"
-    unzip -q -o "$input" '*.so' -d "$extract_dir"
-    find "$extract_dir" -type f -name '*.so' >> "$libs_file"
+    collect_archive "$input"
   else
     echo "error: $input not found" >&2
     exit 2
