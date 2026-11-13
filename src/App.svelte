@@ -171,17 +171,14 @@ onMount(async () => {
   });
   unlistenFns.push(unlistenReconnect);
 
-  const unlistenUsbStatus = await listen<UsbStatusEvent>(
-    "usb-status",
-    (event) => {
-      streamingStatus = event.payload.detail || event.payload.status;
-      if (event.payload.status === "connecting") {
-        connectionStatus = "connecting";
-      } else if (event.payload.status === "error") {
-        errorMessage = event.payload.detail || "USB error occurred";
-      }
-    },
-  );
+  const unlistenUsbStatus = await listen<UsbStatusEvent>("usb-status", (event) => {
+    streamingStatus = event.payload.detail || event.payload.status;
+    if (event.payload.status === "connecting") {
+      connectionStatus = "connecting";
+    } else if (event.payload.status === "error") {
+      errorMessage = event.payload.detail || "USB error occurred";
+    }
+  });
   unlistenFns.push(unlistenUsbStatus);
 
   const unlistenFrame = await listen<{ width: number; height: number; format: string } | null>(
