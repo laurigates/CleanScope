@@ -339,7 +339,10 @@ play-console-setup:
     echo "Opening Play Console users & permissions page..."
     echo "Select: Invite new user"
     echo "Email:      $SA_EMAIL"
-    echo "Permission: Releases → Release to testing tracks (internal)"
+    echo "App permissions (CleanScope):"
+    echo "  - View app information (read-only)   — just play-status"
+    echo "  - Release apps to testing tracks     — release-please publish job"
+    echo "  - Manage store presence              — fastlane listing sync"
     echo ""
     open "https://play.google.com/console/developers/users-and-permissions"
 
@@ -347,8 +350,12 @@ play-console-setup:
     read -r
 
     echo ""
-    echo "Play Console setup complete. The pipeline is ready."
+    echo "Play Console setup complete. Verify with: just play-status"
     echo "See docs/PUBLISHING.md for the full release workflow."
+
+# Report Play Store publishing state + upcoming policy deadlines (JSON; --markdown for a summary)
+play-status *args:
+    uv run scripts/play_status.py {{args}}
 
 # Install Android emulator and system image
 setup-emulator:
