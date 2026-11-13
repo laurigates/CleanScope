@@ -452,6 +452,10 @@ android-build: _require-android
 android-release: _require-android
     npm run tauri:android:build
 
+# Check that packaged native libraries are 16 KB page-aligned (same check as CI)
+android-check-alignment artifact="src-tauri/gen/android/app/build/outputs":
+    scripts/check-elf-alignment.sh "{{artifact}}"
+
 # Install APK to connected device
 android-install: _require-android
     #!/usr/bin/env bash

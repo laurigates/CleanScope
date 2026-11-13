@@ -126,7 +126,7 @@ The pipeline only uploads to the **internal** track. To promote:
 
 ## Caveats
 
-- **NDK r26d vs r28**: Google Play requires 16KB page alignment for new submissions targeting devices with 16KB page sizes (policy effective 2025). NDK r26d may work initially, but validate with NDK r28 before the first production release — the `libusb1-sys` vendored build needs testing with r28.
+- **16 KB page alignment**: Google Play requires 16 KB page-size support for apps targeting Android 15+ ([Android docs](https://developer.android.com/guide/practices/page-sizes)). CI builds with NDK r28c, which links 16 KB-aligned by default, and `src-tauri/build.rs` passes `-z max-page-size=16384` for the Android library so a local build with an older NDK is aligned too. The Android build jobs fail if any packaged `.so` has a LOAD segment aligned below 16384 (`scripts/check-elf-alignment.sh`; locally `just android-check-alignment <aab|apk>`).
 - **`build.gradle.kts` is not auto-regenerated**: Unlike `tauri.properties`, this file persists across `tauri android init` runs. Signing changes added here are safe.
 - **First upload must be manual**: See step 2 above.
 

@@ -7,6 +7,7 @@ use std::process::Command;
 fn main() {
     // Generate build info
     generate_build_info();
+    emit_android_page_size_link_args();
     // Only run Android-specific logic when building for Android
     #[cfg(target_os = "android")]
     {
@@ -25,6 +26,24 @@ fn main() {
 
     // Run Tauri's build process
     tauri_build::build();
+}
+
+/// Link the Android shared library with 16 KB ELF segment alignment.
+///
+/// Devices with 16 KB memory pages need every LOAD segment aligned to 16384,
+/// and Google Play requires it for apps targeting Android 15+. NDK r28+ links
+/// this way by default; NDK r27 and lower need both flags, so they are passed
+/// explicitly to keep the result independent of the installed NDK. See
+/// <https://developer.android.com/guide/practices/page-sizes>.
+///
+/// A build script is compiled for the host, so the target OS is read from
+/// `CARGO_CFG_TARGET_OS` rather than `cfg!(target_os)`.
+fn emit_android_page_size_link_args() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        return;
+    }
+    println!("cargo:rustc-link-arg-cdylib=-Wl,-z,max-page-size=16384");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,-z,common-page-size=16384");
 }
 
 /// Generate build info environment variables for compile-time inclusion

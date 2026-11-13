@@ -48,7 +48,7 @@ jobs:
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r26d
+          ndk-version: r28c
           add-to-path: false
 
       - name: Install Rust toolchain
@@ -87,6 +87,9 @@ jobs:
         run: npm run tauri android build -- --aab --ci
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Check 16 KB page alignment of native libraries
+        run: scripts/check-elf-alignment.sh src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab
 
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v7
