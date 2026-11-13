@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.5.0...clean-scope-v0.6.0) (2026-11-13)
+
+
+### Features
+
+* **ui:** hide debug controls and commit hash in release builds ([#125](https://github.com/laurigates/CleanScope/issues/125)) ([a78b2ab](https://github.com/laurigates/CleanScope/commit/a78b2aba435501d59ced54383c40d75166421f88))
+
+
+### Bug Fixes
+
+* **android:** link native library with 16 KB page alignment ([#133](https://github.com/laurigates/CleanScope/issues/133)) ([17bcd11](https://github.com/laurigates/CleanScope/commit/17bcd111f0261cf6a349e7caf3988c2ee90ea54a))
+* **ci:** pass --aab as a flag to tauri android build ([#108](https://github.com/laurigates/CleanScope/issues/108)) ([e4f687e](https://github.com/laurigates/CleanScope/commit/e4f687e08680d2ad1774fdafb7b1ea2f792d1868))
+* **release:** bump the clean-scope entry in Cargo.lock with each release ([#130](https://github.com/laurigates/CleanScope/issues/130)) ([7fc32f9](https://github.com/laurigates/CleanScope/commit/7fc32f9a1a20e5eb7d18c7e279ae72b72f965900))
+* **usb:** stream YUY2 from the HD camera endoscope on Android 16 ([215bf9f](https://github.com/laurigates/CleanScope/commit/215bf9fe851f563b9542b5f2a28fa6dac92a5150))
+
 ## [0.5.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.4.0...clean-scope-v0.5.0) (2026-03-27)
 
 
