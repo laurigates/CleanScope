@@ -349,7 +349,7 @@ fn test_complete_pipeline_yuy2_checkerboard() {
     let first_pixel = (rgb[0], rgb[1], rgb[2]);
     let mut has_different_pixel = false;
 
-    for chunk in rgb.chunks_exact(3) {
+    for chunk in rgb.as_chunks::<3>().0 {
         if (chunk[0], chunk[1], chunk[2]) != first_pixel {
             has_different_pixel = true;
             break;
