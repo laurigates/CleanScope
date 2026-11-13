@@ -2,6 +2,7 @@
 import type { ConnectionStatus, ResolutionInfo } from "./types";
 
 const {
+  showDebug,
   widthSetting,
   heightSetting,
   strideSetting,
@@ -21,6 +22,8 @@ const {
   oncapture,
   oncycleresolution,
 }: {
+  /** Show the camera-diagnosis buttons; the resolution button is always shown. */
+  showDebug: boolean;
   widthSetting: string;
   heightSetting: string;
   strideSetting: string;
@@ -43,13 +46,15 @@ const {
 </script>
 
 <div class="debug-controls">
-  <button class="debug-btn" onclick={oncyclewidth}>{widthSetting}</button>
-  <button class="debug-btn" onclick={oncycleheight}>{heightSetting}</button>
-  <button class="debug-btn" onclick={oncyclestride}>{strideSetting}</button>
-  <button class="debug-btn format" onclick={oncyclevideoformat}>{videoFormatSetting}</button>
-  <button class="debug-btn format" onclick={ontogglemjpeg}>{mjpegSetting}</button>
-  <button class="debug-btn format" onclick={oncyclepixelformat}>{pixelFormatSetting}</button>
-  <button class="debug-btn capture" onclick={oncapture}>Capture</button>
+  {#if showDebug}
+    <button class="debug-btn" onclick={oncyclewidth}>{widthSetting}</button>
+    <button class="debug-btn" onclick={oncycleheight}>{heightSetting}</button>
+    <button class="debug-btn" onclick={oncyclestride}>{strideSetting}</button>
+    <button class="debug-btn format" onclick={oncyclevideoformat}>{videoFormatSetting}</button>
+    <button class="debug-btn format" onclick={ontogglemjpeg}>{mjpegSetting}</button>
+    <button class="debug-btn format" onclick={oncyclepixelformat}>{pixelFormatSetting}</button>
+    <button class="debug-btn capture" onclick={oncapture}>Capture</button>
+  {/if}
   <button
     class="debug-btn resolution"
     onclick={oncycleresolution}

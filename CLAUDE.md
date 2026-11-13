@@ -236,6 +236,9 @@ Camera → UVC Negotiation → Isochronous USB → Frame Assembly → Validation
 - If headers are rejected, their bytes get added as pixel data → corruption
 
 **Debug UI controls:**
+
+Shown in debug builds. In a release build they are hidden: tap the version label in the status bar seven times in a row to show them (seven more taps hide them; the state resets when the app restarts). The resolution button is always shown.
+
 - Width/Height/Stride/Offset buttons: Override auto-detected values
 - MJPEG toggle: Skip MJPEG detection, force YUY2
 - YUV toggle: Switch between YUYV and UYVY byte order
