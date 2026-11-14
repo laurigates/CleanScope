@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Install Tauri dependencies
         run: |
@@ -39,7 +39,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v5.1.0
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -47,7 +47,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
-        uses: actions/cache@v5
+        uses: actions/cache@v5.1.0
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
@@ -55,7 +55,7 @@ jobs:
             ${{ runner.os }}-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@v5.1.0
         with:
           path: src-tauri/target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -63,9 +63,9 @@ jobs:
             ${{ runner.os }}-cargo-build-target-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v6.5.0
         with:
-          node-version: '20'
+          node-version: '20.20.2'
           cache: 'npm'
 
       - name: Install npm dependencies
@@ -88,12 +88,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v6.5.0
         with:
-          node-version: '20'
+          node-version: '20.20.2'
           cache: 'npm'
 
       - name: Install dependencies
@@ -114,7 +114,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -191,12 +191,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v6.5.0
         with:
-          node-version: '20'
+          node-version: '20.20.2'
           cache: 'npm'
 
       - name: Install Rust
@@ -221,7 +221,7 @@ jobs:
             libxcb-xfixes0-dev
 
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@v5.1.0
         with:
           path: src-tauri/target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -242,7 +242,7 @@ jobs:
 
       - name: Upload Playwright report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: playwright-report
           path: playwright-report/
@@ -250,7 +250,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: test-results
           path: test-results/
