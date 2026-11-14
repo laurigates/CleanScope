@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.6.0...clean-scope-v0.6.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **play-store:** move the fastlane listing to en-GB ([#128](https://github.com/laurigates/CleanScope/issues/128)) ([7195199](https://github.com/laurigates/CleanScope/commit/71951995b07f54da98d57564648c927bb91e5c0e))
+
 ## [0.6.0](https://github.com/laurigates/CleanScope/compare/clean-scope-v0.5.0...clean-scope-v0.6.0) (2026-11-13)
 
 
