@@ -20,7 +20,7 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
-          java-version: '17'
+          java-version: '17.0.21+9'
           distribution: temurin
 
       - name: Setup Android SDK components
